@@ -23,6 +23,8 @@ name: release
 #     Unchecked is a dry run: it still builds, signs and verifies, and leaves
 #     the whole release as workflow artifacts — nothing reaches the host and no
 #     GitHub Release is created.
+#   - a dry run needs no tag; publishing (a tag push, or a dispatch with
+#     publish checked) requires tag vX.Y.Z on the checked-out commit.
 #
 # Release runbook:
 #   1. bump `version` (and `min_version` if old clients must be cut off) in
@@ -99,18 +101,6 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "min_version=$min" >> "$GITHUB_OUTPUT"
 
-      - name: Assert the tag matches
-        shell: bash
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
-            [ "$GITHUB_REF_NAME" = "v$VERSION" ] || { echo "tag $GITHUB_REF_NAME does not match workspace version $VERSION (expected v$VERSION)"; exit 1; }
-          else
-            git tag --points-at HEAD | grep -qx "v$VERSION" || { echo "dispatch requires tag v$VERSION on the checked-out commit"; exit 1; }
-          fi
-
       - name: Decide whether to publish
         id: decide
         shell: bash
@@ -123,14 +113,31 @@ jobs:
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
+      - name: Assert the tag matches
+        # A published release must be exactly the workspace version; a dry run
+        # only needs the version to build and name its artifacts.
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PUBLISH: ${{ steps.decide.outputs.publish }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            [ "$GITHUB_REF_NAME" = "v$VERSION" ] || { echo "tag $GITHUB_REF_NAME does not match workspace version $VERSION (expected v$VERSION)"; exit 1; }
+          elif [ "$PUBLISH" = true ]; then
+            git tag --points-at HEAD | grep -qx "v$VERSION" || { echo "publishing from a dispatch requires tag v$VERSION on the checked-out commit"; exit 1; }
+          else
+            echo "dry run of $VERSION: no tag required"
+          fi
+
       - name: Release notes from the annotated tag
         shell: bash
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          # a lightweight tag carries no message: empty notes, not a failure
-          if [ "$(git cat-file -t "v$VERSION")" = tag ]; then
+          # a lightweight tag, or no tag yet (dry run), carries no message: empty notes, not a failure
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null && [ "$(git cat-file -t "v$VERSION")" = tag ]; then
             git tag -l --format='%(contents)' "v$VERSION" > notes.md
           else
             : > notes.md

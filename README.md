@@ -220,7 +220,7 @@ Key rotation: add the new public key to `client/update-keys.pub` alongside the o
 ### Cutting a release
 
 1. Bump `version` in `client/Cargo.toml` (`[workspace.package]`); bump `min_version` too (`[workspace.metadata.vorcall]`) when older clients must be cut off. Commit and push.
-2. Optionally dispatch the `release` workflow with `publish` unchecked first — a dry run that builds, signs and verifies but reaches neither the host nor a GitHub Release.
+2. Optionally dispatch the `release` workflow with `publish` unchecked first — a dry run that builds, signs and verifies but reaches neither the host nor a GitHub Release. No tag is needed for the dry run.
 3. `git tag -a vX.Y.Z -m "notes"` && `git push origin vX.Y.Z`. The annotation becomes the manifest's `notes` and the GitHub Release body; a lightweight tag (no `-a`/`-m`) gives empty notes.
 4. Watch the workflow run.
 5. Verify on the host: `ssh user@host 'head -c 300 ~/freedom.vorcall/releases/manifest.json'`.
