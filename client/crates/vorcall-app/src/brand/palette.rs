@@ -9,6 +9,10 @@ use iced::{Color, Theme};
 pub const DEEP: Color = Color::from_rgb8(0xC8, 0x10, 0x2E);
 /// Darker Deep: the creases between the fingers in the rare entrance.
 pub const CREASE: Color = Color::from_rgb8(0x8F, 0x0B, 0x22);
+/// The laptop of the loading creature: lid, deck and keys.
+pub const STEEL: Color = Color::from_rgb8(0x45, 0x4A, 0x52);
+pub const DECK: Color = Color::from_rgb8(0x6A, 0x71, 0x7B);
+pub const KEYS: Color = Color::from_rgb8(0x36, 0x3B, 0x42);
 pub const GROUND: Color = Color::from_rgb8(0x14, 0x10, 0x11);
 pub const INK: Color = Color::from_rgb8(0xF1, 0xEA, 0xE9);
 pub const MUTED: Color = Color::from_rgb8(0xA0, 0x93, 0x93);

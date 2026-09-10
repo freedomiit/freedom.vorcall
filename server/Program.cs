@@ -96,6 +96,7 @@ app.MapGet("/ws", async (HttpContext context, ChatSocketHandler handler) =>
 app.MapGet("/api/messages", MessagesEndpoints.GetPageAsync).RequireAuthorization();
 UsersEndpoints.Map(app);
 AuthEndpoints.Map(app);
+UpdatesEndpoints.Map(app);
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {

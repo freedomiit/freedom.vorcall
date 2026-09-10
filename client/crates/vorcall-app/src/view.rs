@@ -14,6 +14,7 @@ use crate::app::{
 };
 use crate::brand::mark::mark;
 use crate::brand::palette::{DANGER, MUTED, SUCCESS, WARNING};
+use crate::update_ui::{self, UpdateView};
 
 pub const MESSAGES_ID: &str = "vorcall-messages";
 pub const INPUT_ID: &str = "vorcall-input";
@@ -124,14 +125,23 @@ pub fn register<'a>(
     container(content).center(Length::Fill).into()
 }
 
-pub fn chat<'a>(chat: &'a ChatState, config: &Config, username: &'a str) -> Element<'a, Message> {
+pub fn chat<'a>(
+    chat: &'a ChatState,
+    config: &Config,
+    username: &'a str,
+    update: UpdateView<'a>,
+) -> Element<'a, Message> {
+    let mut content = column![header(chat, username)];
+    // The banner belongs to the window, not to a page: it stays put while the
+    // settings are open.
+    if let Some(banner) = update_ui::banner(update) {
+        content = content.push(banner);
+    }
     let content = match &chat.page {
-        Page::Chat => column![
-            header(chat, username),
-            row![messages(chat), sidebar(chat, config)].height(Length::Fill),
-            composer(chat),
-        ],
-        Page::Settings(state) => column![header(chat, username), settings(state, config)],
+        Page::Chat => content
+            .push(row![messages(chat), sidebar(chat, config)].height(Length::Fill))
+            .push(composer(chat)),
+        Page::Settings(state) => content.push(settings(state, config, update)),
     };
 
     match &chat.dialog {
@@ -330,7 +340,11 @@ fn voice_member_row<'a>(member: &'a VoiceMember, chat: &ChatState) -> Element<'a
     row.into()
 }
 
-fn settings<'a>(state: &SettingsState, config: &Config) -> Element<'a, Message> {
+fn settings<'a>(
+    state: &SettingsState,
+    config: &Config,
+    update: UpdateView<'a>,
+) -> Element<'a, Message> {
     let ptt: Element<'a, Message> = if state.capturing_ptt {
         text("Press a key… (Esc cancels)").color(WARNING).into()
     } else {
@@ -360,6 +374,7 @@ fn settings<'a>(state: &SettingsState, config: &Config) -> Element<'a, Message> 
         .spacing(12)
         .align_y(Vertical::Center),
         button(text("Back")).on_press(Message::CloseSettings),
+        update_ui::section(update),
     ]
     .spacing(12)
     .padding(16)
@@ -553,7 +568,7 @@ fn format_time(unix_ms: i64) -> String {
         .unwrap_or_else(|| "--:--".to_owned())
 }
 
-fn bold() -> Font {
+pub(crate) fn bold() -> Font {
     Font {
         weight: font::Weight::Bold,
         ..Font::DEFAULT

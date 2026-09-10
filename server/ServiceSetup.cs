@@ -11,6 +11,7 @@ using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
 using Vorcall.Server.Protocol;
+using Vorcall.Server.Updates;
 using Vorcall.Server.Voice;
 
 namespace Vorcall.Server;
@@ -43,10 +44,14 @@ public static class ServiceSetup
         // Unusable voice settings fail the boot the same way; an absent key is a valid default.
         var voice = VoiceOptions.FromConfiguration(builder.Configuration);
 
+        var updates = UpdatesOptions.FromConfiguration(builder.Configuration);
+
         builder.Services.AddDbContextFactory<AppDbContext>(o => o.UseNpgsql(connectionString));
         builder.Services.AddSingleton(new ServerKeyValidator(serverKey));
         builder.Services.AddSingleton(jwt);
         builder.Services.AddSingleton(voice);
+        builder.Services.AddSingleton(updates);
+        builder.Services.AddSingleton<UpdateManifestStore>();
 
         // One instance in both roles: the registry signals over the very relay the host runs.
         builder.Services.AddSingleton<VoiceRelay>();

@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Vorcall.Server.Auth;
 using Vorcall.Server.Data;
+using Vorcall.Server.Updates;
 
 namespace Vorcall.Server.Cli;
 
@@ -13,6 +14,7 @@ public static class AdminCli
 {
     private const int DefaultInviteDays = 7;
     private const int MaxInviteDays = 365;
+    private const int MaxVersionEcho = 32;
     private const int UsageExitCode = 2;
 
     public static bool IsCliInvocation(string[] args) => args.Length > 0 && args[0] is "invites" or "users";
@@ -110,13 +112,82 @@ public static class AdminCli
                         u.Id,
                         u.Username,
                         u.CreatedAt,
+                        u.LastClientVersion,
+                        u.LastClientPlatform,
+                        u.LastSeenAt,
                         Sessions = db.RefreshTokens.Count(t => t.UserId == u.Id && t.RevokedAt == null && t.ExpiresAt > now),
                     })
                     .ToListAsync();
 
                 foreach (var user in users)
                 {
-                    Console.WriteLine($"{user.Id}  {user.Username}  created {Format(user.CreatedAt)}  {user.Sessions} active session(s)");
+                    Console.WriteLine(
+                        $"{user.Id}  {user.Username}  created {Format(user.CreatedAt)}  {user.Sessions} active session(s)"
+                        + FormatClient(user.LastClientVersion, user.LastClientPlatform, user.LastSeenAt));
+                }
+
+                return 0;
+            }
+
+            case "outdated":
+            {
+                if (!TryParseMinVersion(args, out var requested))
+                {
+                    return Usage();
+                }
+
+                ClientVersion floor;
+                if (requested is { } explicitFloor)
+                {
+                    floor = explicitFloor;
+                }
+                else
+                {
+                    var manifests = services.GetRequiredService<UpdateManifestStore>();
+                    if (manifests.TryLoad() is not { } loaded)
+                    {
+                        Console.Error.WriteLine($"no manifest in {manifests.ReleasesDir}; pass --min X.Y.Z");
+                        return 1;
+                    }
+
+                    // A published manifest whose version this server cannot compare is a release
+                    // that needs fixing, not a missing one: say which it is.
+                    if (!ClientVersion.TryParse(loaded.Manifest.Version, out var published))
+                    {
+                        Console.Error.WriteLine(
+                            $"manifest in {manifests.ReleasesDir} has version \"{Truncate(loaded.Manifest.Version)}\" "
+                            + "which is not MAJOR.MINOR.PATCH; pass --min X.Y.Z");
+                        return 1;
+                    }
+
+                    floor = published;
+                }
+
+                var accounts = await db.Users
+                    .AsNoTracking()
+                    .OrderBy(u => u.UsernameNormalized)
+                    .Select(u => new
+                    {
+                        u.Id,
+                        u.Username,
+                        u.LastClientVersion,
+                        u.LastClientPlatform,
+                        u.LastSeenAt,
+                    })
+                    .ToListAsync();
+
+                foreach (var account in accounts)
+                {
+                    // A version that does not parse counts as outdated: the floor is the only
+                    // build this server can vouch for.
+                    if (ClientVersion.TryParse(account.LastClientVersion, out var version) && version.CompareTo(floor) >= 0)
+                    {
+                        continue;
+                    }
+
+                    Console.WriteLine(
+                        $"{account.Id}  {account.Username}"
+                        + FormatClient(account.LastClientVersion, account.LastClientPlatform, account.LastSeenAt));
                 }
 
                 return 0;
@@ -217,6 +288,25 @@ public static class AdminCli
         }
     }
 
+    // Exactly "users outdated" or "users outdated --min X.Y.Z", mirroring "invites new --days".
+    // Null means the caller wants the floor taken from the published manifest.
+    private static bool TryParseMinVersion(string[] args, out ClientVersion? floor)
+    {
+        floor = null;
+        if (args.Length == 2)
+        {
+            return true;
+        }
+
+        if (args.Length != 4 || args[2] != "--min" || !ClientVersion.TryParse(args[3], out var requested))
+        {
+            return false;
+        }
+
+        floor = requested;
+        return true;
+    }
+
     private static bool TryParseDays(string[] args, out int days)
     {
         days = DefaultInviteDays;
@@ -235,6 +325,12 @@ public static class AdminCli
 
     private static string? Argument(string[] args, int index) => args.Length > index ? args[index] : null;
 
+    private static string Truncate(string? value)
+        => value is null ? string.Empty : value.Length <= MaxVersionEcho ? value : value[..MaxVersionEcho];
+
+    private static string FormatClient(string? version, string? platform, DateTime? seenAt)
+        => $"  client {version ?? "-"} {platform ?? "-"}  seen {(seenAt is null ? "-" : Format(seenAt.Value))}";
+
     private static string Format(DateTime value)
         => value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
 
@@ -252,6 +348,7 @@ public static class AdminCli
               invites new [--days N]           create an invite code (default 7 days, 1..365)
               invites list                     list every invite
               users list                       list every account
+              users outdated [--min X.Y.Z]     list accounts below the published release
               users revoke-sessions <name>     revoke every refresh token of an account
               users set-password <name>        set an account's password and revoke its sessions
             """);

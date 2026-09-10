@@ -1,0 +1,17 @@
+[package]
+name = "vorcall-release"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vorcall-release"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+ring.workspace = true
+serde_json.workspace = true
+vorcall-core.workspace = true

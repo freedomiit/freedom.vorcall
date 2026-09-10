@@ -1,0 +1,334 @@
+name: release
+
+# Client release: builds the desktop client for the three supported platforms,
+# signs a manifest with the update signing key and publishes it to the host's
+# `releases/` directory, which the backend serves to signed-in clients through
+# `/api/updates/*`.
+#
+# Flow:
+#   1. job "preflight" — reads version/min_version from client/Cargo.toml,
+#      asserts the tag matches the workspace version and extracts the release
+#      notes from the annotated tag.
+#   2. job "build"     — builds vorcall on ubuntu-22.04 / windows-latest /
+#      macos-latest with the production server key baked in, checks the binary
+#      reports the expected version, and uploads binary + .sha256 per platform.
+#   3. job "publish"   — assembles manifest.json from the built assets, signs
+#      it (Ed25519) and verifies the signature against client/update-keys.pub.
+#      When publishing, it copies everything to the host, swaps the manifest
+#      atomically, prunes old versions and creates the GitHub Release.
+#
+# Dry run vs publish:
+#   - a tag push (v*) always publishes;
+#   - a manual dispatch publishes only when the "publish" input is checked.
+#     Unchecked is a dry run: it still builds, signs and verifies, and leaves
+#     the whole release as workflow artifacts — nothing reaches the host and no
+#     GitHub Release is created.
+#
+# Release runbook:
+#   1. bump `version` (and `min_version` if old clients must be cut off) in
+#      client/Cargo.toml, commit, push.
+#   2. `git tag -a vX.Y.Z -m "notes"` && `git push origin vX.Y.Z`.
+#
+# Prerequisites (one time):
+#   - Secret VORCALL_SERVER_KEY — the production door key, the same value as
+#     Vorcall__ServerKey in the host `.env`. Baked into the binaries at build
+#     time; a rotation therefore needs a new release.
+#   - Secret VORCALL_UPDATE_SIGNING_KEY — hex Ed25519 private key from
+#     `vorcall-release gen-key`. Its public half must be committed in
+#     client/update-keys.pub, otherwise clients reject the manifest (the
+#     verify step below catches that here).
+#   - Secret SSH_PRIVATE_KEY — runner -> server, shared with deploy.yml.
+#   - `${APP_DIR}/releases/` on the host, created by deploy/provision-host.sh
+#     and bind-mounted read-only into the backend container
+#     (docker-compose.prod.yml).
+#   - The ubuntu-22.04 runner is pinned on purpose: it sets the oldest glibc
+#     the Linux binary supports.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to the host and create the GitHub Release (unchecked = dry run: build, sign, verify, keep artifacts only)"
+        type: boolean
+        default: false
+
+# never let two releases race for the manifest
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SERVER: user@host
+  APP_DIR: /opt/vorcall
+  VORCALL_SERVER_URL: https://vorcall.example.com
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      min_version: ${{ steps.meta.outputs.min_version }}
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # full history: the tag object and its annotation (release notes) are
+          # not fetched by a shallow checkout.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Read the workspace version
+        id: meta
+        shell: bash
+        working-directory: client
+        run: |
+          set -euo pipefail
+          meta=$(cargo metadata --no-deps --format-version 1)
+          version=$(jq -r '.packages[] | select(.name=="vorcall-app") | .version' <<<"$meta")
+          min=$(jq -r '.metadata.vorcall.min_version' <<<"$meta")
+          [ -n "$version" ] && [ "$min" != "null" ] || { echo "cannot read version/min_version from Cargo.toml"; exit 1; }
+          # min_version must not exceed version (three-integer compare via sort -V)
+          [ "$(printf '%s\n%s\n' "$min" "$version" | sort -V | head -n1)" = "$min" ] || { echo "min_version $min is above version $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "min_version=$min" >> "$GITHUB_OUTPUT"
+
+      - name: Assert the tag matches
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            [ "$GITHUB_REF_NAME" = "v$VERSION" ] || { echo "tag $GITHUB_REF_NAME does not match workspace version $VERSION (expected v$VERSION)"; exit 1; }
+          else
+            git tag --points-at HEAD | grep -qx "v$VERSION" || { echo "dispatch requires tag v$VERSION on the checked-out commit"; exit 1; }
+          fi
+
+      - name: Decide whether to publish
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            publish=true
+          else
+            publish=${{ inputs.publish }}
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes from the annotated tag
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # a lightweight tag carries no message: empty notes, not a failure
+          if [ "$(git cat-file -t "v$VERSION")" = tag ]; then
+            git tag -l --format='%(contents)' "v$VERSION" > notes.md
+          else
+            : > notes.md
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notes
+          path: notes.md
+          retention-days: 7
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-22.04, platform: linux-x86_64, ext: "" }
+          - { os: windows-latest, platform: windows-x86_64, ext: ".exe" }
+          - { os: macos-latest, platform: macos-aarch64, ext: "" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: client
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+      EXT: ${{ matrix.ext }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          key: release-${{ matrix.platform }}
+
+      - name: ALSA headers (rodio/cpal)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libasound2-dev
+
+      - name: Check the server key secret
+        # client/.cargo/config.toml defaults the key to "dev"; a release built
+        # with it could not talk to production.
+        env:
+          VORCALL_SERVER_KEY: ${{ secrets.VORCALL_SERVER_KEY }}
+        run: '[ -n "$VORCALL_SERVER_KEY" ] && [ "$VORCALL_SERVER_KEY" != dev ] || { echo "VORCALL_SERVER_KEY secret is missing or still ''dev''"; exit 1; }'
+
+      - name: Build
+        env:
+          VORCALL_SERVER_KEY: ${{ secrets.VORCALL_SERVER_KEY }}
+        run: cargo build --release -p vorcall-app
+
+      - name: No aws-lc-rs in the graph
+        if: runner.os == 'Linux'
+        # the Windows cross build (cargo-xwin) and this release gate both
+        # depend on aws-lc-rs staying out of the client dependency graph.
+        run: if cargo tree -i aws-lc-rs >/dev/null 2>&1; then echo "aws-lc-rs is in the dependency graph"; exit 1; fi
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist && cp "target/release/vorcall${EXT}" "../dist/vorcall-${PLATFORM}${EXT}"
+
+      - name: Ad-hoc signature
+        if: runner.os == 'macOS'
+        # Apple Silicon refuses to run unsigned arm64 binaries; an ad-hoc
+        # signature is enough to launch. Gatekeeper's first-run prompt is
+        # documented in the README.
+        run: codesign -s - --force "../dist/vorcall-macos-aarch64" && codesign -dv "../dist/vorcall-macos-aarch64"
+
+      - name: Check the reported version
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          out=$("../dist/vorcall-${PLATFORM}" --version)
+          [ "$out" = "vorcall ${VERSION} ${PLATFORM}" ] || { echo "binary reports '$out'"; exit 1; }
+
+      - name: Checksum
+        # run inside dist/ so the file holds "<hash>  <name>" with no path
+        run: |
+          set -euo pipefail
+          cd ../dist
+          sha256sum "vorcall-${PLATFORM}${EXT}" > "vorcall-${PLATFORM}${EXT}.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vorcall-${{ matrix.platform }}
+          path: dist/vorcall-${{ matrix.platform }}${{ matrix.ext }}*
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      MIN_VERSION: ${{ needs.preflight.outputs.min_version }}
+      PUBLISH: ${{ needs.preflight.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          key: release-tool
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build the release tool
+        run: cd client && cargo build --release -p vorcall-release
+
+      - name: Assemble the manifest
+        run: |
+          set -euo pipefail
+          client/target/release/vorcall-release manifest \
+            --version "$VERSION" \
+            --min-version "$MIN_VERSION" \
+            --notes-file dist/notes.md \
+            --asset linux-x86_64=dist/vorcall-linux-x86_64 \
+            --asset windows-x86_64=dist/vorcall-windows-x86_64.exe \
+            --asset macos-aarch64=dist/vorcall-macos-aarch64 \
+            --out dist/manifest.json
+
+      - name: Sign the manifest
+        # a dry run signs too: a signing key or public-key mismatch must fail
+        # here, not on the release that actually reaches the clients.
+        env:
+          VORCALL_UPDATE_SIGNING_KEY: ${{ secrets.VORCALL_UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$VORCALL_UPDATE_SIGNING_KEY" ] || { echo "VORCALL_UPDATE_SIGNING_KEY secret is missing"; exit 1; }
+          client/target/release/vorcall-release sign --key-env VORCALL_UPDATE_SIGNING_KEY dist/manifest.json --out dist/manifest.sig
+
+      - name: Verify against the committed public keys
+        # fails when the signing key's public half is not in
+        # client/update-keys.pub — i.e. clients would refuse this manifest.
+        run: client/target/release/vorcall-release verify --keys client/update-keys.pub dist/manifest.json dist/manifest.sig
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ needs.preflight.outputs.version }}
+          path: dist/*
+          retention-days: 7
+
+      - name: Set up the SSH key
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 203.0.113.10 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Copy the release to the host
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$SERVER" "mkdir -p '$APP_DIR/releases/$VERSION'"
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes dist/vorcall-* "$SERVER:$APP_DIR/releases/$VERSION/"
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes dist/manifest.json "$SERVER:$APP_DIR/releases/manifest.json.tmp"
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes dist/manifest.sig "$SERVER:$APP_DIR/releases/manifest.sig.tmp"
+
+      - name: Activate the manifest and prune old versions
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$SERVER" \
+            "APP_DIR='$APP_DIR' bash -s" <<'EOF'
+          set -euo pipefail
+          cd "$APP_DIR/releases"
+          # sig first, then json: a client that reads the pair mid-swap fails verification and retries later,
+          # never the other way round (new json + old sig would also fail, but json is what the server 404s on).
+          mv -f manifest.sig.tmp manifest.sig
+          mv -f manifest.json.tmp manifest.json
+          # keep the five newest X.Y.Z directories (sort -V orders 0.10.0 after 0.9.0, unlike a lexical sort)
+          ls -d */ 2>/dev/null | tr -d / | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | head -n -5 | xargs -r rm -rf --
+          ls -la
+          head -c 300 manifest.json; echo
+          EOF
+
+      - name: GitHub Release
+        if: needs.preflight.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          assets=(dist/vorcall-* dist/manifest.json dist/manifest.sig)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" --title "Vorcall $VERSION" --notes-file dist/notes.md "${assets[@]}"
+          fi

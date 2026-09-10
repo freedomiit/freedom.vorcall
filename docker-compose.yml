@@ -1,6 +1,13 @@
 # Vorcall local development: Postgres only. Run the server with
 #   ~/.dotnet/dotnet run --project server/Vorcall.Server.csproj
 # (listens on http://localhost:5000, key "dev", see server/appsettings.Development.json).
+#
+# The server runs on the host, not in a container, so the releases it serves under
+# /api/updates/* come straight from the working tree: Vorcall:ReleasesDir is "../releases"
+# in server/appsettings.Development.json, which is the repo-root releases/ directory.
+# A backend service added here would need the mount production uses instead:
+#   volumes:
+#     - ./releases:/releases:ro
 services:
   db:
     image: postgres:18

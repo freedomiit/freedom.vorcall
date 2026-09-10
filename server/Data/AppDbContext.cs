@@ -40,6 +40,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         user.Property(u => u.UsernameNormalized).HasColumnName("username_normalized").HasMaxLength(32).IsRequired();
         user.Property(u => u.PasswordHash).HasColumnName("password_hash").HasColumnType("text").IsRequired();
         user.Property(u => u.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
+        user.Property(u => u.LastClientVersion).HasColumnName("last_client_version").HasMaxLength(64);
+        user.Property(u => u.LastClientPlatform).HasColumnName("last_client_platform").HasMaxLength(64);
+        user.Property(u => u.LastSeenAt).HasColumnName("last_seen_at").HasColumnType("timestamp with time zone");
         user.HasIndex(u => u.UsernameNormalized).IsUnique();
 
         var refreshToken = modelBuilder.Entity<RefreshToken>();

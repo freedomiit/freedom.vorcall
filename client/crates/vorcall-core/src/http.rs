@@ -61,6 +61,29 @@ pub fn client() -> Result<&'static reqwest::Client, ApiFailure> {
     Ok(CLIENT.get_or_init(|| client))
 }
 
+/// The client release downloads use.
+///
+/// A 20 MB body cannot fit inside the 15 s total timeout of [`client`], so
+/// this one bounds the gap between chunks instead of the whole transfer: a
+/// stalled download still fails, a slow one still finishes.
+pub fn download_client() -> Result<&'static reqwest::Client, ApiFailure> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+
+    let tls = tls_config().map_err(|e| ApiFailure::Transport(e.to_string()))?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(60))
+        .tls_backend_preconfigured(tls.clone())
+        .build()
+        .map_err(|e| ApiFailure::Transport(e.to_string()))?;
+
+    Ok(CLIENT.get_or_init(|| client))
+}
+
 pub fn bearer(access_token: &str) -> String {
     format!("Bearer {access_token}")
 }

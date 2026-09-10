@@ -31,6 +31,8 @@ message ClientFrame {
 message Hello {
   uint32 protocol_version = 1;             // must be 1
   string nickname = 2 [deprecated = true]; // ignored by the server since accounts exist
+  string client_version = 3;               // optional; the client's own version, e.g. "0.2.0"; logged and stored, never enforced
+  string client_platform = 4;              // optional; e.g. "linux-x86_64", "windows-x86_64", "macos-aarch64"
 }
 
 message SendMessage {

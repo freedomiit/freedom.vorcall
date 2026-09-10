@@ -5,5 +5,6 @@
 mod data;
 pub mod entrance;
 pub mod icon;
+pub mod loading;
 pub mod mark;
 pub mod palette;

@@ -6,6 +6,7 @@
 //! source is a synthesized sine and the sink is a level meter.
 
 mod report;
+mod update_cmd;
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -59,7 +60,20 @@ with the values baked in at build time as fallbacks.
 Prints one JSON line on stdout; logs go to stderr.
 
 Exit codes: 0 ran, 1 --expect-peer heard nothing, 2 usage, sign-in,
-connection or media failure.";
+connection or media failure.
+
+Update subcommands:
+  vorcall-probe check-update --username U [--password P] --platform ID
+                             --out PATH [--pubkey HEX ...] [--no-download]
+      Signs in, fetches and verifies the release manifest and, unless
+      --no-download, downloads and hash-checks the asset for --platform into
+      --out. Prints one JSON object. Without --pubkey the baked-in keys are
+      used. Exit 0 checked, 1 the manifest or the download was refused (the
+      JSON carries \"error\" and \"stage\"), 2 usage, sign-in or transport failure.
+
+  vorcall-probe apply-update --file PATH
+      Swaps PATH over this binary and starts it again. The relaunched process
+      prints {\"relaunched\":true,...} and exits 0.";
 
 struct Args {
     username: String,
@@ -73,6 +87,23 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    // The relaunched process must answer before anything else runs: it is the
+    // proof the swap worked, and its argv is whatever `apply-update` was given.
+    if std::env::var_os("VORCALL_RELAUNCHED").is_some() {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        println!(
+            "{}",
+            serde_json::json!({
+                "relaunched": true,
+                "exe": exe.display().to_string(),
+                "version": vorcall_core::update::Version::current().to_string(),
+            })
+        );
+        let _ = std::io::stdout().flush();
+        std::process::exit(0);
+    }
+
     // reqwest is built with `rustls-no-provider`; without this it panics on the
     // first request. An Err only means someone already installed a provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -84,7 +115,14 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = match parse_args(std::env::args().skip(1)) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("check-update") => std::process::exit(update_cmd::check_update(argv).await),
+        Some("apply-update") => std::process::exit(update_cmd::apply_update(argv)),
+        _ => {}
+    }
+
+    let args = match parse_args(argv.into_iter()) {
         Ok(Some(args)) => args,
         Ok(None) => {
             println!("{USAGE}");

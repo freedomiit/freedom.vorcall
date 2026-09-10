@@ -1,0 +1,6 @@
+# Ed25519 public keys trusted by the client to verify releases/manifest.json.
+# One key per line, 64 lowercase hex chars (32 bytes). Blank lines and '#' comments are ignored.
+# Baked into vorcall-core at build time (include_str!). A manifest is accepted when ANY key here verifies it,
+# so rotation is: add the new key, ship a release, sign later releases with it, then drop the old key.
+# An empty list disables the updater entirely ("no update keys baked in").
+# The private key lives only in the GitHub secret VORCALL_UPDATE_SIGNING_KEY and the owner's password manager.

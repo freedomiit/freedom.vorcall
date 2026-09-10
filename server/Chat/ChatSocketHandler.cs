@@ -1,5 +1,7 @@
 using System.Net.WebSockets;
 using Google.Protobuf;
+using Microsoft.EntityFrameworkCore;
+using Vorcall.Server.Data;
 using Vorcall.Server.Protocol;
 
 namespace Vorcall.Server.Chat;
@@ -9,10 +11,12 @@ namespace Vorcall.Server.Chat;
 public sealed class ChatSocketHandler(
     ConnectionRegistry registry,
     MessageService messages,
+    IDbContextFactory<AppDbContext> contextFactory,
     IHostApplicationLifetime lifetime,
     ILogger<ChatSocketHandler> logger)
 {
     private const int MaxInboundBytes = 16 * 1024;
+    private const int MaxClientDescriptionLength = 64;
     private const int ReceiveBufferSize = 4 * 1024;
     private const uint SupportedProtocolVersion = 1;
 
@@ -128,14 +132,53 @@ public sealed class ChatSocketHandler(
                 "session replaced");
         }
 
+        var clientVersion = NormalizeClientField(frame.Hello.ClientVersion);
+        var clientPlatform = NormalizeClientField(frame.Hello.ClientPlatform);
+        await RecordClientAsync(userId, clientVersion, clientPlatform);
+
         logger.LogInformation(
-            "Connection {ConnectionId} (user {UserId} {Username}) connected; {ConnectionCount} live, latest message {LatestMessageId}",
+            "Connection {ConnectionId} (user {UserId} {Username}, client {ClientVersion} {ClientPlatform}) connected; {ConnectionCount} live, latest message {LatestMessageId}",
             connection.Id,
             userId,
             username,
+            clientVersion ?? "-",
+            clientPlatform ?? "-",
             registry.Count,
             latestMessageId);
         return true;
+    }
+
+    // Hello carries these for the update endpoints and the admin CLI to report on; they are
+    // whatever the client claims and are never enforced, so anything unusable becomes null.
+    private static string? NormalizeClientField(string? raw)
+    {
+        var trimmed = raw?.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return null;
+        }
+
+        return trimmed.Length > MaxClientDescriptionLength ? trimmed[..MaxClientDescriptionLength] : trimmed;
+    }
+
+    // Best effort by design: the handshake is already complete, and losing a version reading is
+    // never a reason to refuse the session.
+    private async Task RecordClientAsync(long userId, string? clientVersion, string? clientPlatform)
+    {
+        try
+        {
+            await using var db = await contextFactory.CreateDbContextAsync();
+            await db.Users
+                .Where(u => u.Id == userId)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(u => u.LastClientVersion, clientVersion)
+                    .SetProperty(u => u.LastClientPlatform, clientPlatform)
+                    .SetProperty(u => u.LastSeenAt, (DateTime?)DateTime.UtcNow));
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not record the client version of user {UserId}", userId);
+        }
     }
 
     private async Task PumpAsync(ClientConnection connection, SocketReader reader)

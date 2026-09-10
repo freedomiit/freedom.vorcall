@@ -1,6 +1,7 @@
 //! Everything the Vorcall client does that is not drawing: configuration,
 //! endpoint resolution, the account endpoints, the signed-in session and its
-//! tokens, history fetching and the WebSocket connection loop.
+//! tokens, history fetching, the WebSocket connection loop and the signed
+//! self-update.
 //!
 //! Deliberately free of any UI dependency.
 
@@ -11,6 +12,7 @@ pub mod endpoints;
 pub mod history;
 pub mod http;
 pub mod session;
+pub mod update;
 
 pub use config::Config;
 pub use connection::{Command, DisconnectReason, Event, MediaKey};

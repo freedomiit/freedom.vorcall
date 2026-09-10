@@ -57,6 +57,20 @@ Registration signs the user in and returns tokens. `Hello.nickname` is deprecate
 
 **Rate limits** — `/api/auth/register|login|refresh` allow 10 requests per minute per client IP (sliding window; `429` with `Retry-After: 60`). Login locks a username after 5 consecutive failures for 60 s, doubling on each further lock up to 15 minutes, cleared by a successful login.
 
+## Updates
+
+Both endpoints need the door key and a valid bearer access token, same as `/api/messages`.
+
+| Endpoint | Success | Failure |
+|---|---|---|
+| `GET /api/updates/manifest` | 200 `application/json`, header `X-Vorcall-Manifest-Signature`, `Cache-Control: no-store` | 404 when no manifest is published |
+| `GET /api/updates/{version}/{file}` | 200 `application/octet-stream`, `Content-Length`, a strong `ETag` (`"<sha256>"`), Range supported | 404 unless `version` equals the published manifest's version and `file` is one of its `platforms.*.path` |
+
+- The manifest body is `manifest.json` exactly as it sits on disk — never re-serialised — so the signature header covers precisely those bytes. It is an Ed25519 signature over the raw body, hex-encoded.
+- `manifest.json` shape: `version`, `notes`, `published_at`, `min_version` (all strings; the three version fields are `MAJOR.MINOR.PATCH`), and `platforms`, a map of platform id (e.g. `linux-x86_64`) to `{path, sha256, size}` — `path` a bare filename served from `/api/updates/{version}/{path}`, `sha256` lowercase hex, `size` in bytes.
+- The client verifies the manifest's signature against the keys baked in from `client/update-keys.pub` before parsing it at all, then verifies a downloaded asset's size and SHA-256 against the manifest before treating it as installable.
+- Version comparison is a plain three-integer compare (`MAJOR.MINOR.PATCH`); anything else — a `v` prefix, a pre-release suffix, extra fields — is rejected rather than parsed loosely.
+
 ## Rooms and presence
 
 Room ids match `^[a-z0-9-]{1,32}$`. The only room today is `general`, the text room. Every connection is a member of `general` from `Hello` on. A `Member` is `{user_id, username}`; ids are the database user ids and are stable across sessions.
@@ -136,7 +150,7 @@ The receive side keeps one jitter buffer per ssrc: adaptive 60–100 ms, packet 
 
 ## Server session state machine (per connection)
 
-1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by `RoomState{"general", ...}` — and one `RoomState` per further room when this connection replaced an earlier one — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
+1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. `Hello` may also carry `client_version` (e.g. `"0.2.0"`) and `client_platform` (e.g. `"linux-x86_64"`), both optional: the server logs them and stores them on the account (`users.last_client_version`/`last_client_platform`/`last_seen_at`) for the admin CLI's `users list` and `users outdated`. Neither field is enforced — a client that omits them (any build before the updater) still connects normally. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by `RoomState{"general", ...}` — and one `RoomState` per further room when this connection replaced an earlier one — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
 2. **Ready** — handles `SendMessage`, `Ping`/`Pong`, `JoinRoom` and `LeaveRoom` as described under Rooms and presence, and `JoinVoice`/`LeaveVoice` as described under Voice. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
 3. **Any state** — unparsable bytes or a text frame: fatal protocol error, close 1008. No frame received for 120 s: close 1001. A connection whose outbound queue exceeds 256 frames is closed with 1013. On server shutdown every socket is closed with 1001. If a connection's outbound queue is already full when a fatal error occurs, the `Error` frame may be dropped and only the close frame (1013 or 1008) is delivered: a slow consumer is closed as a slow consumer.
 

@@ -33,6 +33,7 @@ use crate::endpoints::Endpoints;
 use crate::history;
 use crate::http::{self, ApiFailure};
 use crate::session::{self, Session};
+use crate::update;
 
 type WsMessage = tungstenite::Message;
 
@@ -570,6 +571,8 @@ async fn attempt(
     let hello = ClientFrame {
         payload: Some(client_frame::Payload::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
+            client_version: update::Version::current().to_string(),
+            client_platform: update::platform(),
             ..Default::default()
         })),
     };

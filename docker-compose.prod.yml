@@ -38,6 +38,11 @@ services:
       # voice media relay: UDP, public on purpose (clients talk to it directly, nginx cannot proxy UDP).
       # Also needs an ingress rule for UDP 5005 in the OCI VCN security list.
       - "5005:5005/udp"
+    volumes:
+      # release manifests + client binaries published by .github/workflows/release.yml
+      # (releases/<version>/…, releases/manifest.json, releases/manifest.sig); served
+      # by /api/updates/*. Read-only: the workflow writes, the backend only reads.
+      - ./releases:/releases:ro
     depends_on:
       db:
         condition: service_healthy

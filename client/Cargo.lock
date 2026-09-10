@@ -3908,6 +3908,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4785,7 +4798,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4807,16 +4820,19 @@ dependencies = [
 
 [[package]]
 name = "vorcall-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "directories",
  "futures",
+ "hex",
  "prost",
  "rand 0.9.5",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",
@@ -4829,10 +4845,11 @@ dependencies = [
 
 [[package]]
 name = "vorcall-probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "rustls",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4842,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -4850,8 +4867,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorcall-release"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "ring",
+ "serde_json",
+ "vorcall-core",
+]
+
+[[package]]
 name = "vorcall-voice"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "opus-rs",
@@ -6077,6 +6106,12 @@ dependencies = [
  "quote",
  "syn 3.0.5",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zvariant"

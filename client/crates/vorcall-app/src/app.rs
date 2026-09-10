@@ -15,6 +15,7 @@ use iced::widget::scrollable::{RelativeOffset, Viewport};
 use iced::widget::{Id, operation};
 use iced::{Element, Size, Subscription, Task, Theme, keyboard, window};
 use vorcall_core::connection::{self, Command, DisconnectReason, Event, GENERAL_ROOM, MediaKey};
+use vorcall_core::update::{self, Checker, Outcome, Progress, PublicKey, Ready, Version};
 use vorcall_core::{
     ApiFailure, ChatMessage, Config, Endpoints, ErrorCode, Member, Session, VoiceMember, auth,
     config, session,
@@ -23,7 +24,7 @@ use vorcall_voice::{MediaConfig, MediaEngine, Stats};
 
 use crate::view;
 use crate::voice::{self, AudioCommand, AudioEvent, AudioHandle, AudioSettings};
-use crate::{audio, brand, notify};
+use crate::{audio, brand, notify, update_ui};
 
 /// How many messages stay in memory; nothing is persisted.
 pub const MESSAGE_LIMIT: usize = 2000;
@@ -43,6 +44,16 @@ const SPEAKING_WINDOW: Duration = Duration::from_millis(200);
 /// Ticks between two reads of the media statistics: the status line moves far
 /// slower than the speaking dots.
 const STATS_EVERY: u32 = 10;
+
+/// How often a connected client asks whether there is a new release.
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// What the voice room gets between the LeaveVoice and the swap: the frame has
+/// to reach the server and the engine has to stop its tasks, and the process
+/// that replaces this one waits for neither.
+const RESTART_GRACE: Duration = Duration::from_millis(750);
+/// The coarsest step a download reports, so a big release is not a message per
+/// chunk. Below it, one percent is the step.
+const PROGRESS_STEP: u64 = 1024 * 1024;
 
 const UNEXPECTED: &str = "Unexpected server answer";
 
@@ -66,6 +77,21 @@ pub struct App {
     main_window: Option<window::Id>,
     entrance: Option<brand::entrance::Entrance>,
     icon: Option<window::Icon>,
+    update: UpdateState,
+    update_keys: Vec<PublicKey>,
+    /// The release notes of the last download, kept for the settings page after
+    /// the banner is gone.
+    update_notes: Option<(Version, String)>,
+    /// Whether this process has checked at all: the first connection is what
+    /// starts it, and every reconnect after that must not.
+    checked_on_connect: bool,
+    /// What an earlier answer said about the update in flight. The download
+    /// progress never says whether it is required, and `Restarting` carries no
+    /// manifest of its own, so both read this instead.
+    force_required: bool,
+    pending_restart: Option<Ready>,
+    loading: brand::loading::Loading,
+    loading_elapsed: Duration,
 }
 
 pub enum Screen {
@@ -211,6 +237,71 @@ pub enum Status {
     Disconnected(String),
 }
 
+/// Where the self-updater is. `Disabled` is decided at boot and never leaves:
+/// such a build neither checks nor swaps anything.
+pub enum UpdateState {
+    Disabled(String),
+    Idle,
+    Checking,
+    UpToDate {
+        at: Instant,
+    },
+    NoBuild {
+        platform: String,
+    },
+    Downloading {
+        version: Version,
+        received: u64,
+        total: u64,
+        required: bool,
+    },
+    Ready {
+        ready: Ready,
+        dismissed: bool,
+    },
+    Failed {
+        message: String,
+        required: bool,
+        at: Instant,
+    },
+    Restarting,
+}
+
+impl UpdateState {
+    /// Whether another check would only get in the way of what is already going
+    /// on — or of a build that does not update itself at all.
+    pub fn busy(&self) -> bool {
+        match self {
+            Self::Disabled(_) | Self::Checking | Self::Downloading { .. } | Self::Restarting => {
+                true
+            }
+            // "Later" only puts the banner away. The next check reuses the file
+            // already on disk, and its result brings the banner back.
+            Self::Ready { dismissed, .. } => !dismissed,
+            _ => false,
+        }
+    }
+
+    /// Whether the loading creature is on screen, which is what makes its
+    /// per-frame clock worth running.
+    pub fn shows_creature(&self) -> bool {
+        matches!(self, Self::Checking | Self::Downloading { .. })
+    }
+
+    /// Whether the update takes the whole window instead of a banner. `forced`
+    /// is [`App::force_required`]: neither a check nor a restart in flight
+    /// carries the manifest that made the update required, and the retry after
+    /// a failed required update must not flash the chat back into view.
+    pub fn shows_required(&self, forced: bool) -> bool {
+        match self {
+            Self::Downloading { required, .. } | Self::Failed { required, .. } => *required,
+            Self::Ready { ready, .. } => ready.required,
+            Self::Checking | Self::Restarting => forced,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     UsernameChanged(String),
@@ -258,6 +349,19 @@ pub enum Message {
     /// One per frame while the splash is up.
     SplashTick(Instant),
     SplashSkip,
+    /// A check somebody asked for: the settings button, and the retry on the
+    /// required screen.
+    CheckForUpdates,
+    UpdateTick,
+    UpdateProgress(Progress),
+    /// [`Outcome`] is not `Clone` and every [`Message`] is, so the answer
+    /// travels behind an [`Arc`]; the failure is already a sentence.
+    UpdateResult(Result<Arc<Outcome>, String>),
+    RestartForUpdate,
+    ApplyUpdate,
+    DismissUpdate,
+    /// One per frame while the loading creature is on screen.
+    LoadingTick(Instant),
     WindowClosed(window::Id),
     Focus(bool),
     Conn(Event),
@@ -265,7 +369,13 @@ pub enum Message {
 }
 
 impl App {
-    pub fn new(endpoints: Endpoints, config: Config, session: Option<Session>) -> Self {
+    pub fn new(
+        endpoints: Endpoints,
+        config: Config,
+        session: Option<Session>,
+        update_keys: Vec<PublicKey>,
+        disabled: Option<String>,
+    ) -> Self {
         let screen = if session.is_some() {
             Screen::Chat(Box::new(ChatState::new()))
         } else {
@@ -287,6 +397,17 @@ impl App {
             main_window: None,
             entrance: None,
             icon: None,
+            update: match disabled {
+                Some(reason) => UpdateState::Disabled(reason),
+                None => UpdateState::Idle,
+            },
+            update_keys,
+            update_notes: None,
+            checked_on_connect: false,
+            force_required: false,
+            pending_restart: None,
+            loading: brand::loading::Loading::new(),
+            loading_elapsed: Duration::ZERO,
         }
     }
 
@@ -296,8 +417,10 @@ impl App {
         endpoints: Endpoints,
         config: Config,
         session: Option<Session>,
+        update_keys: Vec<PublicKey>,
+        disabled: Option<String>,
     ) -> (Self, Task<Message>) {
-        let mut app = Self::new(endpoints, config, session);
+        let mut app = Self::new(endpoints, config, session, update_keys, disabled);
         app.icon = brand::icon::window_icon();
 
         let task = match brand::entrance::choose() {
@@ -581,6 +704,21 @@ impl App {
                 Task::none()
             }
             Message::SplashSkip => self.close_splash(),
+            Message::CheckForUpdates | Message::UpdateTick => self.check_for_updates(),
+            Message::UpdateProgress(progress) => self.on_update_progress(progress),
+            Message::UpdateResult(result) => self.on_update_result(result),
+            Message::RestartForUpdate => self.restart_for_update(),
+            Message::ApplyUpdate => self.apply_update(),
+            Message::DismissUpdate => {
+                if let UpdateState::Ready { dismissed, .. } = &mut self.update {
+                    *dismissed = true;
+                }
+                Task::none()
+            }
+            Message::LoadingTick(now) => {
+                self.loading_elapsed = self.loading.elapsed(now);
+                Task::none()
+            }
             Message::WindowClosed(id) => {
                 if self.splash == Some(id) {
                     self.splash = None;
@@ -622,6 +760,9 @@ impl App {
         if self.entrance.is_some() {
             subscriptions.push(window::frames().map(Message::SplashTick));
         }
+        if self.creature_visible() {
+            subscriptions.push(window::frames().map(Message::LoadingTick));
+        }
 
         if let Screen::Chat(chat) = &self.screen
             && let Some(session) = self.session.clone()
@@ -641,6 +782,13 @@ impl App {
             // playout and, now and then, the engine statistics.
             if chat.voice.session.is_some() {
                 subscriptions.push(iced::time::every(VOICE_TICK).map(|_| Message::VoiceTick));
+            }
+            // Nothing to ask while the socket is down, and nothing to ask at all
+            // in a build that does not update itself.
+            if matches!(chat.status, Status::Connected)
+                && !matches!(self.update, UpdateState::Disabled(_))
+            {
+                subscriptions.push(iced::time::every(UPDATE_INTERVAL).map(|_| Message::UpdateTick));
             }
         }
         Subscription::batch(subscriptions)
@@ -669,7 +817,18 @@ impl App {
                 error,
                 busy,
             } => view::register(username, password, confirm, invite, error.as_deref(), *busy),
-            Screen::Chat(chat) => view::chat(chat, &self.config, self.username()),
+            Screen::Chat(chat) => {
+                let update = update_ui::UpdateView {
+                    state: &self.update,
+                    notes: self.update_notes.as_ref(),
+                    elapsed: self.loading_elapsed,
+                };
+                if self.update.shows_required(self.force_required) {
+                    update_ui::required(update)
+                } else {
+                    view::chat(chat, &self.config, self.username(), update)
+                }
+            }
         }
     }
 
@@ -1346,6 +1505,16 @@ impl App {
                 )),
                 operation::focus(Id::new(view::USERNAME_ID)),
             ]),
+            // The first connection is the earliest moment there is a token to
+            // check with; every later one is the timer's business.
+            Event::Connected { .. } if !self.checked_on_connect => {
+                self.checked_on_connect = true;
+                let Screen::Chat(chat) = &mut self.screen else {
+                    return Task::none();
+                };
+                let applied = chat.apply(event);
+                Task::batch([applied, self.check_for_updates()])
+            }
             Event::Message(message) => self.on_message(message),
             // Already persisted by the loop; the subscription must not restart,
             // so its identity does not include the tokens.
@@ -1433,6 +1602,166 @@ impl App {
         if let Some(audio) = &self.audio {
             audio.chime();
         }
+    }
+
+    /// Starts one check, unless one is already going or this build does not
+    /// update itself. The token is a clone taken now: a 401 comes back as a
+    /// failure and the next tick tries again with whatever the loop rotated to.
+    fn check_for_updates(&mut self) -> Task<Message> {
+        if self.update.busy() {
+            return Task::none();
+        }
+        let Some(session) = &self.session else {
+            return Task::none();
+        };
+
+        let token = session.access_token.clone();
+        let checker = Checker {
+            endpoints: self.endpoints.clone(),
+            keys: self.update_keys.clone(),
+            current: Version::current(),
+            platform: update::platform(),
+        };
+        self.update = UpdateState::Checking;
+        Task::run(check_stream(checker, token), std::convert::identity)
+    }
+
+    fn on_update_progress(&mut self, progress: Progress) -> Task<Message> {
+        // Only what a live check reports: a message that arrives late must not
+        // undo a restart already on its way.
+        if !matches!(
+            self.update,
+            UpdateState::Checking | UpdateState::Downloading { .. }
+        ) {
+            return Task::none();
+        }
+
+        self.update = match progress {
+            Progress::Checking => UpdateState::Checking,
+            Progress::Downloading {
+                version,
+                received,
+                total,
+                required,
+            } => {
+                // `Failed` and `Restarting` carry no manifest of their own; this
+                // is what they fall back on.
+                self.force_required = required;
+                UpdateState::Downloading {
+                    version,
+                    received,
+                    total,
+                    required,
+                }
+            }
+        };
+        Task::none()
+    }
+
+    fn on_update_result(&mut self, result: Result<Arc<Outcome>, String>) -> Task<Message> {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(message) => {
+                tracing::warn!(%message, "the update check failed");
+                self.update = UpdateState::Failed {
+                    message,
+                    required: self.force_required,
+                    at: Instant::now(),
+                };
+                return Task::none();
+            }
+        };
+
+        match &*outcome {
+            Outcome::UpToDate { .. } => {
+                self.force_required = false;
+                self.update = UpdateState::UpToDate { at: Instant::now() };
+                Task::none()
+            }
+            Outcome::NoBuildForPlatform { .. } => {
+                self.force_required = false;
+                self.update = UpdateState::NoBuild {
+                    platform: update::platform(),
+                };
+                Task::none()
+            }
+            Outcome::Downloaded(ready) => {
+                let ready = ready.clone();
+                self.force_required = ready.required;
+                if !ready.manifest.notes.trim().is_empty() {
+                    self.update_notes =
+                        Some((ready.manifest.version, ready.manifest.notes.clone()));
+                }
+
+                // A download that landed outside the install directory is the
+                // one case a required update still waits for a person.
+                let restart_now = ready.required && !ready.manual;
+                self.update = UpdateState::Ready {
+                    ready,
+                    dismissed: false,
+                };
+                if restart_now {
+                    return self.restart_for_update();
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// Leaves the voice room and closes the media engine before the binary is
+    /// replaced: the swap ends this process without another chance to say so.
+    fn restart_for_update(&mut self) -> Task<Message> {
+        let UpdateState::Ready { ready, .. } = &self.update else {
+            return Task::none();
+        };
+        if ready.manual {
+            return Task::none();
+        }
+
+        self.pending_restart = Some(ready.clone());
+        self.update = UpdateState::Restarting;
+
+        let leaving = self.leave_voice();
+        let closing = match &mut self.screen {
+            Screen::Chat(chat) => chat.voice.close_session(),
+            _ => Task::none(),
+        };
+        let swap = Task::perform(tokio::time::sleep(RESTART_GRACE), |()| Message::ApplyUpdate);
+        Task::batch([leaving, closing]).chain(swap)
+    }
+
+    fn apply_update(&mut self) -> Task<Message> {
+        // The swap only ever follows the restart above, which is what left the
+        // voice room.
+        if !matches!(self.update, UpdateState::Restarting) {
+            return Task::none();
+        }
+        let Some(ready) = self.pending_restart.take() else {
+            return Task::none();
+        };
+
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        match update::swap::apply_and_relaunch(&ready.file, &args) {
+            // On unix the process image is already gone by now; this is Windows,
+            // where the replacement is up and this one is in its way.
+            Ok(update::swap::Relaunched::Spawned) => iced::exit(),
+            Err(e) => {
+                tracing::warn!(error = %e, "the update was not applied");
+                self.update = UpdateState::Failed {
+                    message: format!("restart by hand: {e}"),
+                    required: self.force_required,
+                    at: Instant::now(),
+                };
+                Task::none()
+            }
+        }
+    }
+
+    /// The creature is drawn while a check runs and on the required screen, and
+    /// only the chat screen has room for either.
+    fn creature_visible(&self) -> bool {
+        matches!(self.screen, Screen::Chat(_))
+            && (self.update.shows_creature() || self.update.shows_required(self.force_required))
     }
 
     fn save_config(&self) {
@@ -1773,6 +2102,65 @@ fn connect(input: &ConnectionInput) -> impl Stream<Item = Event> + use<> {
     })
 }
 
+/// One check as a stream of messages: what the core reports on the way, then
+/// the outcome. [`Task::run`] turns it into the task [`App::check_for_updates`]
+/// hands back.
+fn check_stream(checker: Checker, token: String) -> impl Stream<Item = Message> {
+    iced::stream::channel(16, async move |mut output| {
+        let mut throttle = ProgressThrottle::default();
+        let mut reports = output.clone();
+
+        let result = update::check_and_download(&checker, &token, |progress| {
+            if !throttle.admit(&progress) {
+                return;
+            }
+            // A full queue only means the window is behind on a number the next
+            // report replaces anyway.
+            let _ = reports.try_send(Message::UpdateProgress(progress));
+        })
+        .await;
+
+        let _ = futures::SinkExt::send(
+            &mut output,
+            Message::UpdateResult(result.map(Arc::new).map_err(|e| e.to_string())),
+        )
+        .await;
+    })
+}
+
+/// The downloader reports every chunk it writes and every report redraws the
+/// window, so only a step worth looking at is passed on: one percent of the
+/// release, at most [`PROGRESS_STEP`], and the last chunk whatever its size.
+#[derive(Default)]
+struct ProgressThrottle {
+    last: Option<u64>,
+}
+
+impl ProgressThrottle {
+    fn admit(&mut self, progress: &Progress) -> bool {
+        let Progress::Downloading {
+            received, total, ..
+        } = progress
+        else {
+            self.last = None;
+            return true;
+        };
+        let (received, total) = (*received, *total);
+
+        let step = (total / 100).clamp(1, PROGRESS_STEP);
+        let done = total > 0 && received >= total;
+        if let Some(last) = self.last
+            && !done
+            && received.saturating_sub(last) < step
+        {
+            return false;
+        }
+
+        self.last = Some(received);
+        true
+    }
+}
+
 /// Wayland reads the window icon from the desktop entry whose id this matches,
 /// not from the pixels the window carries.
 #[cfg(target_os = "linux")]
@@ -1870,6 +2258,15 @@ pub fn key_label(ptt: &str) -> String {
     }
 }
 
+/// How far a download has come, for the progress bar. An unknown total reads as
+/// nothing done rather than as finished.
+pub fn progress_fraction(received: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    (received as f64 / total as f64).clamp(0.0, 1.0) as f32
+}
+
 /// The pick list offers the system default as an entry; the configuration
 /// spells it `None`.
 fn device_choice(name: String) -> Option<String> {
@@ -1919,4 +2316,230 @@ fn validate_password(password: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use vorcall_core::update::{Asset, Manifest};
+
+    use super::*;
+
+    fn version(raw: &str) -> Version {
+        raw.parse().expect("should parse")
+    }
+
+    fn ready(required: bool, manual: bool) -> Ready {
+        Ready {
+            manifest: Manifest {
+                version: version("0.3.0"),
+                notes: String::new(),
+                published_at: "2026-09-10T18:00:00Z".to_owned(),
+                min_version: version("0.3.0"),
+                platforms: BTreeMap::new(),
+            },
+            asset: Asset {
+                path: "vorcall".to_owned(),
+                sha256: "0".repeat(64),
+                size: 3,
+            },
+            file: PathBuf::from("/opt/vorcall/.vorcall-update-0.3.0"),
+            manual,
+            required,
+        }
+    }
+
+    fn downloading(required: bool) -> UpdateState {
+        UpdateState::Downloading {
+            version: version("0.3.0"),
+            received: 1,
+            total: 2,
+            required,
+        }
+    }
+
+    fn close(actual: f32, expected: f32) -> bool {
+        (actual - expected).abs() < 1e-6
+    }
+
+    #[test]
+    fn a_fraction_without_a_total_is_zero() {
+        assert!(close(progress_fraction(0, 0), 0.0));
+        assert!(close(progress_fraction(512, 0), 0.0));
+    }
+
+    #[test]
+    fn a_fraction_is_the_share_received() {
+        assert!(close(progress_fraction(0, 400), 0.0));
+        assert!(close(progress_fraction(100, 400), 0.25));
+        assert!(close(progress_fraction(400, 400), 1.0));
+    }
+
+    #[test]
+    fn a_fraction_never_passes_one() {
+        assert!(close(progress_fraction(900, 400), 1.0));
+    }
+
+    #[test]
+    fn a_check_waits_for_what_is_already_going_on() {
+        assert!(!UpdateState::Idle.busy());
+        assert!(!UpdateState::UpToDate { at: Instant::now() }.busy());
+        assert!(
+            !UpdateState::NoBuild {
+                platform: "testos-testarch".to_owned()
+            }
+            .busy()
+        );
+        assert!(
+            !UpdateState::Failed {
+                message: "no".to_owned(),
+                required: false,
+                at: Instant::now(),
+            }
+            .busy()
+        );
+
+        assert!(UpdateState::Disabled("debug build".to_owned()).busy());
+        assert!(UpdateState::Checking.busy());
+        assert!(downloading(false).busy());
+        assert!(
+            UpdateState::Ready {
+                ready: ready(false, false),
+                dismissed: false,
+            }
+            .busy()
+        );
+        assert!(UpdateState::Restarting.busy());
+    }
+
+    /// "Later" is only about the banner: the 6 h tick and the settings button
+    /// keep working while an update sits dismissed.
+    #[test]
+    fn a_dismissed_update_does_not_hold_off_the_next_check() {
+        assert!(
+            !UpdateState::Ready {
+                ready: ready(false, false),
+                dismissed: true,
+            }
+            .busy()
+        );
+    }
+
+    #[test]
+    fn only_a_required_update_takes_the_window() {
+        assert!(downloading(true).shows_required(false));
+        assert!(!downloading(false).shows_required(true));
+        assert!(
+            UpdateState::Ready {
+                ready: ready(true, false),
+                dismissed: false,
+            }
+            .shows_required(false)
+        );
+        assert!(
+            !UpdateState::Ready {
+                ready: ready(false, false),
+                dismissed: false,
+            }
+            .shows_required(true)
+        );
+        assert!(
+            UpdateState::Failed {
+                message: "no".to_owned(),
+                required: true,
+                at: Instant::now(),
+            }
+            .shows_required(false)
+        );
+        assert!(!UpdateState::Idle.shows_required(true));
+    }
+
+    /// Neither carries a manifest, so what the app remembers is the only thing
+    /// that keeps the required screen up while the swap — or the retry after a
+    /// failed required update — runs.
+    #[test]
+    fn a_check_or_a_restart_takes_the_window_only_when_it_was_required() {
+        assert!(UpdateState::Restarting.shows_required(true));
+        assert!(!UpdateState::Restarting.shows_required(false));
+        assert!(UpdateState::Checking.shows_required(true));
+        assert!(!UpdateState::Checking.shows_required(false));
+    }
+
+    #[test]
+    fn the_creature_runs_while_a_check_does() {
+        assert!(UpdateState::Checking.shows_creature());
+        assert!(downloading(false).shows_creature());
+        assert!(!UpdateState::Idle.shows_creature());
+        assert!(!UpdateState::Restarting.shows_creature());
+        assert!(
+            !UpdateState::Ready {
+                ready: ready(false, false),
+                dismissed: false,
+            }
+            .shows_creature()
+        );
+    }
+
+    fn report(received: u64, total: u64) -> Progress {
+        Progress::Downloading {
+            version: version("0.3.0"),
+            received,
+            total,
+            required: false,
+        }
+    }
+
+    #[test]
+    fn the_first_report_of_a_download_always_passes() {
+        let mut throttle = ProgressThrottle::default();
+
+        assert!(throttle.admit(&Progress::Checking));
+        assert!(throttle.admit(&report(0, 10_000)));
+    }
+
+    /// One percent of 10 000 bytes is 100 of them.
+    #[test]
+    fn a_step_under_one_percent_is_dropped() {
+        let mut throttle = ProgressThrottle::default();
+        assert!(throttle.admit(&report(0, 10_000)));
+
+        assert!(!throttle.admit(&report(50, 10_000)));
+        assert!(!throttle.admit(&report(99, 10_000)));
+        assert!(throttle.admit(&report(100, 10_000)));
+        assert!(!throttle.admit(&report(150, 10_000)));
+    }
+
+    /// One percent of ten gibibytes is far more than a mebibyte, and a
+    /// mebibyte is already worth redrawing.
+    #[test]
+    fn a_huge_release_steps_by_a_mebibyte() {
+        const TOTAL: u64 = 10 * 1024 * 1024 * 1024;
+        let mut throttle = ProgressThrottle::default();
+        assert!(throttle.admit(&report(0, TOTAL)));
+
+        assert!(!throttle.admit(&report(PROGRESS_STEP - 1, TOTAL)));
+        assert!(throttle.admit(&report(PROGRESS_STEP, TOTAL)));
+    }
+
+    #[test]
+    fn the_last_chunk_always_passes() {
+        let mut throttle = ProgressThrottle::default();
+        assert!(throttle.admit(&report(0, 10_000)));
+        assert!(throttle.admit(&report(9_999, 10_000)));
+
+        assert!(throttle.admit(&report(10_000, 10_000)));
+    }
+
+    /// A second check starts over: its first report is not measured against
+    /// what the last download had reached.
+    #[test]
+    fn checking_again_forgets_the_last_download() {
+        let mut throttle = ProgressThrottle::default();
+        assert!(throttle.admit(&report(0, 10_000)));
+        assert!(throttle.admit(&report(5_000, 10_000)));
+
+        assert!(throttle.admit(&Progress::Checking));
+        assert!(throttle.admit(&report(0, 10_000)));
+    }
 }

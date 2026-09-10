@@ -560,12 +560,18 @@ def intro_svg(rare=False):
 # ----------------------------------------------------------------------------
 
 
+LOAD_SCENE = 4.8              # one scene: the bob's window, and the whole typing loop
+LOAD_PERIOD = LOAD_SCENE * 2  # the full cycle, both scenes
+LOAD_BOB = 1.6                # one bob, up and back down; the scene is three of them
+LOAD_TAP = 0.2                # one tap of a typing hand
+
+
 def eye_el(cls, e):
     cx, cy, rx, ry = e
     return f'<ellipse class="{cls}" cx="{cx}" cy="{cy}" rx="{rx}" ry="{ry}" fill="#000"/>'
 
 
-def typing_arm_keyframes(name, phase, period=4.8, tap=0.2):
+def typing_arm_keyframes(name, phase, period=LOAD_SCENE, tap=LOAD_TAP):
     """Taps during the two typing thirds of the loop; phase offsets the two hands."""
     k = []
     step = tap / period * 100
@@ -580,37 +586,52 @@ def typing_arm_keyframes(name, phase, period=4.8, tap=0.2):
     return f"@keyframes {name}{{{''.join(k)}}}"
 
 
-LOADING_CSS = """
-.sc{animation:9.6s step-end infinite}
-.s1{animation-name:ld-show1}.s2{animation-name:ld-show2}
-@keyframes ld-show1{0%{visibility:visible}50%{visibility:hidden}100%{visibility:hidden}}
-@keyframes ld-show2{0%{visibility:hidden}50%{visibility:visible}100%{visibility:visible}}
+LOADING_CSS = f"""
+.sc{{animation:{LOAD_PERIOD}s step-end infinite}}
+.s1{{animation-name:ld-show1}}.s2{{animation-name:ld-show2}}
+@keyframes ld-show1{{0%{{visibility:visible}}50%{{visibility:hidden}}100%{{visibility:hidden}}}}
+@keyframes ld-show2{{0%{{visibility:hidden}}50%{{visibility:visible}}100%{{visibility:visible}}}}
 
-.b-bob{animation:ld-bob 1.6s ease-in-out infinite}
-.b-squash{transform-origin:128px 226px;animation:ld-squash 1.6s ease-in-out infinite}
-@keyframes ld-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
-@keyframes ld-squash{0%,100%{transform:scale(1.04,.96)}50%{transform:scale(.99,1.01)}}
+.b-bob{{animation:ld-bob {LOAD_BOB}s ease-in-out infinite}}
+.b-squash{{transform-origin:128px 226px;animation:ld-squash {LOAD_BOB}s ease-in-out infinite}}
+@keyframes ld-bob{{0%,100%{{transform:translateY(0)}}50%{{transform:translateY(-6px)}}}}
+@keyframes ld-squash{{0%,100%{{transform:scale(1.04,.96)}}50%{{transform:scale(.99,1.01)}}}}
 
-.t-hand-l{animation:ld-tap-l 4.8s linear infinite 4.8s}
-.t-hand-r{animation:ld-tap-r 4.8s linear infinite 4.8s}
-.t-eyes{animation:ld-scan 4.8s linear infinite 4.8s}
-@keyframes ld-scan{0%,33%{transform:translate(0,6px)}35%{transform:translate(-7px,5px)}49%{transform:translate(7px,5px)}51%{transform:translate(-7px,5px)}65%{transform:translate(7px,5px)}67%,100%{transform:translate(0,6px)}}
+.t-hand-l{{animation:ld-tap-l {LOAD_SCENE}s linear infinite {LOAD_SCENE}s}}
+.t-hand-r{{animation:ld-tap-r {LOAD_SCENE}s linear infinite {LOAD_SCENE}s}}
+.t-eyes{{animation:ld-scan {LOAD_SCENE}s linear infinite {LOAD_SCENE}s}}
+@keyframes ld-scan{{0%,33%{{transform:translate(0,6px)}}35%{{transform:translate(-7px,5px)}}49%{{transform:translate(7px,5px)}}51%{{transform:translate(-7px,5px)}}65%{{transform:translate(7px,5px)}}67%,100%{{transform:translate(0,6px)}}}}
 """ + typing_arm_keyframes("ld-tap-l", True) + "\n" + typing_arm_keyframes("ld-tap-r", False) + """
 @media (prefers-reduced-motion:reduce){.sc,.b-bob,.b-squash,.t-hand-l,.t-hand-r,.t-eyes{animation:none}.s2{visibility:hidden}}
 """
 
 # Laptop from the front, a touch above: a short deck strip with the keyboard, the hands on it,
 # and the tall lid nearest the camera hiding the lower half of the hands.
-DECK = (f'<path fill="{DECK_LIGHT}" d="M66 162 L190 162 L196 178 L60 178 Z"/>'
-        f'<rect x="84" y="165" width="88" height="11" rx="2" fill="{KEYS}"/>')
-LID = f'<rect x="58" y="176" width="140" height="50" rx="7" fill="{STEEL}"/>'
+DECK_PTS = [(66, 162), (190, 162), (196, 178), (60, 178)]
+KEYS_RECT = (84, 165, 88, 11, 2)     # x, y, width, height, corner radius
+LID_RECT = (58, 176, 140, 50, 7)
+LOGO_XF = (128, 201, 0.1, 0.085)     # the mark on the lid: translate, scale about its centre
+TYPING_ARM_W = 18
+TYPING_HAND_R = 12
+TYPING_L = ((66, 124), (108, 168))   # shoulder, hand on the keys
+TYPING_R = ((190, 124), (148, 168))
+
+
+def rect_el(rect, fill):
+    x, y, w, h, rx = rect
+    return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" fill="{fill}"/>'
+
+
+DECK = (f'<path fill="{DECK_LIGHT}" d="M' + " L".join(f"{x} {y}" for x, y in DECK_PTS) + ' Z"/>'
+        + rect_el(KEYS_RECT, KEYS))
+LID = rect_el(LID_RECT, STEEL)
 
 
 def typing_arm(cls, shoulder, hand):
-    pts = capsule(shoulder, hand, 18)
+    pts = capsule(shoulder, hand, TYPING_ARM_W)
     d = "M" + " L".join(f"{x:.1f} {y:.1f}" for x, y in pts) + " Z"
     return (f'<g class="{cls}"><path fill="#fff" d="{d}"/>'
-            f'<circle cx="{hand[0]}" cy="{hand[1]}" r="12" fill="#fff"/></g>')
+            f'<circle cx="{hand[0]}" cy="{hand[1]}" r="{TYPING_HAND_R}" fill="#fff"/></g>')
 
 
 def loading_svg():
@@ -620,8 +641,9 @@ def loading_svg():
         l, r = (EYE_L[0], EYE_L[1] + dy, EYE_L[2], EYE_L[3]), (EYE_R[0], EYE_R[1] + dy, EYE_R[2], EYE_R[3])
         return f'<g class="{cls}">{eye_el("", l)}{eye_el("", r)}</g>'
 
-    arms = typing_arm("t-hand-l", (66, 124), (108, 168)) + typing_arm("t-hand-r", (190, 124), (148, 168))
-    logo = (f'<path fill="{RED}" fill-rule="nonzero" transform="translate(128 201) scale(0.1 0.085) translate(-128 -128)" d="{MARK_D}"/>')
+    arms = typing_arm("t-hand-l", *TYPING_L) + typing_arm("t-hand-r", *TYPING_R)
+    tx, ty, sx, sy = LOGO_XF
+    logo = (f'<path fill="{RED}" fill-rule="nonzero" transform="translate({tx} {ty}) scale({sx} {sy}) translate(-128 -128)" d="{MARK_D}"/>')
     return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Vorcall is loading">
 <style>{LOADING_CSS}</style>
 <defs>
@@ -658,6 +680,11 @@ def f2(v):
     return f"{v:.2f}"
 
 
+def f3(v):
+    """Three decimals, for the handful of values two would round away."""
+    return f"{v:.3f}"
+
+
 def shoelace(pts):
     return sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1]
                for i in range(len(pts)))
@@ -690,18 +717,28 @@ def oriented(sub, want_positive):
     return sub
 
 
-def mark_chains():
-    solids = [body_sub(),
-              horn_sub(horn_points(*HORN_ARGS)),
-              horn_sub(horn_points(*[mirror(p) for p in HORN_ARGS])),
-              foot_sub(84), foot_sub(172), arm_left_sub(), arm_right_sub()]
+def mark_chain_groups():
+    """The mark's rings in the three groups the loading scenes move independently."""
+    body = [body_sub(),
+            horn_sub(horn_points(*HORN_ARGS)),
+            horn_sub(horn_points(*[mirror(p) for p in HORN_ARGS])),
+            foot_sub(84), foot_sub(172)]
+    arms = [arm_left_sub(), arm_right_sub()]
     eyes = [eye_sub(*EYE_L), eye_sub(*EYE_R)]
-    return [oriented(s, True) for s in solids] + [oriented(e, False) for e in eyes]
+    return ([oriented(s, True) for s in body],
+            [oriented(s, True) for s in arms],
+            [oriented(e, False) for e in eyes])
 
 
-def rust_mark():
+def mark_chains():
+    body, arms, eyes = mark_chain_groups()
+    return body + arms + eyes
+
+
+def rust_cmds(chains):
+    """Closed outline chains as `Cmd` literals, one ring after another."""
     lines = []
-    for sub in mark_chains():
+    for sub in chains:
         for cmd in sub:
             if cmd[0] == "M":
                 lines.append(f"    Cmd::M({f2(cmd[1][0])}, {f2(cmd[1][1])}),")
@@ -711,6 +748,25 @@ def rust_mark():
                 lines.append("    Cmd::C(" + ", ".join(f2(v) for p in cmd[1:] for v in p) + "),")
         lines.append("    Cmd::Z,")
     return "\n".join(lines)
+
+
+def rust_mark():
+    return rust_cmds(mark_chains())
+
+
+def rust_chains(name, doc, chains):
+    return "\n".join([doc, f"pub const {name}: &[Cmd] = &[", rust_cmds(chains), "];"])
+
+
+def rust_polygon(name, doc, pts, per_line=6):
+    lines = [doc, f"pub const {name}: &[[f32; 2]] = &["]
+    for i in range(0, len(pts), per_line):
+        lines.append("    " + " ".join(f"[{f2(x)}, {f2(y)}]," for x, y in pts[i:i + per_line]))
+    return "\n".join(lines + ["];"])
+
+
+def rust_array(name, doc, values, fmt=f2):
+    return f"{doc}\npub const {name}: [f32; {len(values)}] = [" + ", ".join(fmt(v) for v in values) + "];"
 
 
 def parse_numbers(spec):
@@ -790,6 +846,8 @@ def rust_module():
     alpha = parse_numbers(SHADE_FADE_VALUES)
     assert len(alpha) == len(alpha_times)
 
+    load_body, load_arms, load_eyes = mark_chain_groups()
+
     wink = frames_for(POSE_KEYS, SOLID_PARTS)
     eye_wink = frames_for(EYE_KEYS, SOLID_PARTS)
     rare = frames_for(ALT_KEYS, RARE_PARTS + SHADED_PARTS)
@@ -850,6 +908,42 @@ def rust_module():
            "/// Crease opacity, linear between these (SMIL `values=\"0;0;1;1\"` on SHADE_FADE_TIMES).",
            "pub const RARE_CREASE_ALPHA_TIMES: &[f32] = &[" + ", ".join(f2(t) for t in alpha_times) + "];",
            "pub const RARE_CREASE_ALPHA: &[f32] = &[" + ", ".join(f2(a) for a in alpha) + "];",
+           "",
+           rust_chains("LOADING_BODY",
+                       "/// The loading creature (`assets/brand/loading.svg`): body, horns and feet, wound\n"
+                       "/// like the solids of `MARK`. Its arms and eyes are separate rings because the\n"
+                       "/// scenes move them on their own.",
+                       load_body),
+           rust_chains("LOADING_ARMS",
+                       "/// The resting arms; the bob scene draws them, the typing scene swaps them for\n"
+                       "/// `LOADING_TYPING_ARM_L` and `LOADING_TYPING_ARM_R`.",
+                       load_arms),
+           rust_chains("LOADING_EYES",
+                       "/// Both eyes at rest, wound against the body so a nonzero fill cuts them out.",
+                       load_eyes),
+           rust_polygon("LOADING_TYPING_ARM_L",
+                        "/// The left arm reaching from the shoulder down to the keys, as a rounded bar.",
+                        capsule(*TYPING_L, TYPING_ARM_W)),
+           rust_polygon("LOADING_TYPING_ARM_R",
+                        "/// The right arm reaching from the shoulder down to the keys.",
+                        capsule(*TYPING_R, TYPING_ARM_W)),
+           rust_array("LOADING_HAND_L", "/// The left hand on the keys: centre and radius.",
+                      (*TYPING_L[1], TYPING_HAND_R)),
+           rust_array("LOADING_HAND_R", "/// The right hand on the keys: centre and radius.",
+                      (*TYPING_R[1], TYPING_HAND_R)),
+           rust_polygon("LOADING_DECK", "/// The laptop deck the hands rest on.", DECK_PTS),
+           rust_array("LOADING_KEYS", "/// The keyboard: x, y, width, height, corner radius.", KEYS_RECT),
+           rust_array("LOADING_LID", "/// The lid, nearest the camera: x, y, width, height, corner radius.",
+                      LID_RECT),
+           rust_array("LOADING_LOGO",
+                      "/// The mark on the lid: `translate(tx, ty) scale(sx, sy) translate(-128, -128)`.",
+                      LOGO_XF, f3),
+           "/// One loading cycle: the bob scene, then the typing scene.",
+           f"pub const LOADING_PERIOD_SECS: f32 = {f2(LOAD_PERIOD)};",
+           "/// One scene of the cycle.",
+           f"pub const LOADING_SCENE_SECS: f32 = {f2(LOAD_SCENE)};",
+           "/// One bob, up and back down; the bob scene is three of them.",
+           f"pub const LOADING_BOB_SECS: f32 = {f2(LOAD_BOB)};",
            ""]
     return "\n".join(out)
 
