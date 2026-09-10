@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_PTT_KEY: &str = "Control";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// `nickname` is what pre-accounts builds wrote here.
@@ -16,6 +18,15 @@ pub struct Config {
     pub notifications: bool,
     #[serde(default)]
     pub sound: bool,
+    /// Input device name as reported by the audio host; `None` = system default.
+    #[serde(default)]
+    pub input_device: Option<String>,
+    #[serde(default)]
+    pub output_device: Option<String>,
+    /// An iced `keyboard::key::Named` variant name ("Control", "F8", "Space", ...)
+    /// or a single character. Left/right location is ignored.
+    #[serde(default = "default_ptt_key")]
+    pub ptt_key: String,
 }
 
 impl Default for Config {
@@ -24,12 +35,19 @@ impl Default for Config {
             username: String::new(),
             notifications: true,
             sound: false,
+            input_device: None,
+            output_device: None,
+            ptt_key: DEFAULT_PTT_KEY.to_owned(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ptt_key() -> String {
+    DEFAULT_PTT_KEY.to_owned()
 }
 
 /// `None` when the platform exposes no config directory at all.

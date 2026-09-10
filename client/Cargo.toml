@@ -9,11 +9,15 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+chacha20poly1305 = "=0.11.0"
 chrono = "0.4"
+# Already in the lock as a rodio dependency; direct use arrives with capture.
+cpal = "=0.17.3"
 directories = "6"
 futures = "0.3"
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "canvas"] }
 notify-rust = "4.18"
+opus-rs = "=0.1.33"
 prost = "0.14"
 prost-build = "0.14"
 protox = "0.9"
@@ -23,6 +27,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "http2",
 ] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
+rubato = { version = "=5.0.0", default-features = false }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
@@ -31,11 +36,13 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "time",
     "sync",
+    "net",
 ] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 toml = "1"
@@ -46,9 +53,18 @@ webpki-roots = "0.26"
 
 vorcall-core = { path = "crates/vorcall-core" }
 vorcall-proto = { path = "crates/vorcall-proto" }
+vorcall-voice = { path = "crates/vorcall-voice" }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Debug builds must not underrun: the codec and the resampler are pure Rust and
+# run at -O0 otherwise.
+[profile.dev.package.opus-rs]
+opt-level = 3
+
+[profile.dev.package.rubato]
+opt-level = 3

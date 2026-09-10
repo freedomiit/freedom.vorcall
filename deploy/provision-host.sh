@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Provision the Oracle host for Vorcall: certbot, nginx site, TLS renewal hook,
-# the production .env and (optionally) the deploy SSH key.
+# the voice media UDP port, the production .env and (optionally) the deploy
+# SSH key.
 #
 # Runs ON THE HOST as the `ubuntu` user, from /opt/vorcall/deploy/:
 #   scp -r deploy .env.production.example user@<host>:/opt/vorcall/
@@ -19,6 +20,7 @@ APP_DIR=/opt/vorcall
 SITE=/etc/nginx/sites-available/$DOMAIN
 CERT_EMAIL=admin@example.com
 WEBROOT=/var/www/certbot
+VOICE_PORT=5005
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIVE_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
@@ -126,7 +128,29 @@ printf '#!/bin/sh\nsystemctl reload nginx\n' \
 sudo chmod 755 /etc/letsencrypt/renewal-hooks/deploy/vorcall-reload-nginx.sh
 echo "hook in place: /etc/letsencrypt/renewal-hooks/deploy/vorcall-reload-nginx.sh"
 
-# --- 7. production .env -----------------------------------------------------
+# --- 7. voice media port -----------------------------------------------------
+step "voice media port udp/$VOICE_PORT"
+# Docker publishes the backend's UDP port through its own DNAT/FORWARD chains, so
+# this INPUT rule is belt-and-braces: it only matters if the backend ever runs
+# with host networking. Inserted before the trailing REJECT so it is reachable.
+if sudo iptables -C INPUT -p udp -m udp --dport "$VOICE_PORT" -j ACCEPT 2>/dev/null; then
+    echo "iptables: udp/$VOICE_PORT already accepted"
+else
+    reject_line="$(sudo iptables -L INPUT --line-numbers -n | awk '$2 == "REJECT" {print $1; exit}')"
+    if [ -n "$reject_line" ]; then
+        sudo iptables -I INPUT "$reject_line" -p udp -m udp --dport "$VOICE_PORT" -j ACCEPT
+    else
+        sudo iptables -A INPUT -p udp -m udp --dport "$VOICE_PORT" -j ACCEPT
+    fi
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        sudo netfilter-persistent save >/dev/null
+        echo "iptables: accepted udp/$VOICE_PORT and saved the rules"
+    else
+        echo "iptables: accepted udp/$VOICE_PORT (netfilter-persistent not found; rule is not persisted)"
+    fi
+fi
+
+# --- 8. production .env -----------------------------------------------------
 step "production .env"
 mkdir -p "$APP_DIR"
 if [ -f "$APP_DIR/.env" ]; then
@@ -150,7 +174,7 @@ else
     echo "bake the same Vorcall__ServerKey into client builds via VORCALL_SERVER_KEY"
 fi
 
-# --- 8. deploy public key ---------------------------------------------------
+# --- 9. deploy public key ---------------------------------------------------
 step "deploy SSH key"
 if [ -n "${DEPLOY_PUBKEY:-}" ]; then
     mkdir -p ~/.ssh
@@ -169,7 +193,7 @@ else
     echo "DEPLOY_PUBKEY not set, skipping"
 fi
 
-# --- 9. summary -------------------------------------------------------------
+# --- 10. summary ------------------------------------------------------------
 step "summary"
 sudo certbot certificates -d "$DOMAIN" 2>/dev/null | grep -i 'expiry date' || \
     echo "certificate expiry: unknown"
@@ -184,3 +208,4 @@ else
     echo "$APP_DIR/.env: MISSING — the backend will not start without it"
 fi
 echo "next: push to main (or run the deploy workflow) to pull the image and start the stack"
+echo "reminder: the OCI VCN security list must allow ingress UDP $VOICE_PORT from 0.0.0.0/0 (OCI console), or voice will not connect"

@@ -24,6 +24,12 @@ impl Endpoints {
     pub fn is_dev_key(&self) -> bool {
         self.key == DEV_KEY
     }
+
+    /// The host the WebSocket connects to, without port: where media goes when
+    /// `VoiceReady.host` is empty.
+    pub fn host(&self) -> String {
+        self.http_base.host_str().unwrap_or_default().to_owned()
+    }
 }
 
 // Hand-written so the pre-shared key never reaches a log line.

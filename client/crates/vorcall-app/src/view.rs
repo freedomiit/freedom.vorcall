@@ -2,22 +2,25 @@
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    Id, button, column, container, opaque, row, scrollable, stack, text, text_input, toggler,
+    Id, button, column, container, opaque, pick_list, row, scrollable, stack, text, text_input,
+    toggler,
 };
 use iced::{Color, Element, Font, Length, Theme, font};
-use vorcall_core::{ChatMessage, Config, Member};
+use vorcall_core::{ChatMessage, Config, Member, VoiceMember};
+use vorcall_voice::{Link, Stats};
 
-use crate::app::{ChatState, Dialog, MESSAGE_LIMIT, Message, Status};
+use crate::app::{
+    ChatState, Dialog, MESSAGE_LIMIT, Message, Page, SettingsState, Status, VoiceUi, key_label,
+};
+use crate::brand::mark::mark;
+use crate::brand::palette::{DANGER, MUTED, SUCCESS, WARNING};
 
 pub const MESSAGES_ID: &str = "vorcall-messages";
 pub const INPUT_ID: &str = "vorcall-input";
 pub const USERNAME_ID: &str = "vorcall-username";
 pub const CURRENT_PASSWORD_ID: &str = "vorcall-current-password";
-
-const OK: Color = Color::from_rgb(0.36, 0.78, 0.46);
-const WARN: Color = Color::from_rgb(0.95, 0.72, 0.28);
-const DANGER: Color = Color::from_rgb(0.92, 0.37, 0.37);
-const MUTED: Color = Color::from_rgb(0.55, 0.57, 0.62);
+/// The pick list entry that means "whatever the system picks".
+pub const SYSTEM_DEFAULT: &str = "System default";
 
 const SIDEBAR_WIDTH: f32 = 200.0;
 const FIELD_WIDTH: f32 = 320.0;
@@ -34,7 +37,9 @@ pub fn login<'a>(
     }
 
     let mut content = column![
-        text("Vorcall").size(34).font(bold()),
+        row![mark(40.0), text("Vorcall").size(34).font(bold())]
+            .spacing(10)
+            .align_y(Vertical::Center),
         text("Sign in").size(20).color(MUTED),
         text_input("Username", username)
             .id(Id::new(USERNAME_ID))
@@ -77,7 +82,9 @@ pub fn register<'a>(
     }
 
     let mut content = column![
-        text("Vorcall").size(34).font(bold()),
+        row![mark(40.0), text("Vorcall").size(34).font(bold())]
+            .spacing(10)
+            .align_y(Vertical::Center),
         text("Create account").size(20).color(MUTED),
         text_input("Username", username)
             .id(Id::new(USERNAME_ID))
@@ -118,11 +125,14 @@ pub fn register<'a>(
 }
 
 pub fn chat<'a>(chat: &'a ChatState, config: &Config, username: &'a str) -> Element<'a, Message> {
-    let content = column![
-        header(chat, username),
-        row![messages(chat), sidebar(chat, config)].height(Length::Fill),
-        composer(chat),
-    ];
+    let content = match &chat.page {
+        Page::Chat => column![
+            header(chat, username),
+            row![messages(chat), sidebar(chat, config)].height(Length::Fill),
+            composer(chat),
+        ],
+        Page::Settings(state) => column![header(chat, username), settings(state, config)],
+    };
 
     match &chat.dialog {
         Some(dialog) => stack![content, change_password(dialog)].into(),
@@ -135,15 +145,19 @@ fn header<'a>(chat: &ChatState, username: &'a str) -> Element<'a, Message> {
         &chat.status,
         chat.notice.as_deref(),
         chat.history_error.as_deref(),
+        chat.voice.session.is_some().then_some(&chat.voice),
     );
 
     row![
-        text("Vorcall").size(20).font(bold()),
+        row![mark(22.0), text("Vorcall").size(20).font(bold())]
+            .spacing(8)
+            .align_y(Vertical::Center),
         text(label)
             .color(colour)
             .width(Length::Fill)
             .align_x(Horizontal::Right),
         text(username).color(MUTED),
+        button(text("Settings")).on_press(Message::OpenSettings),
         button(text("Change password")).on_press(Message::OpenChangePassword),
         button(text("Log out")).on_press(Message::Logout),
     ]
@@ -226,30 +240,148 @@ fn sidebar<'a>(chat: &'a ChatState, config: &Config) -> Element<'a, Message> {
         .spacing(6)
         .width(Length::Fill);
 
-    container(
-        column![
-            text(format!("Members · {online}/{total}")).font(bold()),
-            scrollable(roster).height(Length::Fill),
-            toggler(config.notifications)
-                .label("Notifications")
-                .on_toggle(Message::SetNotifications),
-            toggler(config.sound)
-                .label("Sound")
-                .on_toggle(Message::SetSound),
+    let mut panel = column![
+        text(format!("Members · {online}/{total}")).font(bold()),
+        scrollable(roster).height(Length::Fill),
+        text("Voice · general").font(bold()),
+        voice_controls(chat),
+    ]
+    .spacing(10)
+    .padding(12);
+
+    let mut speakers: Vec<&VoiceMember> = chat.voice.members.values().collect();
+    speakers.sort_by_cached_key(|member| member.username.to_lowercase());
+    for member in speakers {
+        panel = panel.push(voice_member_row(member, chat));
+    }
+
+    if chat.voice.session.is_some() {
+        let mut hint = format!("Hold {} to talk", key_label(&config.ptt_key));
+        // Deafened already implies muted; saying both would only take room.
+        if chat.voice.deafened {
+            hint.push_str(" · deafened");
+        } else if chat.voice.muted {
+            hint.push_str(" · muted");
+        }
+        panel = panel.push(text(hint).color(MUTED));
+    }
+    if chat.voice.joining {
+        panel = panel.push(text("Joining…").color(MUTED));
+    }
+
+    panel = panel.push(
+        toggler(config.notifications)
+            .label("Notifications")
+            .on_toggle(Message::SetNotifications),
+    );
+    panel = panel.push(
+        toggler(config.sound)
+            .label("Sound")
+            .on_toggle(Message::SetSound),
+    );
+
+    container(panel)
+        .width(SIDEBAR_WIDTH)
+        .height(Length::Fill)
+        .into()
+}
+
+fn voice_controls(chat: &ChatState) -> Element<'_, Message> {
+    if chat.voice.session.is_none() && !chat.voice.joining {
+        // Joining goes through the connection, so it needs one.
+        let connected = matches!(chat.status, Status::Connected);
+        return button(text("Join voice"))
+            .on_press_maybe(connected.then_some(Message::JoinVoice))
+            .into();
+    }
+
+    // Two rows: the three buttons side by side do not fit the sidebar.
+    column![
+        button(text("Leave voice")).on_press(Message::LeaveVoice),
+        row![
+            button(text(if chat.voice.muted { "Unmute" } else { "Mute" }))
+                .on_press(Message::ToggleMute),
+            button(text(if chat.voice.deafened {
+                "Undeafen"
+            } else {
+                "Deafen"
+            }))
+            .on_press(Message::ToggleDeafen),
         ]
-        .spacing(10)
-        .padding(12),
-    )
-    .width(SIDEBAR_WIDTH)
-    .height(Length::Fill)
+        .spacing(6),
+    ]
+    .spacing(6)
     .into()
+}
+
+fn voice_member_row<'a>(member: &'a VoiceMember, chat: &ChatState) -> Element<'a, Message> {
+    let speaking = chat.speaking(member.user_id);
+
+    let mut row = row![
+        text("●").color(if speaking { SUCCESS } else { MUTED }),
+        text(member.username.as_str()).font(if speaking { bold() } else { Font::DEFAULT }),
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center);
+
+    if member.user_id == chat.member_id {
+        row = row.push(text("(you)").color(MUTED));
+    }
+    row.into()
+}
+
+fn settings<'a>(state: &SettingsState, config: &Config) -> Element<'a, Message> {
+    let ptt: Element<'a, Message> = if state.capturing_ptt {
+        text("Press a key… (Esc cancels)").color(WARNING).into()
+    } else {
+        button(text("Change"))
+            .on_press(Message::StartPttCapture)
+            .into()
+    };
+
+    column![
+        text("Settings").size(20).font(bold()),
+        text("Input device"),
+        pick_list(
+            device_options(&state.inputs),
+            Some(device_selection(config.input_device.as_deref())),
+            Message::SetInputDevice,
+        ),
+        text("Output device"),
+        pick_list(
+            device_options(&state.outputs),
+            Some(device_selection(config.output_device.as_deref())),
+            Message::SetOutputDevice,
+        ),
+        row![
+            text(format!("Push-to-talk key: {}", key_label(&config.ptt_key))),
+            ptt,
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center),
+        button(text("Back")).on_press(Message::CloseSettings),
+    ]
+    .spacing(12)
+    .padding(16)
+    .width(Length::Fill)
+    .into()
+}
+
+fn device_options(names: &[String]) -> Vec<String> {
+    std::iter::once(SYSTEM_DEFAULT.to_owned())
+        .chain(names.iter().cloned())
+        .collect()
+}
+
+fn device_selection(chosen: Option<&str>) -> String {
+    chosen.unwrap_or(SYSTEM_DEFAULT).to_owned()
 }
 
 fn member_row<'a>(member: &'a Member, chat: &ChatState) -> Element<'a, Message> {
     let online = chat.online.contains(&member.user_id);
 
     let mut row = row![
-        text("●").color(if online { OK } else { MUTED }),
+        text("●").color(if online { SUCCESS } else { MUTED }),
         text(member.username.as_str()).font(if online { bold() } else { Font::DEFAULT }),
     ]
     .spacing(6)
@@ -356,11 +488,12 @@ fn status_line(
     status: &Status,
     notice: Option<&str>,
     history_error: Option<&str>,
+    voice: Option<&VoiceUi>,
 ) -> (String, Color) {
-    let (label, colour) = match status {
+    let (mut label, mut colour) = match status {
         Status::Connecting => ("Connecting…".to_owned(), MUTED),
-        Status::Connected => ("Connected".to_owned(), OK),
-        Status::Reconnecting { in_secs } => (format!("Reconnecting in {in_secs}s"), WARN),
+        Status::Connected => ("Connected".to_owned(), SUCCESS),
+        Status::Reconnecting { in_secs } => (format!("Reconnecting in {in_secs}s"), WARNING),
         Status::Unauthorized => (
             "Unauthorized: rebuild the client with the current key".to_owned(),
             DANGER,
@@ -368,13 +501,50 @@ fn status_line(
         Status::Disconnected(reason) => (format!("Disconnected — {reason}"), DANGER),
     };
 
+    if let Some(voice) = voice {
+        match voice.stats.link {
+            Link::Connecting => label.push_str(" · voice: connecting"),
+            Link::Connected => {
+                let rtt = voice
+                    .stats
+                    .rtt_last_ms
+                    .map_or_else(|| "–".to_owned(), |ms| ms.round().to_string());
+                label.push_str(&format!(
+                    " · voice {rtt} ms · loss {:.1}%",
+                    loss(&voice.stats)
+                ));
+            }
+            // The socket is up and nothing comes back: a person can act on that.
+            Link::NoMedia => {
+                label.push_str(" · voice: no media");
+                colour = WARNING;
+            }
+        }
+    }
+
     if let Some(notice) = notice {
-        return (format!("{label} · {notice}"), WARN);
+        return (format!("{label} · {notice}"), WARNING);
     }
     if history_error.is_some() {
-        return (format!("{label} · history unavailable"), WARN);
+        return (format!("{label} · history unavailable"), WARNING);
     }
     (label, colour)
+}
+
+/// What the jitter buffers never got, over every peer.
+fn loss(stats: &Stats) -> f64 {
+    let (received, lost) = stats
+        .peers
+        .iter()
+        .fold((0u64, 0u64), |(received, lost), (_, peer)| {
+            (received + peer.received, lost + peer.lost)
+        });
+
+    let total = received + lost;
+    if total == 0 {
+        return 0.0;
+    }
+    lost as f64 * 100.0 / total as f64
 }
 
 fn format_time(unix_ms: i64) -> String {

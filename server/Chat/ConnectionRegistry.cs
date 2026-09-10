@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
+using Google.Protobuf;
 using Vorcall.Server.Protocol;
+using Vorcall.Server.Voice;
 
 namespace Vorcall.Server.Chat;
 
@@ -30,11 +32,30 @@ public enum LeaveOutcome
     Left,
 }
 
+public enum JoinVoiceOutcome
+{
+    UnknownRoom,
+    Stale,
+    NotAMember,
+    Unavailable,
+    Rejoined,
+    Joined,
+}
+
+public enum LeaveVoiceOutcome
+{
+    UnknownRoom,
+    Stale,
+    NotInVoice,
+    Left,
+}
+
 // The connection set and the presence model in one place. Every membership change and every
 // room broadcast runs under _gate, which is what gives PROTOCOL.md its ordering guarantee: a
 // connection cannot see a ChatMessage, MemberJoined or MemberLeft before its own Welcome and
-// initial RoomState, because those are enqueued under the same lock.
-public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
+// initial RoomState, because those are enqueued under the same lock. Voice membership lives
+// under the same lock, so a voice frame can never overtake the RoomState of its own room.
+public sealed class ConnectionRegistry
 {
     public const string GeneralRoomId = "general";
 
@@ -46,6 +67,16 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
     // One live connection per account; both guarded by _gate.
     private readonly Dictionary<long, ClientConnection> _online = [];
     private readonly Dictionary<string, Room> _rooms = new() { [GeneralRoomId] = new Room(GeneralRoomId) };
+
+    private readonly VoiceRelay _relay;
+    private readonly ILogger<ConnectionRegistry> _logger;
+
+    public ConnectionRegistry(VoiceRelay relay, ILogger<ConnectionRegistry> logger)
+    {
+        _relay = relay;
+        _logger = logger;
+        _relay.SpeakingChanged += OnSpeakingChanged;
+    }
 
     public int Count => _connections.Count;
 
@@ -59,6 +90,7 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
     public ClientConnection? Attach(ClientConnection connection, long userId, string username, long latestMessageId)
     {
         List<ClientConnection>? slow = null;
+        List<uint> removed = [];
         ClientConnection? replaced;
         lock (_gate)
         {
@@ -72,6 +104,15 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
                 // sees a leave/join pair for what is really one session moving.
                 foreach (var room in _rooms.Values)
                 {
+                    // Voice first, and never transferred: the key and ssrc belong to the socket
+                    // that proved its address. Announcing it before the text slot changes hands
+                    // also keeps the leave off the new connection's outbox, which owes Welcome
+                    // its first frame.
+                    if (room.Voice.TryGetValue(userId, out var slot) && ReferenceEquals(slot.Connection, replaced))
+                    {
+                        RemoveVoiceLocked(room, userId, ref slow, removed);
+                    }
+
                     if (Holds(room, replaced, userId))
                     {
                         room.Members[userId] = connection;
@@ -109,6 +150,7 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
         }
 
         CloseSlow(slow);
+        ReleaseVoice(removed);
         return replaced;
     }
 
@@ -122,6 +164,7 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
         }
 
         List<ClientConnection>? slow = null;
+        List<uint> removed = [];
         lock (_gate)
         {
             if (!IsLive(connection, userId))
@@ -138,6 +181,10 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
                 }
 
                 room.Members.Remove(userId);
+
+                // VoiceMemberLeft before MemberLeft: the room stops hearing the session before
+                // it stops seeing the member.
+                RemoveVoiceLocked(room, userId, ref slow, removed);
                 BroadcastLocked(
                     room,
                     new ServerFrame { MemberLeft = new MemberLeft { RoomId = room.Id, UserId = userId } },
@@ -147,6 +194,7 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
         }
 
         CloseSlow(slow);
+        ReleaseVoice(removed);
     }
 
     public MembershipCheck Check(ClientConnection connection, string roomId)
@@ -210,7 +258,7 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
 
             // Both outcomes answer with the full membership: joining a room twice is the
             // client's resync primitive.
-            Enqueue(connection, new ServerFrame { RoomState = StateOf(room) }, ref slow);
+            EnqueueState(connection, room, ref slow);
         }
 
         CloseSlow(slow);
@@ -225,6 +273,7 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
         }
 
         List<ClientConnection>? slow = null;
+        List<uint> removed = [];
         lock (_gate)
         {
             if (!_rooms.TryGetValue(roomId, out var room))
@@ -242,6 +291,9 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
                 return LeaveOutcome.NotAMember;
             }
 
+            // Leaving the text room leaves its voice channel too, announced first.
+            RemoveVoiceLocked(room, userId, ref slow, removed);
+
             // Broadcast before the removal: PROTOCOL.md has the leaver receive its own MemberLeft.
             BroadcastLocked(
                 room,
@@ -252,7 +304,102 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
         }
 
         CloseSlow(slow);
+        ReleaseVoice(removed);
         return LeaveOutcome.Left;
+    }
+
+    public JoinVoiceOutcome JoinVoice(ClientConnection connection, string roomId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return JoinVoiceOutcome.Stale;
+        }
+
+        List<ClientConnection>? slow = null;
+        List<uint> removed = [];
+        JoinVoiceOutcome outcome;
+        lock (_gate)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room))
+            {
+                return JoinVoiceOutcome.UnknownRoom;
+            }
+
+            if (!IsLive(connection, userId))
+            {
+                return JoinVoiceOutcome.Stale;
+            }
+
+            // Voice rides on the text room: its audience is the text membership, so there is
+            // nobody to announce a voice join to before the text join happened.
+            if (!Holds(room, connection, userId))
+            {
+                return JoinVoiceOutcome.NotAMember;
+            }
+
+            if (!_relay.IsAvailable)
+            {
+                return JoinVoiceOutcome.Unavailable;
+            }
+
+            // Repeating JoinVoice is safe, but it is never a no-op: the caller's old session
+            // ends and a fresh one replaces it. A client that asks again has rebuilt its media
+            // engine with the sequence counter back at zero, so handing back the same key would
+            // repeat (key, nonce) pairs that the relay's replay window already refuses. Every
+            // VoiceReady therefore carries a key and ssrc that were never used before.
+            outcome = room.Voice.ContainsKey(userId) ? JoinVoiceOutcome.Rejoined : JoinVoiceOutcome.Joined;
+            RemoveVoiceLocked(room, userId, ref slow, removed);
+
+            // CreateSession takes the relay's own lock and calls nothing back into here.
+            var slot = new VoiceSlot(connection, _relay.CreateSession(room.Id, userId));
+            room.Voice[userId] = slot;
+
+            Enqueue(connection, VoiceReadyOf(room, slot.Session), ref slow);
+            Enqueue(connection, VoiceStateOf(room), ref slow);
+            BroadcastLocked(
+                room,
+                new ServerFrame { VoiceMemberJoined = new VoiceMemberJoined { RoomId = room.Id, Member = VoiceMemberOf(slot) } },
+                except: userId,
+                ref slow);
+        }
+
+        CloseSlow(slow);
+        ReleaseVoice(removed);
+        return outcome;
+    }
+
+    public LeaveVoiceOutcome LeaveVoice(ClientConnection connection, string roomId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return LeaveVoiceOutcome.Stale;
+        }
+
+        List<ClientConnection>? slow = null;
+        List<uint> removed = [];
+        lock (_gate)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room))
+            {
+                return LeaveVoiceOutcome.UnknownRoom;
+            }
+
+            if (!IsLive(connection, userId))
+            {
+                return LeaveVoiceOutcome.Stale;
+            }
+
+            if (!room.Voice.ContainsKey(userId))
+            {
+                return LeaveVoiceOutcome.NotInVoice;
+            }
+
+            RemoveVoiceLocked(room, userId, ref slow, removed);
+        }
+
+        CloseSlow(slow);
+        ReleaseVoice(removed);
+        return LeaveVoiceOutcome.Left;
     }
 
     public void BroadcastToRoom(string roomId, ServerFrame frame)
@@ -304,16 +451,42 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
         var general = _rooms[GeneralRoomId];
         if (Holds(general, connection, userId))
         {
-            Enqueue(connection, new ServerFrame { RoomState = StateOf(general) }, ref slow);
+            EnqueueState(connection, general, ref slow);
         }
 
         foreach (var room in _rooms.Values)
         {
             if (room.Id != GeneralRoomId && Holds(room, connection, userId))
             {
-                Enqueue(connection, new ServerFrame { RoomState = StateOf(room) }, ref slow);
+                EnqueueState(connection, room, ref slow);
             }
         }
+    }
+
+    // A room is always described in full: PROTOCOL.md pairs every RoomState with the voice
+    // occupancy of the same room, even when that occupancy is empty.
+    private static void EnqueueState(ClientConnection connection, Room room, ref List<ClientConnection>? slow)
+    {
+        Enqueue(connection, new ServerFrame { RoomState = StateOf(room) }, ref slow);
+        Enqueue(connection, VoiceStateOf(room), ref slow);
+    }
+
+    // The whole text room hears it, the leaver included. The media session itself is released
+    // after the lock, because RemoveSession can raise SpeakingChanged straight back into a
+    // broadcast.
+    private static void RemoveVoiceLocked(Room room, long userId, ref List<ClientConnection>? slow, List<uint> removed)
+    {
+        if (!room.Voice.Remove(userId, out var slot))
+        {
+            return;
+        }
+
+        removed.Add(slot.Session.Ssrc);
+        BroadcastLocked(
+            room,
+            new ServerFrame { VoiceMemberLeft = new VoiceMemberLeft { RoomId = room.Id, UserId = userId } },
+            except: null,
+            ref slow);
     }
 
     private static bool Holds(Room room, ClientConnection connection, long userId)
@@ -333,6 +506,55 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
     private static Member MemberOf(ClientConnection connection, long userId)
         => new() { UserId = userId, Username = connection.Username ?? string.Empty };
 
+    private static ServerFrame VoiceStateOf(Room room)
+    {
+        var state = new VoiceState { RoomId = room.Id };
+        foreach (var slot in room.Voice.Values)
+        {
+            state.Members.Add(VoiceMemberOf(slot));
+        }
+
+        return new ServerFrame { VoiceState = state };
+    }
+
+    private static VoiceMember VoiceMemberOf(VoiceSlot slot)
+        => new()
+        {
+            UserId = slot.Session.UserId,
+            Username = slot.Connection.Username ?? string.Empty,
+            Ssrc = slot.Session.Ssrc,
+        };
+
+    // Only ever enqueued to the joiner: it carries that session's media key.
+    private ServerFrame VoiceReadyOf(Room room, VoiceSession session)
+        => new()
+        {
+            VoiceReady = new VoiceReady
+            {
+                RoomId = room.Id,
+                Host = _relay.AdvertisedHost,
+                Port = (uint)_relay.Port,
+                Key = ByteString.CopyFrom(session.Key),
+                Ssrc = session.Ssrc,
+            },
+        };
+
+    private void ReleaseVoice(List<uint> removed)
+    {
+        foreach (var ssrc in removed)
+        {
+            _relay.RemoveSession(ssrc);
+        }
+    }
+
+    // Raised from the relay's threads. No membership re-check: a false that lands after the
+    // user left says nothing a client cannot already handle, and re-taking _gate here is what
+    // keeps this frame ordered against the room's own voice membership changes.
+    private void OnSpeakingChanged(string roomId, long userId, bool speaking)
+        => BroadcastToRoom(
+            roomId,
+            new ServerFrame { Speaking = new Speaking { RoomId = roomId, UserId = userId, Speaking_ = speaking } });
+
     private bool IsLive(ClientConnection connection, long userId)
         => _online.TryGetValue(userId, out var live) && ReferenceEquals(live, connection);
 
@@ -345,7 +567,7 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
 
         foreach (var connection in slow)
         {
-            logger.LogWarning(
+            _logger.LogWarning(
                 "Connection {ConnectionId} (user {UserId} {Username}) fell behind {Capacity} queued frames; closing",
                 connection.Id,
                 connection.UserId,
@@ -363,14 +585,20 @@ public sealed class ConnectionRegistry(ILogger<ConnectionRegistry> logger)
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Connection {ConnectionId}: failed to close with {CloseCode}", connection.Id, (int)status);
+            _logger.LogError(ex, "Connection {ConnectionId}: failed to close with {CloseCode}", connection.Id, (int)status);
         }
     }
+
+    // The connection is kept alongside the session because VoiceMember carries the username,
+    // which lives on the connection and nowhere else.
+    private readonly record struct VoiceSlot(ClientConnection Connection, VoiceSession Session);
 
     private sealed class Room(string id)
     {
         public string Id { get; } = id;
 
         public Dictionary<long, ClientConnection> Members { get; } = [];
+
+        public Dictionary<long, VoiceSlot> Voice { get; } = [];
     }
 }

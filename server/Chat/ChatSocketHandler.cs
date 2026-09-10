@@ -201,6 +201,24 @@ public sealed class ChatSocketHandler(
 
                     break;
 
+                case ClientFrame.PayloadOneofCase.JoinVoice:
+                    if (!HandleJoinVoice(connection, frame.JoinVoice))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.LeaveVoice:
+                    if (!HandleLeaveVoice(connection, frame.LeaveVoice))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
                 case ClientFrame.PayloadOneofCase.Ping:
                     if (!connection.TryEnqueue(new ServerFrame { Pong = new Pong { SentAtUnixMs = frame.Ping.SentAtUnixMs } }))
                     {
@@ -303,6 +321,58 @@ public sealed class ChatSocketHandler(
 
             case LeaveOutcome.Stale:
                 logger.LogDebug("Connection {ConnectionId} left a room after being replaced; dropping", connection.Id);
+                return true;
+
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleJoinVoice(ClientConnection connection, JoinVoice join)
+    {
+        if (!Validation.TryNormalizeRoomId(join.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.JoinVoice(connection, roomId))
+        {
+            case JoinVoiceOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case JoinVoiceOutcome.NotAMember:
+                return NonFatal(connection, ErrorCode.NotAMember, "join the room before joining voice");
+
+            case JoinVoiceOutcome.Unavailable:
+                return NonFatal(connection, ErrorCode.VoiceUnavailable, "voice is not available on this server");
+
+            case JoinVoiceOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} joined voice after being replaced; dropping", connection.Id);
+                return true;
+
+            // Joined and Rejoined: the registry has already queued VoiceReady and VoiceState.
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleLeaveVoice(ClientConnection connection, LeaveVoice leave)
+    {
+        if (!Validation.TryNormalizeRoomId(leave.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.LeaveVoice(connection, roomId))
+        {
+            case LeaveVoiceOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case LeaveVoiceOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, "not in that room's voice channel");
+
+            case LeaveVoiceOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} left voice after being replaced; dropping", connection.Id);
                 return true;
 
             default:

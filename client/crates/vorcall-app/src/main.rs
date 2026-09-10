@@ -6,10 +6,12 @@
 
 mod app;
 mod audio;
+mod brand;
 mod notify;
 mod view;
+mod voice;
 
-use iced::{Size, Theme};
+use iced::Theme;
 use tracing_subscriber::EnvFilter;
 use vorcall_core::Config;
 
@@ -55,14 +57,14 @@ fn main() -> iced::Result {
         }
     };
 
-    iced::application(
-        move || App::new(endpoints.clone(), config.clone(), session.clone()),
+    iced::daemon(
+        move || App::boot(endpoints.clone(), config.clone(), session.clone()),
         App::update,
         App::view,
     )
     .title(App::title)
-    .theme(|_: &App| Theme::Dark)
+    .theme(App::theme)
+    .style(|_: &App, theme: &Theme| brand::palette::style(theme))
     .subscription(App::subscription)
-    .window_size(Size::new(1100.0, 680.0))
     .run()
 }

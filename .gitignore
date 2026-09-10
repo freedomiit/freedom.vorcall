@@ -2,6 +2,8 @@
 /.env
 # Local release build settings (server key); never committed
 client/.env.release
+# Probe credentials for the two production test accounts; never committed
+client/.env.probe
 client/target/
 dist/
 **/bin/

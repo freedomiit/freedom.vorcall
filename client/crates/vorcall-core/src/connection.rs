@@ -24,8 +24,8 @@ use tokio_tungstenite::tungstenite::{
     protocol::{CloseFrame, frame::coding::CloseCode},
 };
 use vorcall_proto::v1::{
-    ChatMessage, ClientFrame, ErrorCode, Hello, Member, MessagePage, Ping, SendMessage,
-    ServerFrame, client_frame, server_frame,
+    ChatMessage, ClientFrame, ErrorCode, Hello, JoinVoice, LeaveVoice, Member, MessagePage, Ping,
+    SendMessage, ServerFrame, VoiceMember, client_frame, server_frame,
 };
 
 use crate::auth;
@@ -56,6 +56,18 @@ pub const GENERAL_ROOM: &str = "general";
 pub enum Command {
     Send { room_id: String, text: String },
     LoadOlder { room_id: String, before: i64 },
+    JoinVoice { room_id: String },
+    LeaveVoice { room_id: String },
+}
+
+/// The per-session media key from `VoiceReady`. Debug never prints it.
+#[derive(Clone)]
+pub struct MediaKey(pub [u8; 32]);
+
+impl fmt::Debug for MediaKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MediaKey(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +153,47 @@ pub enum Event {
     SendDropped,
     /// A rotated token pair, already persisted by this loop.
     SessionUpdated(Session),
+    VoiceReady {
+        room_id: String,
+        host: String,
+        port: u16,
+        key: MediaKey,
+        ssrc: u32,
+    },
+    VoiceState {
+        room_id: String,
+        members: Vec<VoiceMember>,
+    },
+    VoiceMemberJoined {
+        room_id: String,
+        member: VoiceMember,
+    },
+    VoiceMemberLeft {
+        room_id: String,
+        user_id: i64,
+    },
+    Speaking {
+        room_id: String,
+        user_id: i64,
+        speaking: bool,
+    },
+}
+
+/// A log-safe rendering of a received frame: `VoiceReady` carries the media key,
+/// which must never reach a log line.
+fn describe(frame: &ServerFrame) -> String {
+    match &frame.payload {
+        Some(server_frame::Payload::VoiceReady(ready)) => {
+            let room_id = &ready.room_id;
+            let host = &ready.host;
+            let port = ready.port;
+            let ssrc = ready.ssrc;
+            format!(
+                "VoiceReady {{ room_id: {room_id:?}, host: {host:?}, port: {port}, ssrc: {ssrc}, key: <redacted> }}"
+            )
+        }
+        _ => format!("{frame:?}"),
+    }
 }
 
 /// What [`run`] does once one connection attempt is over.
@@ -357,6 +410,11 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
                 .send(Event::OlderFailed("not connected".to_owned()))
                 .await
                 .is_ok()
+        }
+        // No event: the UI re-sends JoinVoice after every Connected.
+        Command::JoinVoice { room_id } | Command::LeaveVoice { room_id } => {
+            tracing::debug!(%room_id, "cannot change voice membership while disconnected");
+            true
         }
     }
 }
@@ -631,7 +689,7 @@ where
                         });
                     }
                 };
-                tracing::debug!(frame = ?server_frame, "received");
+                tracing::debug!(frame = %describe(&server_frame), "received");
 
                 match server_frame.payload {
                     Some(server_frame::Payload::Welcome(welcome)) => return Ok(welcome),
@@ -648,6 +706,23 @@ where
                             return Err(AfterAttempt::Stop(None));
                         }
                         return Err(fatal_outcome(&error));
+                    }
+                    // Voice frames cannot precede Welcome, but ignoring one is
+                    // cheaper than tearing down an otherwise healthy attempt.
+                    Some(server_frame::Payload::VoiceReady(ready)) => {
+                        tracing::debug!(room = %ready.room_id, "ignoring a voice frame before Welcome");
+                    }
+                    Some(server_frame::Payload::VoiceState(state)) => {
+                        tracing::debug!(room = %state.room_id, "ignoring a voice frame before Welcome");
+                    }
+                    Some(server_frame::Payload::VoiceMemberJoined(joined)) => {
+                        tracing::debug!(room = %joined.room_id, "ignoring a voice frame before Welcome");
+                    }
+                    Some(server_frame::Payload::VoiceMemberLeft(left)) => {
+                        tracing::debug!(room = %left.room_id, "ignoring a voice frame before Welcome");
+                    }
+                    Some(server_frame::Payload::Speaking(speaking)) => {
+                        tracing::debug!(room = %speaking.room_id, "ignoring a voice frame before Welcome");
                     }
                     // A payload this build does not know: a newer server may add
                     // frames without a version bump.
@@ -956,7 +1031,7 @@ where
                                 after: Retry::BackoffAfterSession,
                             },
                         };
-                        tracing::debug!(frame = ?server_frame, "received");
+                        tracing::debug!(frame = %describe(&server_frame), "received");
 
                         match server_frame.payload {
                             Some(server_frame::Payload::Message(message)) => {
@@ -1010,6 +1085,62 @@ where
                                 if is_session_replaced(&error) {
                                     break AfterAttempt::Stop(Some(DisconnectReason::SessionReplaced));
                                 }
+                            }
+                            Some(server_frame::Payload::VoiceReady(ready)) => {
+                                let Ok(key) = <[u8; 32]>::try_from(ready.key.as_slice()) else {
+                                    tracing::warn!(
+                                        room = %ready.room_id,
+                                        len = ready.key.len(),
+                                        "ignoring a VoiceReady whose key is not 32 bytes"
+                                    );
+                                    continue;
+                                };
+                                let Ok(port) = u16::try_from(ready.port) else {
+                                    tracing::warn!(
+                                        room = %ready.room_id,
+                                        port = ready.port,
+                                        "ignoring a VoiceReady with an out-of-range port"
+                                    );
+                                    continue;
+                                };
+                                emit_or_break!('live, events, Event::VoiceReady {
+                                    room_id: ready.room_id,
+                                    host: ready.host,
+                                    port,
+                                    key: MediaKey(key),
+                                    ssrc: ready.ssrc,
+                                });
+                            }
+                            Some(server_frame::Payload::VoiceState(state)) => {
+                                emit_or_break!('live, events, Event::VoiceState {
+                                    room_id: state.room_id,
+                                    members: state.members,
+                                });
+                            }
+                            Some(server_frame::Payload::VoiceMemberJoined(joined)) => {
+                                match joined.member {
+                                    Some(member) => emit_or_break!('live, events, Event::VoiceMemberJoined {
+                                        room_id: joined.room_id,
+                                        member,
+                                    }),
+                                    None => tracing::warn!(
+                                        room = %joined.room_id,
+                                        "ignoring a VoiceMemberJoined without a member"
+                                    ),
+                                }
+                            }
+                            Some(server_frame::Payload::VoiceMemberLeft(left)) => {
+                                emit_or_break!('live, events, Event::VoiceMemberLeft {
+                                    room_id: left.room_id,
+                                    user_id: left.user_id,
+                                });
+                            }
+                            Some(server_frame::Payload::Speaking(speaking)) => {
+                                emit_or_break!('live, events, Event::Speaking {
+                                    room_id: speaking.room_id,
+                                    user_id: speaking.user_id,
+                                    speaking: speaking.speaking,
+                                });
                             }
                             // A Pong only had to reach the watchdog above.
                             Some(server_frame::Payload::Pong(_)) => {}
@@ -1112,6 +1243,30 @@ where
                         if let Err(e) = sink.send(WsMessage::binary(frame.encode_to_vec())).await {
                             tracing::warn!(error = %e, "cannot send the message");
                             emit_or_break!('live, events, Event::SendDropped);
+                            break AfterAttempt::Reconnect {
+                                reason: DisconnectReason::Io(e.to_string()),
+                                after: Retry::BackoffAfterSession,
+                            };
+                        }
+                    }
+                    Some(Command::JoinVoice { room_id }) => {
+                        let frame = ClientFrame {
+                            payload: Some(client_frame::Payload::JoinVoice(JoinVoice { room_id })),
+                        };
+                        if let Err(e) = sink.send(WsMessage::binary(frame.encode_to_vec())).await {
+                            tracing::warn!(error = %e, "cannot send JoinVoice");
+                            break AfterAttempt::Reconnect {
+                                reason: DisconnectReason::Io(e.to_string()),
+                                after: Retry::BackoffAfterSession,
+                            };
+                        }
+                    }
+                    Some(Command::LeaveVoice { room_id }) => {
+                        let frame = ClientFrame {
+                            payload: Some(client_frame::Payload::LeaveVoice(LeaveVoice { room_id })),
+                        };
+                        if let Err(e) = sink.send(WsMessage::binary(frame.encode_to_vec())).await {
+                            tracing::warn!(error = %e, "cannot send LeaveVoice");
                             break AfterAttempt::Reconnect {
                                 reason: DisconnectReason::Io(e.to_string()),
                                 after: Retry::BackoffAfterSession,

@@ -22,6 +22,8 @@ message ClientFrame {
     Ping ping = 3;
     JoinRoom join_room = 4;
     LeaveRoom leave_room = 5;
+    JoinVoice join_voice = 6;
+    LeaveVoice leave_voice = 7;
   }
 }
 
@@ -48,6 +50,14 @@ message LeaveRoom {
   string room_id = 1;
 }
 
+message JoinVoice {
+  string room_id = 1;             // the text room whose voice channel to join; requires text membership
+}
+
+message LeaveVoice {
+  string room_id = 1;
+}
+
 // Server -> client. One ServerFrame per binary WebSocket message.
 message ServerFrame {
   oneof payload {
@@ -58,6 +68,11 @@ message ServerFrame {
     RoomState room_state = 5;
     MemberJoined member_joined = 6;
     MemberLeft member_left = 7;
+    VoiceReady voice_ready = 8;
+    VoiceState voice_state = 9;
+    VoiceMemberJoined voice_member_joined = 10;
+    VoiceMemberLeft voice_member_left = 11;
+    Speaking speaking = 12;
   }
 }
 
@@ -93,6 +108,45 @@ message MemberLeft {
   int64 user_id = 2;
 }
 
+// A user in a room's voice channel. ssrc identifies that user's media packets.
+message VoiceMember {
+  int64 user_id = 1;
+  string username = 2;
+  uint32 ssrc = 3;                // non-zero, unique across live voice sessions
+}
+
+// Sent only to the joiner: where to send media and with which key.
+message VoiceReady {
+  string room_id = 1;
+  string host = 2;                // empty means the host of the WebSocket URL
+  uint32 port = 3;                // UDP
+  bytes key = 4;                  // 32 bytes, ChaCha20-Poly1305, valid for this voice session only
+  uint32 ssrc = 5;                // the joiner's own ssrc
+}
+
+// Full voice membership of one room; replaces whatever the client knew.
+message VoiceState {
+  string room_id = 1;
+  repeated VoiceMember members = 2;
+}
+
+message VoiceMemberJoined {
+  string room_id = 1;
+  VoiceMember member = 2;
+}
+
+message VoiceMemberLeft {
+  string room_id = 1;
+  int64 user_id = 2;
+}
+
+// Server-derived from media packets, sent to every member of the text room.
+message Speaking {
+  string room_id = 1;
+  int64 user_id = 2;
+  bool speaking = 3;
+}
+
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   ERROR_CODE_PROTOCOL = 1;         // malformed frame, wrong first frame, unsupported version, text frame
@@ -101,6 +155,8 @@ enum ErrorCode {
   ERROR_CODE_SESSION_REPLACED = 4; // fatal: the same account connected again elsewhere
   ERROR_CODE_UNKNOWN_ROOM = 5;     // non-fatal: room id invalid or unknown
   ERROR_CODE_NOT_A_MEMBER = 6;     // non-fatal: the connection is not in that room
+  ERROR_CODE_VOICE_UNAVAILABLE = 7; // non-fatal: the media relay is disabled or not running
+  ERROR_CODE_NOT_IN_VOICE = 8;      // non-fatal: LeaveVoice while not in that room's voice channel
 }
 
 message Error {

@@ -11,6 +11,7 @@ using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
 using Vorcall.Server.Protocol;
+using Vorcall.Server.Voice;
 
 namespace Vorcall.Server;
 
@@ -39,9 +40,17 @@ public static class ServiceSetup
         // Same reasoning for the signing key: without it every access token would be forgeable.
         var jwt = JwtOptions.FromConfiguration(builder.Configuration);
 
+        // Unusable voice settings fail the boot the same way; an absent key is a valid default.
+        var voice = VoiceOptions.FromConfiguration(builder.Configuration);
+
         builder.Services.AddDbContextFactory<AppDbContext>(o => o.UseNpgsql(connectionString));
         builder.Services.AddSingleton(new ServerKeyValidator(serverKey));
         builder.Services.AddSingleton(jwt);
+        builder.Services.AddSingleton(voice);
+
+        // One instance in both roles: the registry signals over the very relay the host runs.
+        builder.Services.AddSingleton<VoiceRelay>();
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<VoiceRelay>());
         builder.Services.AddSingleton<ConnectionRegistry>();
         builder.Services.AddSingleton<MessageService>();
         builder.Services.AddSingleton<ChatSocketHandler>();

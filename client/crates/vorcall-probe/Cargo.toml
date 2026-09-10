@@ -1,25 +1,16 @@
 [package]
-name = "vorcall-app"
+name = "vorcall-probe"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "vorcall"
+name = "vorcall-probe"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace = true
-chrono.workspace = true
-cpal.workspace = true
 futures.workspace = true
-iced.workspace = true
-notify-rust.workspace = true
-rand.workspace = true
-rodio.workspace = true
-rubato.workspace = true
 rustls.workspace = true
-tiny-skia.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

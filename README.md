@@ -4,17 +4,18 @@ A private chat for a friend group: one room, native Rust desktop client, .NET ba
 
 ## Status
 
-MVP. Present: invite-only accounts, one room (`general`), a presence sidebar, live messages, older history, notifications.
+MVP. Present: invite-only accounts, one room (`general`), a presence sidebar, live messages, older history, notifications, voice rooms with push-to-talk.
 
-Deliberately absent: multiple text rooms, attachments, voice, OAuth/2FA.
+Deliberately absent: multiple text rooms, attachments, OAuth/2FA.
 
 ## Repository layout
 
 ```
 proto/vorcall.proto        shared schema; generated into both server and client at build time
 PROTOCOL.md                wire framing, state machines, limits
-server/                    ASP.NET Core (.NET 10) backend, Vorcall.Server.csproj
-client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall-core, crates/vorcall-app -> binary `vorcall`)
+server/                    ASP.NET Core (.NET 10) backend, Vorcall.Server.csproj (server/Voice/ is the voice UDP relay)
+client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall-core, crates/vorcall-voice -> media engine,
+                            crates/vorcall-probe -> headless voice probe binary, crates/vorcall-app -> binary `vorcall`)
 deploy/                    nginx site configs and the host provisioning script
 scripts/                   client release build scripts (Linux, Windows cross-build)
 docker-compose.yml         local dev: Postgres only
@@ -25,9 +26,11 @@ docker-compose.prod.yml    production stack: Postgres + backend, pulled from GHC
 
 ## Prerequisites
 
-- **Linux (build client + server, run local dev):** Rust via rustup (stable, 1.89+ — MSRV set by notify-rust), .NET SDK 10.0.x, Docker (for the local Postgres), ALSA headers for rodio: Fedora `sudo dnf install -y alsa-lib-devel`, Debian/Ubuntu `libasound2-dev` (CI installs it).
+- **Linux (build client + server, run local dev):** Rust via rustup (stable, 1.89+ — MSRV set by notify-rust), .NET SDK 10.0.x, Docker (for the local Postgres), ALSA headers for rodio/cpal: Fedora `sudo dnf install -y alsa-lib-devel`, Debian/Ubuntu `libasound2-dev` (CI installs it).
 - **Cross-build for Windows (from Linux/Fedora):** the above, plus `sudo dnf install -y clang lld llvm`, `rustup target add x86_64-pc-windows-msvc`, `cargo install cargo-xwin`.
 - **macOS (build client from source only):** Xcode command-line tools, rustup.
+
+Voice adds no build prerequisite beyond the above: `opus-rs` is a pure-Rust codec (no cmake, no system libopus). ALSA headers remain the only Linux-specific requirement, needed for cpal (capture/playback) as well as rodio.
 
 `dotnet` may not be on `PATH`; it can live at `~/.dotnet/dotnet`. The `dotnet-ef` global tool needs `DOTNET_ROOT=~/.dotnet` and `dotnet` on `PATH` (e.g. `PATH=~/.dotnet:$PATH`).
 
@@ -130,6 +133,35 @@ Local:
 ~/.dotnet/dotnet run --project server/Vorcall.Server.csproj -- invites new
 ```
 
+## Voice
+
+One voice channel per text room. Join it from the sidebar; talk with push-to-talk (hold Ctrl by default, while the window is focused); mute and deafen are separate switches. The sidebar shows who is in voice and highlights who is speaking. Media rides a direct UDP path to the server host — not Cloudflare, not nginx — encrypted per voice session.
+
+**Settings:** the "Settings" button in the header opens a full-screen page with the input device, the output device and the push-to-talk key ("Change", then press a key; Esc cancels). These are stored in `config.toml` as `input_device`, `output_device` and `ptt_key`.
+
+**Network:** media goes over UDP 5005 to the server host (`VoiceReady` tells the client the exact host and port). Production needs an ingress rule for UDP 5005 in the OCI VCN security list **and** the host firewall step of `deploy/provision-host.sh`. Server config keys: `Vorcall__VoiceEnabled`, `Vorcall__VoicePort`, `Vorcall__VoiceHost` (all optional, with defaults). Local dev needs nothing extra: the relay binds `0.0.0.0:5005` as soon as the server starts.
+
+**Status line:** "voice N ms · loss x%" is the healthy state (round-trip time and packet loss to the relay); "voice: connecting" means no pong has arrived yet; "voice: no media" means 15 s have passed without a pong — check the VCN rule or host firewall.
+
+**Probe (runtime oracle):** two headless probes exchanging tone are the way to verify the voice path end to end, locally or in production, without opening the GUI.
+
+```
+cd client && cargo build -p vorcall-probe
+```
+
+Two terminals, local server:
+
+```
+VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username alice --send-seconds 10 --listen-seconds 14 --expect-peer
+VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username bob --send-seconds 10 --listen-seconds 14 --expect-peer --tone-hz 660
+```
+
+Each probe prints one JSON line to stdout: `packets_sent`/`packets_received`, `decoded_seconds` and `tone_seconds` (how much of the peer's tone was actually decoded), `gaps`/`late`, `rtt_ms` (min/avg/max/last/samples), `link`, one `peers` entry per remote ssrc (received/lost/late/decoded_frames/decoder_resets), and `speaking_events`. Exit codes: `0` ran, `1` `--expect-peer` heard less than 1 s of tone, `2` usage, sign-in, connection or media failure.
+
+Against production, run the same two-terminal recipe with the two test accounts kept in the gitignored `client/.env.probe` (`export PROBE_A_USER=… PROBE_A_PASS=… PROBE_B_USER=… PROBE_B_PASS=…`), `VORCALL_SERVER_URL` left at its default, and the real key in `VORCALL_SERVER_KEY`.
+
+**Limits worth knowing:** 20 ms Opus frames at 48 kbps CBR; one voice channel (`general`); no echo cancellation (headsets recommended); no voice activation, only push-to-talk; push-to-talk only fires while the window is focused.
+
 ## Protocol
 
 See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limits, and [`proto/vorcall.proto`](proto/vorcall.proto) for the message schema. Both sides generate code from the `.proto` file at build time; never hand-edit generated code.
@@ -150,14 +182,23 @@ See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limi
 4. Rebuild the clients: `scripts/build-client-linux.sh` / `scripts/build-client-windows.sh`. The Mac friend rebuilds from source.
 5. Distribute the new builds. Old clients stop working at deploy time and show "Unauthorized: rebuild the client".
 
+## Rolling out the voice release
+
+1. Open UDP 5005 ingress in the OCI VCN security list.
+2. Push `main` — this deploys. Old clients keep working: they ignore the voice frames (see [Forward compatibility](PROTOCOL.md#forward-compatibility)).
+3. On the host, run `deploy/provision-host.sh` (adds the iptables rule for UDP 5005; idempotent) — copy the updated `deploy/` to the host first, as the script header says.
+4. Verify with two probes against production, using `client/.env.probe` (see [Voice](#voice)).
+5. Rebuild and distribute both clients: `scripts/build-client-linux.sh`, `scripts/build-client-windows.sh`. The Mac friend rebuilds from source.
+6. Friends check the settings page for their microphone.
+
 ## Development gates
 
 ```
-cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo build
+cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test -p vorcall-voice
 ```
 
 ```
 dotnet build server/Vorcall.Server.csproj -warnaserror
 ```
 
-There are no automated tests in the MVP. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph.
+There are no automated tests in the MVP outside `vorcall-voice`'s unit tests. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph.

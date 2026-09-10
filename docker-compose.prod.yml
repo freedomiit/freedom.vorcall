@@ -35,6 +35,9 @@ services:
     ports:
       # loopback only; the host nginx publishes it
       - "127.0.0.1:5004:5000"
+      # voice media relay: UDP, public on purpose (clients talk to it directly, nginx cannot proxy UDP).
+      # Also needs an ingress rule for UDP 5005 in the OCI VCN security list.
+      - "5005:5005/udp"
     depends_on:
       db:
         condition: service_healthy

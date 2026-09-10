@@ -14,4 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 WORKDIR /app
 COPY --from=build /app/publish .
 ENV ASPNETCORE_URLS=http://0.0.0.0:5000
+EXPOSE 5000/tcp
+EXPOSE 5005/udp
 ENTRYPOINT ["dotnet", "Vorcall.Server.dll"]

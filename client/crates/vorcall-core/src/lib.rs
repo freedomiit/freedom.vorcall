@@ -13,8 +13,10 @@ pub mod http;
 pub mod session;
 
 pub use config::Config;
-pub use connection::{Command, DisconnectReason, Event};
+pub use connection::{Command, DisconnectReason, Event, MediaKey};
 pub use endpoints::Endpoints;
 pub use http::ApiFailure;
 pub use session::Session;
-pub use vorcall_proto::v1::{ChatMessage, ErrorCode, Member, MessagePage, TokenResponse};
+pub use vorcall_proto::v1::{
+    ChatMessage, ErrorCode, Member, MessagePage, TokenResponse, VoiceMember,
+};

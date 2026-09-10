@@ -73,10 +73,71 @@ When a connection ends, the remaining members of each room it was in receive `Me
 
 Ordering guarantee: membership changes and room broadcasts are serialized by the server. A connection never sees a `ChatMessage`, `MemberJoined` or `MemberLeft` before its `Welcome` and initial `RoomState`.
 
+## Voice
+
+One voice channel per text room. Voice membership is separate from text membership: a user is in a room's voice channel only after `JoinVoice`, and signalling for it rides the same WebSocket. Media does not — see Media transport.
+
+### Signalling
+
+- `JoinVoice{room_id}` — requires membership of that **text** room. Invalid or unknown room: non-fatal `ERROR_CODE_UNKNOWN_ROOM`. Not a member of the text room: non-fatal `ERROR_CODE_NOT_A_MEMBER`. Relay disabled: non-fatal `ERROR_CODE_VOICE_UNAVAILABLE`. Already in that voice channel: the existing media session ends first — every member of the text room, the caller included, receives `VoiceMemberLeft` — and a new one is created exactly like a fresh join, so a `VoiceReady` always carries a key and ssrc that were never used before. Otherwise the server creates a media session, sends the caller `VoiceReady` then `VoiceState`, and every other member of the **text room** receives `VoiceMemberJoined`.
+- `LeaveVoice{room_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Otherwise every member of the text room **including the leaver** receives `VoiceMemberLeft`, and the media session is invalidated.
+
+Audience: `VoiceState`, `VoiceMemberJoined`, `VoiceMemberLeft` and `Speaking` go to every member of the text room, whether or not they are in voice. `VoiceReady` goes only to the joiner — it carries that session's key and ssrc.
+
+`VoiceMember` is `{user_id, username, ssrc}`; `user_id` is the same stable id as in `Member`.
+
+`VoiceState` is also sent right after every `RoomState` — at `Hello`, after a session replacement and after `JoinRoom` — possibly with zero members, so a client always learns the voice occupancy of a room it is in.
+
+- `LeaveRoom` while in that room's voice channel: every member receives `VoiceMemberLeft` first, then the normal `MemberLeft`.
+- When a connection ends, each room it had a voice session in receives `VoiceMemberLeft` before `MemberLeft`.
+- Session replacement: the replaced connection's voice sessions end with `VoiceMemberLeft` to the room. Voice membership is **not** transferred — the media key and ssrc belong to the old session. The new connection must send `JoinVoice` again.
+
+`Speaking{room_id, user_id, speaking}` is server-derived, never sent by clients. `true` on the first authenticated audio packet of a session that was not speaking; `false` once 250 ms pass without an audio packet, evaluated every 100 ms; `false` is also sent when a speaking session ends.
+
+Ordering: voice membership changes and their broadcasts are serialized with text membership under the same server lock. A connection never sees a voice frame for a room before that room's `RoomState`.
+
+### Media transport
+
+Media takes a separate UDP path, IPv4, default port 5005 (`Vorcall:VoicePort`), advertised in `VoiceReady`. An empty `VoiceReady.host` means the host part of the WebSocket URL.
+
+Every datagram is big-endian, with the header in clear and used as AEAD associated data, then the ciphertext, then a 16-byte tag:
+
+```
+offset 0   ver    u8   = 1
+offset 1   type   u8   1 = audio, 2 = ping, 3 = pong
+offset 2   flags  u8   bit 0 = first packet of a talk spurt; other bits 0
+offset 3   ssrc   u32
+offset 7   seq    u64
+offset 15  ts     u32  sender's 48 kHz sample clock
+offset 19  ciphertext, then tag (16 bytes)
+```
+
+Cipher: IETF ChaCha20-Poly1305 (RFC 8439). The key is the 32-byte session key from `VoiceReady`; the nonce is the 12 header bytes `ssrc || seq`. The header is authenticated, not encrypted.
+
+- **Client to relay** — sealed with the client's own session key. `seq` starts at 0 and increases by one per packet of any type. Bit 63 of `seq` is never set by a client.
+- **Relay to client, audio** — the relay opens the packet with the sender's key, re-seals the plaintext with the recipient's key under the unchanged header, so the recipient sees the original sender's `ssrc`, `seq` and `ts`, and forwards it to every other voice member of the room. No mixing, no transcoding.
+- **Relay to client, pong** — the same header as the ping except `type = 3` and `seq = ping.seq | (1 << 63)`, sealed with that session's key. The bit keeps the pong nonce distinct from the ping nonce.
+
+Ping/pong payload: 8 bytes, an opaque client clock value echoed unchanged. Clients send a ping every 5 s from the moment they hold a `VoiceReady`, regardless of push-to-talk, to keep NAT and conntrack mappings alive and to measure the media path RTT. A client that receives no pong for 15 s reports the media link as down.
+
+Audio payload: exactly one Opus packet of 20 ms at 48 kHz mono, CELT-only mode, 48 kbps CBR.
+
+The relay processes each inbound datagram in this order: size (≤ 512 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2}`) → session lookup by ssrc → per-session rate limit (100 packets/s sustained, burst 200) → AEAD open → replay window (128 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason and logs per-room counters every 30 s while the room has voice members.
+
+The relay only ever sends to an address it learned this way: a member whose address is not known yet receives nothing. A media session ends when the voice membership ends; late packets for a removed ssrc are dropped as unknown.
+
+### Client voice state machine
+
+`Idle → Joining (JoinVoice sent) → Ready (VoiceReady received; UDP socket bound and pinging) → Media (first pong received) → Idle (LeaveVoice sent, or the WebSocket ended)`.
+
+"In voice" is user intent and survives reconnects: after every `Welcome` a client that was in voice sends `JoinVoice` again and rebuilds its media path with the new key. The old socket and key are discarded on disconnect. A non-fatal `ERROR_CODE_NOT_A_MEMBER` or `ERROR_CODE_VOICE_UNAVAILABLE` in answer to `JoinVoice` clears the intent.
+
+The receive side keeps one jitter buffer per ssrc: adaptive 60–100 ms, packet loss concealment for missing sequence numbers, late packets dropped. Push-to-talk gates sending only; pings continue while muted or deafened.
+
 ## Server session state machine (per connection)
 
 1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by `RoomState{"general", ...}` — and one `RoomState` per further room when this connection replaced an earlier one — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
-2. **Ready** — handles `SendMessage`, `Ping`/`Pong`, `JoinRoom` and `LeaveRoom` as described under Rooms and presence. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
+2. **Ready** — handles `SendMessage`, `Ping`/`Pong`, `JoinRoom` and `LeaveRoom` as described under Rooms and presence, and `JoinVoice`/`LeaveVoice` as described under Voice. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
 3. **Any state** — unparsable bytes or a text frame: fatal protocol error, close 1008. No frame received for 120 s: close 1001. A connection whose outbound queue exceeds 256 frames is closed with 1013. On server shutdown every socket is closed with 1001. If a connection's outbound queue is already full when a fatal error occurs, the `Error` frame may be dropped and only the close frame (1013 or 1008) is delivered: a slow consumer is closed as a slow consumer.
 
 The server also sends WebSocket-level keep-alive pings every 30 s; clients answer with pong frames automatically.
@@ -98,7 +159,7 @@ The server also sends WebSocket-level keep-alive pings every 30 s; clients answe
 
 ## Forward compatibility
 
-A client that receives a `ServerFrame` whose payload it does not recognise — including an empty payload — logs it and ignores it. Only undecodable bytes are a protocol error. Servers may therefore add new `ServerFrame` payloads without a version bump. New `ClientFrame` payloads still require server support; an unknown client payload is a fatal `ERROR_CODE_PROTOCOL` as today.
+A client that receives a `ServerFrame` whose payload it does not recognise — including an empty payload — logs it and ignores it. Only undecodable bytes are a protocol error. Servers may therefore add new `ServerFrame` payloads without a version bump. New `ClientFrame` payloads still require server support; an unknown client payload is a fatal `ERROR_CODE_PROTOCOL` as today. The voice frames were added under version 1: a client without voice support ignores them.
 
 ## Limits (summary)
 
@@ -123,3 +184,13 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 | Client silence watchdog | 75 s |
 | Client ping interval | 30 s |
 | Outbound queue per connection | 256 frames |
+| Voice media port | 5005/udp, configurable |
+| Media datagram | 35..512 bytes |
+| Media key | 32 bytes, per voice session |
+| Replay window | 128 sequence numbers |
+| Media rate limit | 100 packets/s per session, burst 200 |
+| Speaking hysteresis | 250 ms |
+| Client media ping | every 5 s |
+| Media link timeout | 15 s without pong |
+| Jitter buffer | 60–100 ms adaptive |
+| Opus frame | 20 ms, 48 kHz mono, 48 kbps CBR |
