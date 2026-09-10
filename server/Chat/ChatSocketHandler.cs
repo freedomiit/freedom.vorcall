@@ -23,26 +23,30 @@ public sealed class ChatSocketHandler(
     // Shared with Program's shutdown hook so both close paths report the same reason.
     public const string ShutdownReason = "server shutting down";
 
+    private const string InvalidRoomIdDetail = "room id must match ^[a-z0-9-]{1,32}$";
+
     private static readonly TimeSpan HelloDeadline = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan IdleDeadline = TimeSpan.FromSeconds(120);
 
-    public async Task HandleAsync(WebSocket socket, CancellationToken requestAborted)
+    // The bearer token of the upgrade request already identified the caller, so the handshake
+    // only has to agree on the protocol version.
+    public async Task HandleAsync(WebSocket socket, long userId, string username, CancellationToken requestAborted)
     {
         var connection = new ClientConnection(socket, logger, requestAborted, lifetime.ApplicationStopping);
         var reader = new SocketReader(connection, logger);
         registry.Add(connection);
-        logger.LogDebug("Connection {ConnectionId} accepted", connection.Id);
+        logger.LogDebug("Connection {ConnectionId} accepted for user {UserId}", connection.Id, userId);
 
         try
         {
-            if (await HandshakeAsync(connection, reader))
+            if (await HandshakeAsync(connection, reader, userId, username))
             {
                 await PumpAsync(connection, reader);
             }
         }
         catch (Exception ex) when (ex is WebSocketException or OperationCanceledException)
         {
-            logger.LogDebug(ex, "Connection {ConnectionId} ({Nickname}) torn down", connection.Id, connection.Nickname);
+            logger.LogDebug(ex, "Connection {ConnectionId} (user {UserId}) torn down", connection.Id, userId);
 
             // The host stopping cancels this connection's lifetime, so the receive loop can
             // reach here before ConnectionRegistry.CloseAllAsync does. Both paths must close
@@ -53,18 +57,21 @@ public sealed class ChatSocketHandler(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Connection {ConnectionId} ({Nickname}) failed unexpectedly", connection.Id, connection.Nickname);
+            logger.LogError(ex, "Connection {ConnectionId} (user {UserId}) failed unexpectedly", connection.Id, userId);
             await CloseAsync(connection, WebSocketCloseStatus.InternalServerError, "internal error");
         }
         finally
         {
+            // Detach first: it announces the leave while the connection is still the account's
+            // live one, which Remove says nothing about.
+            registry.Detach(connection);
             registry.Remove(connection);
             await reader.DrainAsync();
             connection.Dispose();
         }
     }
 
-    private async Task<bool> HandshakeAsync(ClientConnection connection, SocketReader reader)
+    private async Task<bool> HandshakeAsync(ClientConnection connection, SocketReader reader, long userId, string username)
     {
         var received = await reader.ReadAsync(HelloDeadline);
         switch (received.Outcome)
@@ -105,22 +112,27 @@ public sealed class ChatSocketHandler(
             return false;
         }
 
-        if (!Validation.TryNormalizeNickname(frame.Hello.Nickname, out var nickname))
-        {
-            await FailAsync(connection, ErrorCode.InvalidNickname, "nickname must be 1..32 characters without control characters", ProtocolClose, "invalid nickname");
-            return false;
-        }
-
         var latestMessageId = await messages.GetLatestIdAsync();
 
-        // Welcome is queued before the connection joins the broadcast set, so no ChatMessage
-        // can ever overtake it.
-        connection.TryEnqueue(new ServerFrame { Welcome = new Welcome { LatestMessageId = latestMessageId } });
-        connection.MarkReady(nickname);
+        // Attach queues Welcome and the initial RoomState frames under the registry lock, so no
+        // room broadcast can overtake them.
+        var replaced = registry.Attach(connection, userId, username, latestMessageId);
+        if (replaced is not null)
+        {
+            // Detached and never awaited: the replaced socket may be dead, and this account's
+            // new session must not wait out its close handshake.
+            _ = FailQuietlyAsync(
+                replaced,
+                new Error { Code = ErrorCode.SessionReplaced, Detail = "this account connected from another device", Fatal = true },
+                ProtocolClose,
+                "session replaced");
+        }
+
         logger.LogInformation(
-            "Connection {ConnectionId} ({Nickname}) connected; {ConnectionCount} live, latest message {LatestMessageId}",
+            "Connection {ConnectionId} (user {UserId} {Username}) connected; {ConnectionCount} live, latest message {LatestMessageId}",
             connection.Id,
-            nickname,
+            userId,
+            username,
             registry.Count,
             latestMessageId);
         return true;
@@ -138,9 +150,9 @@ public sealed class ChatSocketHandler(
                     return;
                 case ReceiveOutcome.Closed:
                     logger.LogDebug(
-                        "Connection {ConnectionId} ({Nickname}) stopped receiving: close already latched",
+                        "Connection {ConnectionId} ({Username}) stopped receiving: close already latched",
                         connection.Id,
-                        connection.Nickname);
+                        connection.Username);
                     LogDisconnect(connection);
                     return;
                 case ReceiveOutcome.Timeout:
@@ -164,6 +176,24 @@ public sealed class ChatSocketHandler(
             {
                 case ClientFrame.PayloadOneofCase.Send:
                     if (!await HandleSendAsync(connection, frame.Send))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.JoinRoom:
+                    if (!HandleJoin(connection, frame.JoinRoom))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.LeaveRoom:
+                    if (!HandleLeave(connection, frame.LeaveRoom))
                     {
                         await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
                         return;
@@ -195,36 +225,95 @@ public sealed class ChatSocketHandler(
     private async Task<bool> HandleSendAsync(ClientConnection connection, SendMessage send)
     {
         // A latched close must never persist or broadcast another message, however this frame
-        // was read: the close wins even if it landed mid-receive.
-        if (!connection.IsReady)
+        // was read: the close wins even if it landed mid-receive. MarkReady sets the identity
+        // before IsReady, so a ready connection always has one.
+        if (!connection.IsReady || connection.UserId is not { } userId || connection.Username is not { } username)
         {
-            logger.LogDebug(
-                "Connection {ConnectionId} ({Nickname}) sent after close was latched; dropping",
-                connection.Id,
-                connection.Nickname);
+            logger.LogDebug("Connection {ConnectionId} sent after close was latched; dropping", connection.Id);
             return true;
+        }
+
+        if (!Validation.TryNormalizeRoomId(send.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.Check(connection, roomId))
+        {
+            case MembershipCheck.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case MembershipCheck.NotAMember:
+                return NonFatal(connection, ErrorCode.NotAMember, "join the room before sending");
+
+            case MembershipCheck.Stale:
+                logger.LogDebug("Connection {ConnectionId} (user {UserId}) sent after being replaced; dropping", connection.Id, userId);
+                return true;
         }
 
         if (!Validation.TryNormalizeText(send.Text, out var text))
         {
-            logger.LogWarning("Connection {ConnectionId} ({Nickname}) sent invalid text", connection.Id, connection.Nickname);
-            return connection.TryEnqueue(new ServerFrame
-            {
-                Error = new Error
-                {
-                    Code = ErrorCode.InvalidMessage,
-                    Detail = "text must be 1..2000 characters after trimming",
-                    Fatal = false,
-                },
-            });
+            logger.LogWarning("Connection {ConnectionId} ({Username}) sent invalid text", connection.Id, username);
+            return NonFatal(connection, ErrorCode.InvalidMessage, "text must be 1..2000 characters after trimming");
         }
 
         // Persist first: an id only exists once the row is committed, and the broadcast
         // carries that id.
-        var chatMessage = await messages.AppendAsync(connection.Nickname!, text);
-        registry.Broadcast(new ServerFrame { Message = chatMessage });
+        var chatMessage = await messages.AppendAsync(userId, username, roomId, text);
+        registry.BroadcastToRoom(roomId, new ServerFrame { Message = chatMessage });
         return true;
     }
+
+    private bool HandleJoin(ClientConnection connection, JoinRoom join)
+    {
+        if (!Validation.TryNormalizeRoomId(join.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.Join(connection, roomId))
+        {
+            case JoinOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case JoinOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} joined a room after being replaced; dropping", connection.Id);
+                return true;
+
+            // Joined and AlreadyMember: the registry has already queued the RoomState.
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleLeave(ClientConnection connection, LeaveRoom leave)
+    {
+        if (!Validation.TryNormalizeRoomId(leave.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.Leave(connection, roomId))
+        {
+            case LeaveOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case LeaveOutcome.NotAMember:
+                return NonFatal(connection, ErrorCode.NotAMember, "not a member of that room");
+
+            case LeaveOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} left a room after being replaced; dropping", connection.Id);
+                return true;
+
+            default:
+                return true;
+        }
+    }
+
+    // Non-fatal errors ride the same outbox as everything else, so a refusal means the sender
+    // itself has fallen behind and the caller closes it as a slow consumer.
+    private static bool NonFatal(ClientConnection connection, ErrorCode code, string detail)
+        => connection.TryEnqueue(new ServerFrame { Error = new Error { Code = code, Detail = detail, Fatal = false } });
 
     // A pending WebSocket receive cannot be cancelled without aborting the socket, which would
     // destroy the connection before the fatal error and close frames could be written. Deadlines
@@ -338,7 +427,7 @@ public sealed class ChatSocketHandler(
         }
         catch (InvalidProtocolBufferException ex)
         {
-            logger.LogWarning(ex, "Connection {ConnectionId} ({Nickname}) sent an unparsable frame", connection.Id, connection.Nickname);
+            logger.LogWarning(ex, "Connection {ConnectionId} ({Username}) sent an unparsable frame", connection.Id, connection.Username);
             frame = new ClientFrame();
             return false;
         }
@@ -350,13 +439,28 @@ public sealed class ChatSocketHandler(
     private async Task FailAsync(ClientConnection connection, ErrorCode code, string detail, WebSocketCloseStatus status, string reason)
     {
         logger.LogWarning(
-            "Connection {ConnectionId} ({Nickname}) protocol error {ErrorCode}: {Detail}",
+            "Connection {ConnectionId} ({Username}) protocol error {ErrorCode}: {Detail}",
             connection.Id,
-            connection.Nickname,
+            connection.Username,
             code,
             detail);
         await connection.FailAsync(new Error { Code = code, Detail = detail, Fatal = true }, status, reason);
         LogDisconnect(connection, status, reason);
+    }
+
+    // For a connection this handler does not own: it is being torn down from another
+    // connection's handshake, so its failures belong in the log and nowhere else.
+    private async Task FailQuietlyAsync(ClientConnection connection, Error error, WebSocketCloseStatus status, string reason)
+    {
+        try
+        {
+            await connection.FailAsync(error, status, reason);
+            LogDisconnect(connection, status, reason);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Connection {ConnectionId}: failed to close with {CloseCode}", connection.Id, (int)status);
+        }
     }
 
     private async Task CloseAsync(ClientConnection connection, WebSocketCloseStatus status, string reason)
@@ -370,9 +474,9 @@ public sealed class ChatSocketHandler(
     // requested pair is only a fallback, and a close this handler awaited always latched one.
     private void LogDisconnect(ClientConnection connection, WebSocketCloseStatus? requestedStatus = null, string? requestedReason = null)
         => logger.LogInformation(
-            "Connection {ConnectionId} ({Nickname}) disconnected with {CloseCode} {CloseReason}",
+            "Connection {ConnectionId} ({Username}) disconnected with {CloseCode} {CloseReason}",
             connection.Id,
-            connection.Nickname,
+            connection.Username,
             (int)(connection.CloseStatus ?? requestedStatus ?? WebSocketCloseStatus.Empty),
             connection.CloseReason ?? requestedReason ?? string.Empty);
 

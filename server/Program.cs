@@ -1,30 +1,21 @@
 using System.Net.WebSockets;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
+using Vorcall.Server;
 using Vorcall.Server.Api;
 using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
+using Vorcall.Server.Cli;
 using Vorcall.Server.Data;
 
+// The same binary is the admin tool: "dotnet Vorcall.Server.dll invites new" never listens.
+if (AdminCli.IsCliInvocation(args))
+{
+    return await AdminCli.RunAsync(args);
+}
+
 var builder = WebApplication.CreateBuilder(args);
-
-var connectionString = builder.Configuration.GetConnectionString("Default");
-if (string.IsNullOrWhiteSpace(connectionString))
-{
-    throw new InvalidOperationException("Missing configuration 'ConnectionStrings:Default'.");
-}
-
-// The pre-shared key is the only door: refusing to boot without it is deliberate.
-var serverKey = builder.Configuration["Vorcall:ServerKey"];
-if (string.IsNullOrWhiteSpace(serverKey))
-{
-    throw new InvalidOperationException("Missing configuration 'Vorcall:ServerKey'.");
-}
-
-builder.Services.AddDbContextFactory<AppDbContext>(o => o.UseNpgsql(connectionString));
-builder.Services.AddSingleton(new ServerKeyValidator(serverKey));
-builder.Services.AddSingleton<ConnectionRegistry>();
-builder.Services.AddSingleton<MessageService>();
-builder.Services.AddSingleton<ChatSocketHandler>();
+ServiceSetup.Configure(builder);
 
 var app = builder.Build();
 
@@ -36,12 +27,29 @@ using (var scope = app.Services.CreateScope())
     db.Database.Migrate();
 }
 
+// nginx is the only thing that can reach this port: docker publishes it on host loopback. That
+// is why the known-proxy list stays empty (which skips the check entirely) and why trusting the
+// immediate hop is enough. ForwardLimit = 1 keeps only the entry nginx appends, so a client that
+// sends its own X-Forwarded-For cannot forge the rate limiter's partition key.
+var forwardedHeaders = new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto,
+    ForwardLimit = 1,
+};
+forwardedHeaders.KnownIPNetworks.Clear();
+forwardedHeaders.KnownProxies.Clear();
+app.UseForwardedHeaders(forwardedHeaders);
+
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
 // Segment matching, not equality: routing also serves "/ws/", which equality would leave ungated.
 app.UseWhen(
     context => context.Request.Path.StartsWithSegments("/ws") || context.Request.Path.StartsWithSegments("/api"),
     keyed => keyed.UseMiddleware<ServerKeyMiddleware>());
+
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
 
 app.MapGet("/health", async (IDbContextFactory<AppDbContext> contextFactory, ILogger<Program> logger) =>
 {
@@ -66,11 +74,28 @@ app.MapGet("/ws", async (HttpContext context, ChatSocketHandler handler) =>
         return;
     }
 
-    using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    await handler.HandleAsync(socket, context.RequestAborted);
-});
+    // The token validated, so both claims are this server's own: a missing one is a bug, not a
+    // caller error, and the socket is never accepted without an identity behind it.
+    if (!BearerIdentity.TryGetUserId(context.User, out var userId))
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        return;
+    }
 
-app.MapGet("/api/messages", MessagesEndpoints.GetPageAsync);
+    var username = BearerIdentity.GetUsername(context.User);
+    if (username.Length == 0)
+    {
+        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        return;
+    }
+
+    using var socket = await context.WebSockets.AcceptWebSocketAsync();
+    await handler.HandleAsync(socket, userId, username, context.RequestAborted);
+}).RequireAuthorization();
+
+app.MapGet("/api/messages", MessagesEndpoints.GetPageAsync).RequireAuthorization();
+UsersEndpoints.Map(app);
+AuthEndpoints.Map(app);
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
@@ -92,3 +117,4 @@ app.Lifetime.ApplicationStopping.Register(() =>
 });
 
 app.Run();
+return 0;

@@ -1,5 +1,4 @@
 using System.Globalization;
-using Google.Protobuf;
 using Vorcall.Server.Chat;
 
 namespace Vorcall.Server.Api;
@@ -10,9 +9,14 @@ public static class MessagesEndpoints
     private const int MinLimit = 1;
     private const int MaxLimit = 100;
 
-    // GET /api/messages?limit=&before= -> MessagePage as application/x-protobuf.
-    public static async Task<IResult> GetPageAsync(string? limit, string? before, MessageService messages)
+    // GET /api/messages?room=&limit=&before= -> MessagePage as application/x-protobuf.
+    public static async Task<IResult> GetPageAsync(string? room, string? limit, string? before, MessageService messages)
     {
+        if (!Validation.TryNormalizeRoomId(room, out var roomId))
+        {
+            return Results.BadRequest();
+        }
+
         var pageSize = DefaultLimit;
         if (limit is not null)
         {
@@ -35,7 +39,7 @@ public static class MessagesEndpoints
             exclusiveUpperBound = parsedBefore;
         }
 
-        var page = await messages.GetPageAsync(pageSize, exclusiveUpperBound);
-        return Results.Bytes(page.ToByteArray(), "application/x-protobuf");
+        var page = await messages.GetPageAsync(roomId, pageSize, exclusiveUpperBound);
+        return ProtobufBody.Proto(page);
     }
 }

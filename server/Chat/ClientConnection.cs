@@ -44,7 +44,10 @@ public sealed class ClientConnection : IDisposable
 
     public WebSocket Socket { get; }
 
-    public string? Nickname { get; private set; }
+    // Both set by MarkReady, before IsReady turns on: an identity is never half-published.
+    public long? UserId { get; private set; }
+
+    public string? Username { get; private set; }
 
     public bool IsReady => _isReady;
 
@@ -62,9 +65,10 @@ public sealed class ClientConnection : IDisposable
 
     public string? CloseReason { get; private set; }
 
-    public void MarkReady(string nickname)
+    public void MarkReady(long userId, string username)
     {
-        Nickname = nickname;
+        UserId = userId;
+        Username = username;
         _isReady = true;
     }
 

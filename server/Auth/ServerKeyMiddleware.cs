@@ -10,6 +10,8 @@ public sealed class ServerKeyMiddleware(RequestDelegate next, ServerKeyValidator
         // comparison. The key itself is never logged, not even at Debug.
         if (!validator.IsValid(context.Request.Headers[HeaderName].ToString()))
         {
+            // The scheme is how a client tells a stale build (wrong key) from an expired bearer.
+            context.Response.Headers.WWWAuthenticate = HeaderName;
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
             return;
         }
