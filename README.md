@@ -4,9 +4,9 @@ A private chat for a friend group: one room, native Rust desktop client, .NET ba
 
 ## Status
 
-MVP. Present: one shared room, a nickname, live text messages, the last 100 messages on join.
+MVP. Present: invite-only accounts, one room (`general`), a presence sidebar, live messages, older history, notifications.
 
-Deliberately absent: accounts, multiple channels, presence/typing indicators, attachments, voice.
+Deliberately absent: multiple text rooms, attachments, voice, OAuth/2FA.
 
 ## Repository layout
 
@@ -25,7 +25,7 @@ docker-compose.prod.yml    production stack: Postgres + backend, pulled from GHC
 
 ## Prerequisites
 
-- **Linux (build client + server, run local dev):** Rust via rustup (stable, 1.88+ — MSRV set by iced 0.14), .NET SDK 10.0.x, Docker (for the local Postgres).
+- **Linux (build client + server, run local dev):** Rust via rustup (stable, 1.89+ — MSRV set by notify-rust), .NET SDK 10.0.x, Docker (for the local Postgres), ALSA headers for rodio: Fedora `sudo dnf install -y alsa-lib-devel`, Debian/Ubuntu `libasound2-dev` (CI installs it).
 - **Cross-build for Windows (from Linux/Fedora):** the above, plus `sudo dnf install -y clang lld llvm`, `rustup target add x86_64-pc-windows-msvc`, `cargo install cargo-xwin`.
 - **macOS (build client from source only):** Xcode command-line tools, rustup.
 
@@ -90,7 +90,45 @@ VORCALL_SERVER_URL=http://localhost:5000 cargo run -p vorcall-app
 
 Set `RUST_LOG=vorcall_core=debug` to see the client's connection log.
 
-Client config on disk (only the nickname): `~/.config/vorcall/config.toml` on Linux (via `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`). The nickname can also be changed with the "Change name" button in the app.
+Client config on disk: `~/.config/vorcall/config.toml` on Linux (via `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`), keys `username`, `notifications` and `sound` (the old `nickname` key is still read). `notifications` (default on) and `sound` (default off) are also toggled by the two switches at the bottom of the sidebar. Session tokens are stored separately, next to it, in `session.toml` — see [Accounts](#accounts).
+
+## Accounts
+
+Registration is invite-only. The "Create account" screen in the app takes a username, password, confirmation and invite code, and signs the new account in. Username: 1..32 Unicode scalars, unique case-insensitively. Password: 8..128 chars. The pre-shared door key (`X-Vorcall-Key`, compiled into the client — see [Client key and URL](#client-key-and-url)) still gates every request; accounts add identity on top of it, they don't replace it.
+
+Sessions: a JWT access token (15 min) plus a rotating refresh token (30 days sliding), stored by the client in `session.toml` next to `config.toml`:
+
+- Linux: `~/.config/vorcall/session.toml`, mode `0600`.
+- Windows: `%APPDATA%\freedomit\vorcall\config\session.toml`.
+- macOS: `~/Library/Application Support/br.com.freedomit.vorcall/session.toml`.
+
+(Windows and macOS paths are the platform config dir of the same `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`.)
+
+Logout revokes the refresh token and deletes `session.toml`. Changing the password (from the header) revokes every other session of the account. Only one connection per account is live at a time: signing in on a second device disconnects the first, which returns to the sign-in screen ("connected from another device").
+
+### Admin CLI
+
+Invites and account maintenance run through the server binary's own subcommands. The subcommand is the first argument; it runs pending migrations first and never starts the web server:
+
+```
+invites new [--days N]      # prints a one-time invite code, default 7-day expiry
+invites list
+users list
+users revoke-sessions <username>
+users set-password <username>   # prompts for the new password
+```
+
+Production:
+
+```
+cd /opt/vorcall && docker compose -f docker-compose.prod.yml run --rm backend invites new
+```
+
+Local:
+
+```
+~/.dotnet/dotnet run --project server/Vorcall.Server.csproj -- invites new
+```
 
 ## Protocol
 
@@ -99,9 +137,18 @@ See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limi
 ## Production
 
 - Domain `vorcall.example.com` points DNS-only (no Cloudflare proxy) at the Oracle ARM64 host `user@host`, app directory `/opt/vorcall`.
-- `deploy/provision-host.sh` runs on the host: installs certbot, issues the Let's Encrypt certificate, installs the nginx site (`deploy/nginx/vorcall.conf`, backend proxied from loopback `127.0.0.1:5004`), sets up the certbot renewal hook, and generates the host's `.env` from `.env.production.example` (random Postgres password and `Vorcall__ServerKey`). See the script header for the exact invocation.
+- `deploy/provision-host.sh` runs on the host: installs certbot, issues the Let's Encrypt certificate, installs the nginx site (`deploy/nginx/vorcall.conf`, backend proxied from loopback `127.0.0.1:5004`, `listen 443 ssl http2` to match the other sites on the host and silence the "protocol options redefined" warning), sets up the certbot renewal hook, and generates the host's `.env` from `.env.production.example` (random Postgres password, `Vorcall__ServerKey` and `Vorcall__JwtSigningKey`). See the script header for the exact invocation. nginx config changes on an existing host are applied by hand — the deploy workflow only copies the compose file.
 - Deploy pipeline (`.github/workflows/deploy.yml`): a push to `main` builds an arm64 backend image on GitHub Actions, pushes it to `ghcr.io/freedomiit/vorcall-backend`, then copies `docker-compose.prod.yml` to the host and runs `docker compose pull && up -d` over SSH. The backend applies its own EF Core migrations on boot. A push to `main` deploys production immediately; there is no separate approval step.
 - The pre-shared door key lives only in the host's `.env` (`Vorcall__ServerKey`) and must be baked into client builds as `VORCALL_SERVER_KEY`. Rotating it means: generate a new value, update the host `.env`, restart the backend, and rebuild/redistribute the client with the new key.
+- `Vorcall:JwtSigningKey` (env `Vorcall__JwtSigningKey`) is required — base64 of 32 random bytes; the server refuses to boot without it. `.env.production.example` carries a placeholder and `deploy/provision-host.sh` generates a real value for fresh hosts; on an existing host, append it by hand (`openssl rand -base64 32`). Rotating it signs every client out within 15 minutes (the access token lifetime).
+
+## Rolling out the accounts release
+
+1. Add `Vorcall__JwtSigningKey` to the host `.env` **before** pushing (see [Production](#production)).
+2. Push `main` — this deploys.
+3. Generate one invite per friend with the admin CLI (see [Admin CLI](#admin-cli)).
+4. Rebuild the clients: `scripts/build-client-linux.sh` / `scripts/build-client-windows.sh`. The Mac friend rebuilds from source.
+5. Distribute the new builds. Old clients stop working at deploy time and show "Unauthorized: rebuild the client".
 
 ## Development gates
 
