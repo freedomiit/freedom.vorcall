@@ -4,3 +4,4 @@
 # so rotation is: add the new key, ship a release, sign later releases with it, then drop the old key.
 # An empty list disables the updater entirely ("no update keys baked in").
 # The private key lives only in the GitHub secret VORCALL_UPDATE_SIGNING_KEY and the owner's password manager.
+3051020101300506032b65700422042075860a96e9e1cdd773c5c2b65ae6a48eff2674df5f53a040d8b497dc33b3c054812100e722bd424b83b383231399958542392a4fb4bc4a2d4379df929fd1d03eecfb21
