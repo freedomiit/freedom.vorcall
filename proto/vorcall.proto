@@ -4,12 +4,14 @@ package vorcall.v1;
 
 option csharp_namespace = "Vorcall.Server.Protocol";
 
-// A persisted chat message. Ids are server-assigned and strictly increasing.
+// A persisted chat message. Ids are server-assigned and strictly increasing across all rooms.
 message ChatMessage {
   int64 id = 1;
-  string author = 2;
+  string author = 2;              // username at the time of sending
   string text = 3;
   int64 sent_at_unix_ms = 4;
+  string room_id = 5;             // "general" today
+  int64 author_id = 6;            // user id; 0 for messages that predate accounts
 }
 
 // Client -> server. One ClientFrame per binary WebSocket message.
@@ -18,21 +20,32 @@ message ClientFrame {
     Hello hello = 1;
     SendMessage send = 2;
     Ping ping = 3;
+    JoinRoom join_room = 4;
+    LeaveRoom leave_room = 5;
   }
 }
 
-// Must be the first frame after the upgrade.
+// Must be the first frame after the upgrade. Identity comes from the bearer token of the upgrade request.
 message Hello {
-  uint32 protocol_version = 1; // must be 1
-  string nickname = 2;         // trimmed, 1..32 chars, no control characters
+  uint32 protocol_version = 1;             // must be 1
+  string nickname = 2 [deprecated = true]; // ignored by the server since accounts exist
 }
 
 message SendMessage {
-  string text = 1;             // trimmed, 1..2000 chars
+  string text = 1;                // trimmed, 1..2000 chars
+  string room_id = 2;             // empty means "general"
 }
 
 message Ping {
   int64 sent_at_unix_ms = 1;
+}
+
+message JoinRoom {
+  string room_id = 1;
+}
+
+message LeaveRoom {
+  string room_id = 1;
 }
 
 // Server -> client. One ServerFrame per binary WebSocket message.
@@ -42,22 +55,52 @@ message ServerFrame {
     ChatMessage message = 2;
     Error error = 3;
     Pong pong = 4;
+    RoomState room_state = 5;
+    MemberJoined member_joined = 6;
+    MemberLeft member_left = 7;
   }
 }
 
 message Welcome {
-  int64 latest_message_id = 1; // 0 when the room is empty
+  int64 latest_message_id = 1;    // 0 when no message exists yet
+  int64 member_id = 2;            // the connected user's id, as it appears in Member.user_id
+  string username = 3;            // canonical casing
 }
 
 message Pong {
-  int64 sent_at_unix_ms = 1;   // echoed from the Ping
+  int64 sent_at_unix_ms = 1;      // echoed from the Ping
+}
+
+// A user, as listed by GET /api/users and as a room member.
+message Member {
+  int64 user_id = 1;
+  string username = 2;
+}
+
+// Full membership of one room; replaces whatever the client knew about that room.
+message RoomState {
+  string room_id = 1;
+  repeated Member members = 2;
+}
+
+message MemberJoined {
+  string room_id = 1;
+  Member member = 2;
+}
+
+message MemberLeft {
+  string room_id = 1;
+  int64 user_id = 2;
 }
 
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   ERROR_CODE_PROTOCOL = 1;         // malformed frame, wrong first frame, unsupported version, text frame
-  ERROR_CODE_INVALID_NICKNAME = 2;
+  ERROR_CODE_INVALID_NICKNAME = 2; // reserved: no longer sent since accounts exist
   ERROR_CODE_INVALID_MESSAGE = 3;  // empty or too long
+  ERROR_CODE_SESSION_REPLACED = 4; // fatal: the same account connected again elsewhere
+  ERROR_CODE_UNKNOWN_ROOM = 5;     // non-fatal: room id invalid or unknown
+  ERROR_CODE_NOT_A_MEMBER = 6;     // non-fatal: the connection is not in that room
 }
 
 message Error {
@@ -66,8 +109,57 @@ message Error {
   bool fatal = 3;                  // true: the server closes the socket right after sending this
 }
 
-// REST: GET /api/messages?limit=100&before=<id>  (Content-Type: application/x-protobuf)
+// REST: GET /api/messages?room=general&limit=100&before=<id>  (Content-Type: application/x-protobuf)
 message MessagePage {
   repeated ChatMessage messages = 1; // ascending by id
   bool has_more = 2;                 // older messages exist before messages[0]
+}
+
+// REST: GET /api/users
+message UserList {
+  repeated Member users = 1;         // every registered user, ordered by username (case-insensitive)
+}
+
+// REST: POST /api/auth/register
+message RegisterRequest {
+  string username = 1;
+  string password = 2;
+  string invite_code = 3;
+}
+
+// REST: POST /api/auth/login
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+// REST: POST /api/auth/refresh
+message RefreshRequest {
+  string refresh_token = 1;
+}
+
+// REST: POST /api/auth/logout
+message LogoutRequest {
+  string refresh_token = 1;
+}
+
+// REST: POST /api/auth/password (bearer required)
+message ChangePasswordRequest {
+  string current_password = 1;
+  string new_password = 2;
+  string refresh_token = 3;          // the caller's own refresh token; it stays valid, every other one is revoked
+}
+
+// Body of every 2xx on register, login and refresh.
+message TokenResponse {
+  string access_token = 1;           // JWT, present as "Authorization: Bearer <token>"
+  uint32 expires_in = 2;             // seconds until the access token expires
+  string refresh_token = 3;          // opaque; rotates on every refresh
+  int64 user_id = 4;
+  string username = 5;               // canonical casing
+}
+
+// Body of every 4xx/429 on /api/auth/*.
+message ApiError {
+  string detail = 1;
 }
