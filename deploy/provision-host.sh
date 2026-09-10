@@ -140,8 +140,10 @@ else
         umask 077
         pg_pass="$(openssl rand -hex 24)"
         server_key="$(openssl rand -hex 32)"
+        jwt_key="$(openssl rand -base64 32)"
         sed -e "s|__POSTGRES_PASSWORD__|$pg_pass|g" \
             -e "s|__SERVER_KEY__|$server_key|g" \
+            -e "s|__JWT_SIGNING_KEY__|$jwt_key|g" \
             "$APP_DIR/.env.production.example" > "$APP_DIR/.env"
     )
     echo "generated $APP_DIR/.env"
