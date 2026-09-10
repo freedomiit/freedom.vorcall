@@ -1,0 +1,50 @@
+# Production stack for vorcall.example.com.
+#
+# TLS is terminated by the host nginx (Let's Encrypt); this stack only
+# publishes the backend on a loopback port that nginx proxies to.
+# Images are built in CI (GitHub Actions) and merely pulled here — never
+# built on the host. IMAGE_TAG is the commit SHA pushed by the deploy
+# workflow and defaults to `latest`.
+# Variables come from the `.env` file next to this compose file, which is
+# never committed (see .env.production.example).
+# The host needs `docker login ghcr.io` once, the images are private.
+
+services:
+  db:
+    image: postgres:18
+    container_name: vorcall-db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+    volumes:
+      # postgres:18 stores data under /var/lib/postgresql (per-major subdirectory).
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ghcr.io/freedomiit/vorcall-backend:${IMAGE_TAG:-latest}
+    container_name: vorcall-backend
+    restart: always
+    env_file: .env
+    ports:
+      # loopback only; the host nginx publishes it
+      - "127.0.0.1:5004:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # /health answers 200 only after migration completed and the DB answers.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+volumes:
+  pgdata:

@@ -1,0 +1,22 @@
+# Vorcall local development: Postgres only. Run the server with
+#   ~/.dotnet/dotnet run --project server/Vorcall.Server.csproj
+# (listens on http://localhost:5000, key "dev", see server/appsettings.Development.json).
+services:
+  db:
+    image: postgres:18
+    container_name: vorcall-dev-db
+    environment:
+      POSTGRES_USER: vorcall
+      POSTGRES_PASSWORD: vorcall
+      POSTGRES_DB: vorcall
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vorcall -d vorcall"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  pgdata:

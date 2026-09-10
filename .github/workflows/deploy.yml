@@ -1,0 +1,129 @@
+name: deploy
+
+# Automatic deploy: every push to main rebuilds production
+# (https://vorcall.example.com).
+#
+# Flow (build in CI, not on the server):
+#   1. job "build"  — builds the backend image on GitHub's ARM64 runners
+#      (with layer cache) and pushes it to GHCR, tagged with the commit SHA
+#      and "latest". The heavy `dotnet publish` runs here, off the Oracle VPS.
+#   2. job "deploy" — copies only the compose file to the server and runs
+#      `pull` + `up -d` (never --build). The backend applies its own
+#      migrations on boot, so there is no separate migration step.
+#
+# Prerequisites (one time):
+#   - Secret SSH_PRIVATE_KEY — runner -> server; a valid OpenSSH private key
+#     whose public key is in ~/.ssh/authorized_keys of user@host.
+#   - On the server, a `.env` next to the compose file with the runtime
+#     secrets (POSTGRES_PASSWORD, ConnectionStrings__Default,
+#     Vorcall__ServerKey, ...) — never build-args, never committed
+#     (see .env.production.example / deploy/provision-host.sh).
+#   - On the server: `docker login ghcr.io` with a read-only PAT
+#     (packages:read), because the images are private.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# never let two deploys run at the same time
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  SERVER: user@host
+  APP_DIR: /opt/vorcall
+  REGISTRY: ghcr.io
+  IMAGE_BASE: ghcr.io/freedomiit/vorcall
+
+jobs:
+  build:
+    # native ARM64 runner: the production VPS (Oracle Ampere) is linux/arm64,
+    # so we build on that architecture without QEMU emulation (fast).
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push (backend)
+        uses: docker/build-push-action@v6
+        with:
+          # build context is the repository root: the Dockerfile also needs
+          # proto/ to generate the gRPC/protocol code.
+          context: .
+          file: server/Dockerfile
+          target: final
+          # arm64 only — that is what the production server consumes
+          platforms: linux/arm64
+          # no provenance attestation: with it the push becomes an image index
+          # with "untagged" child manifests on GHCR — any cleanup of untagged
+          # versions breaks the pull ("manifest ... not found").
+          # With false the tag points straight at a self-contained arm64 manifest.
+          provenance: false
+          push: true
+          tags: |
+            ${{ env.IMAGE_BASE }}-backend:latest
+            ${{ env.IMAGE_BASE }}-backend:${{ github.sha }}
+          # layer cache between deploys (dependencies rebuild only when they change)
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up the SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 203.0.113.10 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Copy the compose file to the server
+        # only the compose file needs to travel; code and build live in the GHCR image
+        run: |
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
+            docker-compose.prod.yml "${SERVER}:${APP_DIR}/docker-compose.prod.yml"
+
+      - name: Pull + restart
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "${SERVER}" \
+            "IMAGE_TAG='${{ github.sha }}' bash -s" <<'EOF'
+          set -e
+          cd /opt/vorcall
+          docker compose -f docker-compose.prod.yml pull
+          docker compose -f docker-compose.prod.yml up -d
+          # wait for the backend to become healthy (migration + warmup finish there)
+          healthy=no
+          for i in $(seq 1 30); do
+            s=$(docker inspect -f "{{.State.Health.Status}}" vorcall-backend 2>/dev/null || echo none)
+            if [ "$s" = "healthy" ]; then
+              healthy=yes
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" != "yes" ]; then
+            echo "vorcall-backend did not become healthy after 30 attempts (60s)"
+            docker compose -f docker-compose.prod.yml ps
+            docker logs --tail 100 vorcall-backend 2>&1 || true
+            exit 1
+          fi
+          docker compose -f docker-compose.prod.yml ps
+          # drop orphaned old images so the VPS disk does not fill up
+          docker image prune -f
+          EOF

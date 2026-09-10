@@ -1,0 +1,5 @@
+# Default so a plain `cargo build` compiles without any VORCALL_* variable set.
+# Cargo's [env] never overrides a variable already present in the environment,
+# so a real key exported in the shell wins.
+[env]
+VORCALL_SERVER_KEY = "dev"

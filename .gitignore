@@ -1,0 +1,10 @@
+# Production secrets live only on the host; the versioned template is .env.production.example
+/.env
+# Local release build settings (server key); never committed
+client/.env.release
+client/target/
+dist/
+**/bin/
+**/obj/
+.vs/
+.idea/
