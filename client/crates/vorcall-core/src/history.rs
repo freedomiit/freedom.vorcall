@@ -1,108 +1,86 @@
-//! The REST half of the protocol: one page of the newest messages, fetched
-//! right after `Welcome` so a fresh connection is not an empty room.
-
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+//! The read-only REST endpoints: one page of a room's messages, and the roster
+//! the sidebar shows offline members from.
 
 use prost::Message as _;
-use vorcall_proto::v1::{ChatMessage, MessagePage};
+use reqwest::header::AUTHORIZATION;
+use vorcall_proto::v1::{Member, MessagePage, UserList};
 
 use crate::endpoints::Endpoints;
+use crate::http::{self, ApiFailure};
 
-/// The header carrying the pre-shared door key on every request.
-pub const KEY_HEADER: &str = "X-Vorcall-Key";
-
-/// Returned inside the `anyhow::Error` of [`fetch_latest`], so a caller that
-/// cares (the UI distinguishes a stale key from a flaky network) can downcast.
-#[derive(Debug, thiserror::Error)]
-pub enum HistoryError {
-    #[error("the server rejected the pre-shared key")]
-    Unauthorized,
-    #[error("the server answered HTTP {0}")]
-    Status(u16),
-    #[error("cannot reach the server: {0}")]
-    Transport(String),
-    #[error("the server returned a malformed MessagePage: {0}")]
-    Malformed(String),
-}
-
-/// Fetches the newest `limit` messages, ascending by id.
-///
-/// Needs no process-wide `rustls` provider: `tls_config` hands reqwest one of
-/// its own, with the ring provider and the bundled roots. `main` still installs
-/// a default, because tungstenite builds its `ClientConfig` from it.
-pub async fn fetch_latest(endpoints: &Endpoints, limit: u32) -> anyhow::Result<Vec<ChatMessage>> {
+/// One page of `room_id`, ascending by id. `before` is exclusive: without it
+/// the page is the newest `limit` messages.
+pub async fn fetch_page(
+    endpoints: &Endpoints,
+    access_token: &str,
+    room_id: &str,
+    limit: u32,
+    before: Option<i64>,
+) -> Result<MessagePage, ApiFailure> {
     let mut url = endpoints
         .http_base
         .join("/api/messages")
-        .map_err(|e| HistoryError::Malformed(e.to_string()))?;
-    url.set_query(Some(&format!("limit={limit}")));
-
-    let tls = tls_config().map_err(|e| HistoryError::Transport(e.to_string()))?;
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .connect_timeout(Duration::from_secs(10))
-        .tls_backend_preconfigured(tls.clone())
-        .build()
-        .map_err(|e| HistoryError::Transport(e.to_string()))?;
-
-    let response = client
-        .get(url)
-        .header(KEY_HEADER, &endpoints.key)
-        .send()
-        .await
-        .map_err(|e| HistoryError::Transport(e.to_string()))?;
-
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(HistoryError::Unauthorized.into());
-    }
-    if !status.is_success() {
-        return Err(HistoryError::Status(status.as_u16()).into());
+        .map_err(|e| ApiFailure::Malformed(e.to_string()))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("room", room_id);
+        query.append_pair("limit", &limit.to_string());
+        if let Some(before) = before {
+            query.append_pair("before", &before.to_string());
+        }
     }
 
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| HistoryError::Transport(e.to_string()))?;
-
-    let page = MessagePage::decode(body).map_err(|e| HistoryError::Malformed(e.to_string()))?;
+    let body = get(endpoints, url, access_token).await?;
+    let page = MessagePage::decode(body).map_err(|e| ApiFailure::Malformed(e.to_string()))?;
 
     tracing::debug!(
+        room = %room_id,
         count = page.messages.len(),
         has_more = page.has_more,
-        "fetched history page"
+        "fetched a history page"
     );
 
-    Ok(page.messages)
+    Ok(page)
 }
 
-/// The TLS setup shared by every history fetch.
-///
-/// reqwest and tokio-tungstenite must trust the same roots: tungstenite is
-/// built with `rustls-tls-webpki-roots`, so REST verifies against the same
-/// bundled Mozilla set instead of reqwest's platform verifier. Built once —
-/// parsing the root bundle on every fetch would be wasteful.
-fn tls_config() -> Result<&'static rustls::ClientConfig, rustls::Error> {
-    static CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
+/// Every registered user, ordered by username; who is online comes from the
+/// presence frames instead.
+pub async fn fetch_users(
+    endpoints: &Endpoints,
+    access_token: &str,
+) -> Result<Vec<Member>, ApiFailure> {
+    let url = endpoints
+        .http_base
+        .join("/api/users")
+        .map_err(|e| ApiFailure::Malformed(e.to_string()))?;
 
-    if let Some(config) = CONFIG.get() {
-        return Ok(config);
+    let body = get(endpoints, url, access_token).await?;
+    let users = UserList::decode(body).map_err(|e| ApiFailure::Malformed(e.to_string()))?;
+
+    tracing::debug!(count = users.users.len(), "fetched the user list");
+
+    Ok(users.users)
+}
+
+async fn get(
+    endpoints: &Endpoints,
+    url: url::Url,
+    access_token: &str,
+) -> Result<prost::bytes::Bytes, ApiFailure> {
+    let response = http::client()?
+        .get(url)
+        .header(http::KEY_HEADER, &endpoints.key)
+        .header(AUTHORIZATION, http::bearer(access_token))
+        .send()
+        .await
+        .map_err(|e| ApiFailure::Transport(e.to_string()))?;
+
+    if !response.status().is_success() {
+        return Err(http::failure_from(response).await);
     }
 
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    // reqwest only fills ALPN in on a config it builds itself; these are the
-    // protocols it would have offered.
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    Ok(CONFIG.get_or_init(|| config))
+    response
+        .bytes()
+        .await
+        .map_err(|e| ApiFailure::Transport(e.to_string()))
 }

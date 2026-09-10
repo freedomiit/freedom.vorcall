@@ -13,6 +13,7 @@ chrono = "0.4"
 directories = "6"
 futures = "0.3"
 iced = { version = "0.14", features = ["tokio"] }
+notify-rust = "4.18"
 prost = "0.14"
 prost-build = "0.14"
 protox = "0.9"
@@ -21,6 +22,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
     "http2",
 ] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",

@@ -1,5 +1,5 @@
-//! On-disk client configuration. The only thing we persist is the nickname;
-//! messages are never stored on the client.
+//! On-disk client preferences: who signed in last and how the client behaves.
+//! Tokens live in `session.toml` instead, and messages are never stored.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -9,7 +9,27 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub nickname: String,
+    /// `nickname` is what pre-accounts builds wrote here.
+    #[serde(default, alias = "nickname")]
+    pub username: String,
+    #[serde(default = "default_true")]
+    pub notifications: bool,
+    #[serde(default)]
+    pub sound: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            notifications: true,
+            sound: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `None` when the platform exposes no config directory at all.
