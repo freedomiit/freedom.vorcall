@@ -36,6 +36,7 @@ public sealed class ChatSocketHandler(
     private const string UnknownMessageDetail = "unknown or deleted message";
     private const string NotAMemberDetail = "not a member of that room";
     private const string UnleavableRoomDetail = "this room cannot be left";
+    private const string NotInVoiceDetail = "join the voice channel first";
 
     // The eight of PROTOCOL.md, compared as exact strings: the heart carries its variation
     // selector, so a client that drops it is not sending one of these.
@@ -322,6 +323,42 @@ public sealed class ChatSocketHandler(
 
                 case ClientFrame.PayloadOneofCase.React:
                     if (!await HandleReactAsync(connection, frame.React))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.StartShare:
+                    if (!HandleStartShare(connection, frame.StartShare))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.StopShare:
+                    if (!HandleStopShare(connection, frame.StopShare))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.WatchShare:
+                    if (!HandleWatchShare(connection, frame.WatchShare))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.UnwatchShare:
+                    if (!HandleUnwatchShare(connection, frame.UnwatchShare))
                     {
                         await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
                         return;
@@ -771,6 +808,142 @@ public sealed class ChatSocketHandler(
 
             case LeaveVoiceOutcome.Stale:
                 logger.LogDebug("Connection {ConnectionId} left voice after being replaced; dropping", connection.Id);
+                return true;
+
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleStartShare(ClientConnection connection, StartShare start)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (!Validation.TryNormalizeRoomId(start.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.StartShare(connection, userId, roomId, start.Audio))
+        {
+            case StartShareOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case StartShareOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case StartShareOutcome.Unavailable:
+                return NonFatal(connection, ErrorCode.ShareUnavailable, "screen share is disabled on this server");
+
+            case StartShareOutcome.Limit:
+                return NonFatal(connection, ErrorCode.ShareLimit, "this room already has the maximum number of sharers");
+
+            case StartShareOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} started a share after being replaced; dropping", connection.Id);
+                return true;
+
+            // Started: the registry has already queued ShareStarted and ShareWatchers.
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleStopShare(ClientConnection connection, StopShare stop)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (!Validation.TryNormalizeRoomId(stop.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.StopShare(connection, userId, roomId))
+        {
+            case StopShareOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case StopShareOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case StopShareOutcome.NotSharing:
+                return NonFatal(connection, ErrorCode.NotSharing, "not sharing");
+
+            case StopShareOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} stopped a share after being replaced; dropping", connection.Id);
+                return true;
+
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleWatchShare(ClientConnection connection, WatchShare watch)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (!Validation.TryNormalizeRoomId(watch.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        // No account has a non-positive id, so nobody behind one is sharing either.
+        if (watch.UserId <= 0)
+        {
+            return NonFatal(connection, ErrorCode.NotSharing, "that user is not sharing");
+        }
+
+        switch (registry.WatchShare(connection, userId, roomId, watch.UserId))
+        {
+            case WatchShareOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case WatchShareOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case WatchShareOutcome.NotSharing:
+                return NonFatal(connection, ErrorCode.NotSharing, "that user is not sharing");
+
+            case WatchShareOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} watched a share after being replaced; dropping", connection.Id);
+                return true;
+
+            // Watching: the registry has already queued WatchState and the sharer's ShareWatchers.
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleUnwatchShare(ClientConnection connection, UnwatchShare unwatch)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (!Validation.TryNormalizeRoomId(unwatch.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        switch (registry.UnwatchShare(connection, userId, roomId))
+        {
+            case UnwatchShareOutcome.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case UnwatchShareOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case UnwatchShareOutcome.Stale:
+                logger.LogDebug("Connection {ConnectionId} unwatched a share after being replaced; dropping", connection.Id);
                 return true;
 
             default:

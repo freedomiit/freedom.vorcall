@@ -1,40 +1,50 @@
 name: release
 
-# Client release: builds the desktop client for the three supported platforms,
-# signs a manifest with the update signing key and publishes it to the host's
-# `releases/` directory, which the backend serves to signed-in clients through
-# `/api/updates/*`.
+# Client release: builds the macOS desktop client, picks up the Linux and
+# Windows binaries the owner pushed to the host, signs one manifest covering
+# all three platforms and publishes it to the host's `releases/` directory,
+# which the backend serves to signed-in clients through `/api/updates/*`.
+#
+# Linux and Windows are NOT built here. `scripts/push-client.sh` builds them on
+# the owner's machine (native, and cargo-xwin for Windows), checksums them and
+# scp's them into `${APP_DIR}/releases/<version>/` before the tag is pushed.
+# This workflow fetches them back from there.
 #
 # Flow:
-#   1. job "preflight" — reads version/min_version from client/Cargo.toml,
+#   1. job "preflight"         — reads version/min_version from client/Cargo.toml,
 #      asserts the tag matches the workspace version and extracts the release
 #      notes from the annotated tag.
-#   2. job "build"     — builds vorcall on ubuntu-22.04 / windows-latest /
-#      macos-latest with the production server key baked in, checks the binary
-#      reports the expected version, and uploads binary + .sha256 per platform.
-#      Each platform also gets its first-install package: a Linux tarball
-#      with a launcher entry and install script, a per-user Inno Setup
-#      installer on Windows (icon rendered by job "icons"), Vorcall.app inside
-#      a DMG on macOS. The updater keeps fetching the bare binaries and swaps
-#      them in place inside whatever the package installed.
-#   3. job "publish"   — assembles manifest.json from the built assets, signs
-#      it (Ed25519) and verifies the signature against client/update-keys.pub.
-#      When publishing, it copies everything to the host, swaps the manifest
-#      atomically, prunes old versions and creates the GitHub Release.
+#   2. job "icons"             — renders vorcall.ico for the Windows installer.
+#   3. job "build"             — builds vorcall on macos-latest with the
+#      production server key baked in, checks the binary reports the expected
+#      version, wraps it as Vorcall.app inside a DMG and uploads binary +
+#      .sha256 + DMG.
+#   4. job "windows-installer" — publish only: fetches the pushed
+#      vorcall-windows-x86_64.exe from the host, verifies its checksum and
+#      compiles the per-user Inno Setup installer around it.
+#   5. job "publish"           — assembles manifest.json (macOS from job 3,
+#      Linux/Windows fetched from the host), signs it (Ed25519) and verifies the
+#      signature against client/update-keys.pub. When publishing, it copies the
+#      macOS binary and the manifest to the host, swaps the manifest atomically,
+#      prunes old versions and creates the GitHub Release.
 #
 # Dry run vs publish:
 #   - a tag push (v*) always publishes;
 #   - a manual dispatch publishes only when the "publish" input is checked.
-#     Unchecked is a dry run: it still builds, signs and verifies, and leaves
-#     the whole release as workflow artifacts — nothing reaches the host and no
-#     GitHub Release is created.
+#     Unchecked is a dry run: it builds macOS, signs and verifies a macOS-only
+#     manifest and leaves everything as workflow artifacts — the host is never
+#     read or written, so a dry run needs nothing pushed to it, and no GitHub
+#     Release is created.
 #   - a dry run needs no tag; publishing (a tag push, or a dispatch with
 #     publish checked) requires tag vX.Y.Z on the checked-out commit.
 #
 # Release runbook:
 #   1. bump `version` (and `min_version` if old clients must be cut off) in
 #      client/Cargo.toml, commit, push.
-#   2. `git tag -a vX.Y.Z -m "notes"` && `git push origin vX.Y.Z`.
+#   2. `git tag -a vX.Y.Z -m "notes"`.
+#   3. `scripts/push-client.sh` — builds Linux + Windows locally and pushes them
+#      to the host.
+#   4. `git push origin vX.Y.Z`.
 #
 # Prerequisites (one time):
 #   - Secret VORCALL_SERVER_KEY — the production door key, the same value as
@@ -48,8 +58,6 @@ name: release
 #   - `${APP_DIR}/releases/` on the host, created by deploy/provision-host.sh
 #     and bind-mounted read-only into the backend container
 #     (docker-compose.prod.yml).
-#   - The ubuntu-22.04 runner is pinned on purpose: it sets the oldest glibc
-#     the Linux binary supports.
 
 on:
   push:
@@ -57,7 +65,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish to the host and create the GitHub Release (unchecked = dry run: build, sign, verify, keep artifacts only)"
+        description: "Publish to the host and create the GitHub Release (unchecked = dry run: build macOS, sign, verify, keep artifacts only)"
         type: boolean
         default: false
 
@@ -156,8 +164,8 @@ jobs:
 
   icons:
     # The Windows icon, rendered from assets/brand/icon.svg where an SVG
-    # renderer is an apt package away, and handed to the Windows build for
-    # the installer and its shortcuts.
+    # renderer is an apt package away, and handed to the Windows installer job
+    # for the installer and its shortcuts.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -177,13 +185,11 @@ jobs:
           if-no-files-found: error
 
   build:
-    needs: [preflight, icons]
+    needs: [preflight]
     strategy:
       fail-fast: true
       matrix:
         include:
-          - { os: ubuntu-22.04, platform: linux-x86_64, ext: "" }
-          - { os: windows-latest, platform: windows-x86_64, ext: ".exe" }
           - { os: macos-latest, platform: macos-aarch64, ext: "" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -205,10 +211,6 @@ jobs:
           workspaces: client
           key: release-${{ matrix.platform }}
 
-      - name: ALSA headers (rodio/cpal), desktop-file-utils (tarball check)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libasound2-dev desktop-file-utils
-
       - name: Check the server key secret
         # client/.cargo/config.toml defaults the key to "dev"; a release built
         # with it could not talk to production.
@@ -222,9 +224,9 @@ jobs:
         run: cargo build --release -p vorcall-app
 
       - name: No aws-lc-rs in the graph
-        if: runner.os == 'Linux'
-        # the Windows cross build (cargo-xwin) and this release gate both
-        # depend on aws-lc-rs staying out of the client dependency graph.
+        # the Windows cross build (cargo-xwin, run by scripts/push-client.sh)
+        # and this release gate both depend on aws-lc-rs staying out of the
+        # client dependency graph.
         run: if cargo tree -i aws-lc-rs >/dev/null 2>&1; then echo "aws-lc-rs is in the dependency graph"; exit 1; fi
 
       - name: Collect
@@ -233,46 +235,18 @@ jobs:
           mkdir -p ../dist && cp "target/release/vorcall${EXT}" "../dist/vorcall-${PLATFORM}${EXT}"
 
       - name: Ad-hoc signature
-        if: runner.os == 'macOS'
         # Apple Silicon refuses to run unsigned arm64 binaries; an ad-hoc
         # signature is enough to launch. Gatekeeper's first-run prompt is
         # documented in the README.
         run: codesign -s - --force "../dist/vorcall-macos-aarch64" && codesign -dv "../dist/vorcall-macos-aarch64"
 
       - name: Check the reported version
-        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           out=$("../dist/vorcall-${PLATFORM}" --version)
           [ "$out" = "vorcall ${VERSION} ${PLATFORM}" ] || { echo "binary reports '$out'"; exit 1; }
 
-      - name: Linux tarball
-        if: runner.os == 'Linux'
-        # the binary with its executable bit, the launcher entry, the icon and a
-        # per-user install script (packaging/linux/)
-        run: ../scripts/package-client-linux.sh "../dist/vorcall-${PLATFORM}" "$VERSION" ../dist
-
-      - uses: actions/download-artifact@v8
-        if: runner.os == 'Windows'
-        with:
-          name: icons
-          path: icons
-
-      - name: Windows installer
-        if: runner.os == 'Windows'
-        # packaging/windows/vorcall.iss: per-user (Start menu entry, icon,
-        # uninstaller) into the account's local programs folder, which the
-        # updater can write to. pwsh keeps MSYS from rewriting the /D switches.
-        shell: pwsh
-        run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
-          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
-          & $iscc "/DAppVersion=$env:VERSION" "/DSourceDir=$dist" "/DOutputDir=$dist" "/DIconFile=$env:GITHUB_WORKSPACE\icons\vorcall.ico" "$env:GITHUB_WORKSPACE\packaging\windows\vorcall.iss"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: App bundle
-        if: runner.os == 'macOS'
         # Vorcall.app in a DMG is what a friend installs; scripts/bundle-client-macos.sh
         # renders the icon (rsvg-convert), writes Info.plist, signs ad-hoc and builds
         # the drag-to-Applications image with hdiutil.
@@ -289,7 +263,7 @@ jobs:
         run: |
           set -euo pipefail
           cd ../dist
-          for f in "vorcall-${PLATFORM}${EXT}" "vorcall-${PLATFORM}.tar.gz" "vorcall-${PLATFORM}-setup.exe" "vorcall-${PLATFORM}.dmg"; do
+          for f in "vorcall-${PLATFORM}${EXT}" "vorcall-${PLATFORM}.dmg"; do
             if [ -f "$f" ]; then sha256sum "$f" > "$f.sha256"; fi
           done
 
@@ -300,8 +274,74 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  windows-installer:
+    # Publish only: the installer wraps the exe scripts/push-client.sh built and
+    # pushed to the host, so there is nothing to wrap on a dry run.
+    needs: [preflight, icons]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up the SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Fetch the pushed Windows binary from the host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # StrictHostKeyChecking=accept-new instead of ssh-keyscan: the Windows
+          # runner's ssh-keyscan is not guaranteed to be the same OpenSSH.
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+            "$SERVER:$APP_DIR/releases/$VERSION/vorcall-windows-x86_64.exe" \
+            "$SERVER:$APP_DIR/releases/$VERSION/vorcall-windows-x86_64.exe.sha256" \
+            dist/ || { echo "vorcall-windows-x86_64.exe is not on the host for $VERSION — run scripts/push-client.sh first"; exit 1; }
+          cd dist && sha256sum -c vorcall-windows-x86_64.exe.sha256
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: icons
+          path: icons
+
+      - name: Windows installer
+        # packaging/windows/vorcall.iss: per-user (Start menu entry, icon,
+        # uninstaller) into the account's local programs folder, which the
+        # updater can write to. pwsh keeps MSYS from rewriting the /D switches.
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          & $iscc "/DAppVersion=$env:VERSION" "/DSourceDir=$dist" "/DOutputDir=$dist" "/DIconFile=$env:GITHUB_WORKSPACE\icons\vorcall.ico" "$env:GITHUB_WORKSPACE\packaging\windows\vorcall.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist && sha256sum vorcall-windows-x86_64-setup.exe > vorcall-windows-x86_64-setup.exe.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vorcall-windows-installer
+          path: dist/vorcall-windows-x86_64-setup.exe*
+          retention-days: 7
+          if-no-files-found: error
+
   publish:
-    needs: [preflight, build]
+    needs: [preflight, build, windows-installer]
+    # windows-installer is skipped on a dry run, which would skip this job too
+    # under the default "all needs succeeded" rule.
+    if: always() && needs.preflight.result == 'success' && needs.build.result == 'success' && (needs['windows-installer'].result == 'success' || needs['windows-installer'].result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -320,22 +360,62 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
+          name: vorcall-macos-aarch64
           path: dist
-          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: notes
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        if: needs.preflight.outputs.publish == 'true'
+        with:
+          name: vorcall-windows-installer
+          path: dist
 
       - name: Build the release tool
         run: cd client && cargo build --release -p vorcall-release
 
-      - name: Assemble the manifest
+      - name: Set up the SSH key
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 203.0.113.10 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Fetch the pushed Linux and Windows binaries from the host
+        if: needs.preflight.outputs.publish == 'true'
         run: |
           set -euo pipefail
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
+            "$SERVER:$APP_DIR/releases/$VERSION/vorcall-linux-x86_64" \
+            "$SERVER:$APP_DIR/releases/$VERSION/vorcall-linux-x86_64.sha256" \
+            "$SERVER:$APP_DIR/releases/$VERSION/vorcall-windows-x86_64.exe" \
+            "$SERVER:$APP_DIR/releases/$VERSION/vorcall-windows-x86_64.exe.sha256" \
+            "$SERVER:$APP_DIR/releases/$VERSION/vorcall-linux-x86_64.tar.gz" \
+            dist/ || { echo "the Linux/Windows release files are not on the host for $VERSION — run scripts/push-client.sh for v$VERSION first"; exit 1; }
+          cd dist
+          sha256sum -c vorcall-linux-x86_64.sha256
+          sha256sum -c vorcall-windows-x86_64.exe.sha256
+          sha256sum vorcall-linux-x86_64.tar.gz > vorcall-linux-x86_64.tar.gz.sha256
+
+      - name: Assemble the manifest
+        # A dry run has only the macOS binary (the host is never read), so it
+        # signs a macOS-only manifest — enough to prove the key and the tooling.
+        run: |
+          set -euo pipefail
+          assets=(--asset "macos-aarch64=dist/vorcall-macos-aarch64")
+          if [ "$PUBLISH" = true ]; then
+            assets+=(--asset "linux-x86_64=dist/vorcall-linux-x86_64")
+            assets+=(--asset "windows-x86_64=dist/vorcall-windows-x86_64.exe")
+          fi
           client/target/release/vorcall-release manifest \
             --version "$VERSION" \
             --min-version "$MIN_VERSION" \
             --notes-file dist/notes.md \
-            --asset linux-x86_64=dist/vorcall-linux-x86_64 \
-            --asset windows-x86_64=dist/vorcall-windows-x86_64.exe \
-            --asset macos-aarch64=dist/vorcall-macos-aarch64 \
+            "${assets[@]}" \
             --out dist/manifest.json
 
       - name: Sign the manifest
@@ -359,24 +439,15 @@ jobs:
           path: dist/*
           retention-days: 7
 
-      - name: Set up the SSH key
-        if: needs.preflight.outputs.publish == 'true'
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 203.0.113.10 >> ~/.ssh/known_hosts 2>/dev/null
-
       - name: Copy the release to the host
         if: needs.preflight.outputs.publish == 'true'
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$SERVER" "mkdir -p '$APP_DIR/releases/$VERSION'"
-          # the host gets only what the manifest lists, the bare binaries: the tarball, the
-          # installer and the DMG are first-install downloads served by the GitHub Release
+          # only the macOS binary goes up: the Linux and Windows ones are already
+          # there, put by scripts/push-client.sh, and the tarball, the installer
+          # and the DMG are first-install downloads served by the GitHub Release
           scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
-            dist/vorcall-linux-x86_64 dist/vorcall-linux-x86_64.sha256 \
-            dist/vorcall-windows-x86_64.exe dist/vorcall-windows-x86_64.exe.sha256 \
             dist/vorcall-macos-aarch64 dist/vorcall-macos-aarch64.sha256 \
             "$SERVER:$APP_DIR/releases/$VERSION/"
           scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes dist/manifest.json "$SERVER:$APP_DIR/releases/manifest.json.tmp"

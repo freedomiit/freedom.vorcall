@@ -27,4 +27,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 vorcall-core.workspace = true
 vorcall-hotkey.workspace = true
+vorcall-screen.workspace = true
 vorcall-voice.workspace = true

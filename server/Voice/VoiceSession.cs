@@ -1,11 +1,15 @@
+using System.Buffers;
+using System.Collections.Immutable;
 using System.Net;
 using System.Security.Cryptography;
+using System.Threading.Channels;
 
 namespace Vorcall.Server.Voice;
 
 // One voice membership: the key handed to the client in VoiceReady, the cipher built from it,
-// and the per-sender state the relay keeps. Replay and Bucket belong to the receive loop and
-// are touched from nowhere else; the address and the speaking flag cross threads.
+// and the per-sender state the relay keeps. Replay, Bucket and ShareBucket belong to the receive
+// loop and are touched from nowhere else; the address, the speaking flag and the share state
+// cross threads. The share state is only ever written under the relay's gate.
 public sealed class VoiceSession : IDisposable
 {
     public const int KeyBytes = 32;
@@ -15,17 +19,35 @@ public sealed class VoiceSession : IDisposable
     private const double PermitsPerSecond = 100;
     private const double BurstPermits = 200;
 
+    // Half a second of the configured share rate, and never less than 1.5 MiB: a keyframe arrives
+    // as one burst of fragments, and the budget exists to cap a runaway sender, not to shape it.
+    private const double MinShareBurstBytes = 1.5 * 1024 * 1024;
+
+    // Roughly a second of a 30 Mbit/s share at 1200 bytes a datagram. Past that the oldest frames
+    // are worthless, so the queue drops them rather than the newest.
+    private const int ShareQueueCapacity = 4096;
+
     private IPEndPoint? _address;
     private long _lastAudioTicks;
     private int _speaking;
+    private bool _sharing;
+    private bool _shareAudio;
+    private ImmutableArray<VoiceSession> _watchers = [];
+    private VoiceSession? _watching;
+    private Channel<Outbound> _shareQueue;
+    private long _queueDrops;
 
-    internal VoiceSession(uint ssrc, long userId, string roomId, byte[] key)
+    internal VoiceSession(uint ssrc, long userId, string roomId, byte[] key, int shareMaxKbps)
     {
         Ssrc = ssrc;
         UserId = userId;
         RoomId = roomId;
         Key = key;
         Cipher = new ChaCha20Poly1305(key);
+        _shareQueue = CreateShareQueue();
+
+        var bytesPerSecond = shareMaxKbps * 1000d / 8d;
+        ShareBucket = new TokenBucket(bytesPerSecond, Math.Max(MinShareBurstBytes, bytesPerSecond / 2));
     }
 
     public uint Ssrc { get; }
@@ -43,6 +65,46 @@ public sealed class VoiceSession : IDisposable
     internal ReplayWindow Replay { get; } = new();
 
     internal TokenBucket Bucket { get; } = new(PermitsPerSecond, BurstPermits);
+
+    // Bytes, not packets: share media is charged its datagram length and never touches Bucket.
+    internal TokenBucket ShareBucket { get; }
+
+    // Whether this session is screen sharing, and whether that share carries its own audio.
+    public bool Sharing
+    {
+        get => Volatile.Read(ref _sharing);
+        internal set => Volatile.Write(ref _sharing, value);
+    }
+
+    public bool ShareAudio
+    {
+        get => Volatile.Read(ref _shareAudio);
+        internal set => Volatile.Write(ref _shareAudio, value);
+    }
+
+    // The sessions this share is forwarded to. Replaced under the relay's gate, never mutated,
+    // and read as a snapshot by the sender worker: the interlocked write publishes the array, and
+    // the worker reads the field again for every datagram it dequeues.
+    internal ImmutableArray<VoiceSession> Watchers
+    {
+        get => _watchers;
+        set => ImmutableInterlocked.InterlockedExchange(ref _watchers, value);
+    }
+
+    // The share this session is watching, if any: the only target a keyframe request may name.
+    internal VoiceSession? Watching
+    {
+        get => Volatile.Read(ref _watching);
+        set => Volatile.Write(ref _watching, value);
+    }
+
+    // Share media leaves the receive loop here and the session's own worker picks it up, so a
+    // sharer's fan-out never delays anyone's audio.
+    internal ChannelWriter<Outbound> ShareWriter => Volatile.Read(ref _shareQueue).Writer;
+
+    // Frames this session's queue evicted because the worker could not keep up. Cumulative over
+    // the session, across however many shares it ran, and reported with the room's other drops.
+    internal long QueueDrops => Interlocked.Read(ref _queueDrops);
 
     internal bool IsSpeaking => Volatile.Read(ref _speaking) != 0;
 
@@ -113,5 +175,37 @@ public sealed class VoiceSession : IDisposable
 
     internal bool StopSpeaking() => Interlocked.Exchange(ref _speaking, 0) == 1;
 
+    // A completed queue can never be written again, so a share that starts after one stopped gets
+    // a fresh one. Called under the relay's gate, only when this session was not already sharing.
+    internal ChannelReader<Outbound> RestartShareQueue()
+    {
+        var queue = CreateShareQueue();
+        Volatile.Write(ref _shareQueue, queue);
+        return queue.Reader;
+    }
+
+    // Harmless twice: the second call finds the queue already completed and says so.
+    internal void CompleteShareQueue() => Volatile.Read(ref _shareQueue).Writer.TryComplete();
+
     public void Dispose() => Cipher.Dispose();
+
+    // An eviction is the one drop nobody else is in a position to see: it happens inside the
+    // channel, on whichever thread was writing, so the rental goes back to the pool and the
+    // session counts it here.
+    private Channel<Outbound> CreateShareQueue()
+        => Channel.CreateBounded<Outbound>(
+            new BoundedChannelOptions(ShareQueueCapacity)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+            },
+            dropped =>
+            {
+                ArrayPool<byte>.Shared.Return(dropped.Buffer);
+                Interlocked.Increment(ref _queueDrops);
+            });
+
+    // One queued datagram: the 19-byte header verbatim followed by its plaintext, in a buffer
+    // rented from the shared pool that the sender worker returns once it has forwarded it.
+    internal readonly record struct Outbound(byte[] Buffer, int PlaintextLength);
 }

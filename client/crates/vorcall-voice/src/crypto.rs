@@ -160,6 +160,23 @@ mod tests {
     }
 
     #[test]
+    fn a_full_size_datagram_opens_and_one_byte_more_does_not() {
+        let cipher = MediaCipher::new(&KEY);
+        let payload = vec![0xA5u8; MAX_DATAGRAM - HEADER_LEN - TAG_LEN];
+
+        let full = cipher.seal(&header(), &payload);
+        assert_eq!(full.len(), MAX_DATAGRAM);
+        let (_, opened) = cipher.open(&full).expect("opens");
+        assert_eq!(opened, payload);
+
+        let mut oversized = payload;
+        oversized.push(0xA5);
+        let over = cipher.seal(&header(), &oversized);
+        assert_eq!(over.len(), MAX_DATAGRAM + 1);
+        assert!(matches!(cipher.open(&over), Err(PacketError::TooLong)));
+    }
+
+    #[test]
     fn debug_does_not_leak_the_key() {
         let rendered = format!("{:?}", MediaCipher::new(&KEY));
         assert_eq!(rendered, "MediaCipher(<redacted>)");

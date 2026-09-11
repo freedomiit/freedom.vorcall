@@ -32,8 +32,8 @@ jobs:
         with:
           workspaces: client
 
-      - name: ALSA headers (rodio/cpal)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libasound2-dev
+      - name: ALSA headers (rodio/cpal), PipeWire headers + libclang (screen capture bindings)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libasound2-dev libpipewire-0.3-dev libclang-dev
 
       - name: Format
         run: cargo fmt --all --check

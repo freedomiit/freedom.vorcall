@@ -17,7 +17,9 @@ use iced::widget::image::Handle;
 use iced::widget::scrollable::{RelativeOffset, Viewport};
 use iced::widget::{Id, operation};
 use iced::{Element, Size, Subscription, Task, Theme, keyboard, mouse, window};
-use vorcall_core::config::{PeerAudio, TransmitMode, VAD_MAX_DB, VAD_MIN_DB};
+use vorcall_core::config::{
+    PeerAudio, SHARE_MAX_BITRATE_KBPS, SHARE_MIN_BITRATE_KBPS, TransmitMode, VAD_MAX_DB, VAD_MIN_DB,
+};
 use vorcall_core::connection::{
     self, Blob, Command, DisconnectReason, Event, GENERAL_ROOM, MediaKey,
 };
@@ -28,8 +30,14 @@ use vorcall_core::{
     RoomKind, Session, VoiceMember, attachments, auth, config, mentions, session,
 };
 use vorcall_hotkey::{Backend, Binding, Edge, Listener, MouseButton, Unavailable};
-use vorcall_voice::{CleanupSettings, MediaConfig, MediaEngine, Playout, Stats};
+use vorcall_screen::codec::Picture;
+use vorcall_screen::preset::{self, FrameRate, Preset, Resolution};
+use vorcall_screen::{AudioMode, Capabilities, CaptureRequest, Source, SourceId};
+use vorcall_voice::{CleanupSettings, MediaConfig, MediaEngine, Playout, Stats, VideoStats};
 
+use crate::share::{
+    self, DecodeHandle, ShareCommand, ShareEvent, ShareHandle, ShareStats, StageEvent,
+};
 use crate::view;
 use crate::voice::{self, AudioCommand, AudioEvent, AudioHandle, AudioSettings, TransmitSettings};
 use crate::{audio, brand, images, notify, update_ui};
@@ -69,6 +77,16 @@ const RESTART_GRACE: Duration = Duration::from_millis(750);
 /// The coarsest step a download reports, so a big release is not a message per
 /// chunk. Below it, one percent is the step.
 const PROGRESS_STEP: u64 = 1024 * 1024;
+
+/// The pop-out stage: a 16:9 picture with its toolbar over it.
+const STAGE_WINDOW: (f32, f32) = (960.0, 560.0);
+/// The loudest a watched share can be played, which is the range the stage's
+/// slider offers.
+const SHARE_VOLUME_MAX: f32 = 2.0;
+/// What [`vorcall_screen::capabilities`] calls a system that cannot capture.
+pub const NO_CAPTURE: &str = "none";
+/// Whose screen the stage shows while the roster has not caught up.
+const UNKNOWN_SHARER: &str = "someone";
 
 const UNEXPECTED: &str = "Unexpected server answer";
 /// Both the guard that keeps a huge file out of memory and the answer to one
@@ -207,6 +225,10 @@ pub struct RoomUi {
 pub struct VoiceRoster {
     pub members: BTreeMap<i64, VoiceMember>,
     pub speaking: BTreeSet<i64>,
+    /// Who is sharing their screen, and whether that share carries audio. Kept
+    /// beside `members`, which only holds what the last frame about a member
+    /// said and goes stale the moment somebody starts or stops sharing.
+    pub sharing: BTreeMap<i64, bool>,
 }
 
 /// What the message being written carries besides its text.
@@ -248,6 +270,20 @@ pub enum Dialog {
     },
     /// One attachment at full size.
     Image(i64),
+    /// What to share, before any capture starts. A system whose own picker
+    /// chooses the source has nothing to list here.
+    SharePicker {
+        sources: SourcesState,
+        selected: Option<SourceId>,
+        audio: bool,
+    },
+}
+
+/// What the picker knows about this machine's screens and windows.
+pub enum SourcesState {
+    Loading,
+    Ready(Vec<Source>),
+    Failed(String),
 }
 
 /// Everything the voice room adds to the chat screen. `intent` is what makes a
@@ -261,6 +297,10 @@ pub struct VoiceUi {
     /// `JoinVoice` is out and `VoiceReady` has not come back yet.
     pub joining: bool,
     pub members: BTreeMap<i64, VoiceMember>,
+    /// The joined room's sharers, kept the way [`VoiceRoster::sharing`] is.
+    pub sharing: BTreeMap<i64, bool>,
+    pub share: ShareUi,
+    pub watch: WatchUi,
     pub speaking_server: BTreeSet<i64>,
     /// Whoever the local decoder heard within [`SPEAKING_WINDOW`], which needs
     /// no help from the server.
@@ -287,12 +327,118 @@ pub struct VoiceUi {
     pub expanded_member: Option<i64>,
     /// A mirror of the configured tuning, so applying it needs no [`Config`].
     peer_audio: BTreeMap<i64, PeerAudio>,
+    /// Whether a `VoiceState` for the joined room has landed since this
+    /// session's media path was set up. Until one has, `sharing` still
+    /// describes the session that was replaced.
+    roster_seen: bool,
     /// The ssrc of the last `VoiceReady`, waiting for its engine.
     pending_ssrc: u32,
     by_ssrc: BTreeMap<u32, i64>,
     /// What un-deafening puts back.
     muted_before_deafen: bool,
     ticks: u32,
+}
+
+/// This client's own screen share. `intent` is what makes a reconnect start it
+/// again; nothing else here survives one.
+#[derive(Default)]
+pub struct ShareUi {
+    pub intent: Option<ShareIntent>,
+    /// A capture is being started and the server has not answered for it yet.
+    pub starting: bool,
+    pub active: bool,
+    /// The share thread, started the first time something is shared and kept
+    /// for as long as the chat screen is open.
+    handle: Option<ShareHandle>,
+    pub watchers: u32,
+    pub stats: Option<ShareStats>,
+    pub backend: Option<&'static str>,
+    /// What the backend really captured, which is not always what was asked
+    /// for: `None` is a share without audio.
+    pub audio: Option<AudioMode>,
+}
+
+/// What a share was started with, so a reconnect can start the same one again.
+pub struct ShareIntent {
+    request: CaptureRequest,
+    preset: Preset,
+}
+
+impl ShareUi {
+    /// The share thread, spawned on the first share and kept afterwards. The
+    /// task is its event stream, which must only be wired once.
+    fn ensure_thread(&mut self) -> Task<Message> {
+        if self.handle.is_some() {
+            return Task::none();
+        }
+        let (handle, events) = share::spawn_share_thread();
+        self.handle = Some(handle);
+        Task::run(events, Message::Share)
+    }
+
+    fn send(&self, command: ShareCommand) {
+        if let Some(handle) = &self.handle {
+            handle.send(command);
+        }
+    }
+
+    /// Everything about a share that is over. The intent is the caller's: a
+    /// reconnect keeps it, a failure gives it up.
+    fn stopped(&mut self) {
+        self.starting = false;
+        self.active = false;
+        self.stats = None;
+        self.watchers = 0;
+        self.backend = None;
+        self.audio = None;
+    }
+}
+
+/// The share being watched: the intent that survives a reconnect, and the
+/// decoded picture the stage draws.
+pub struct WatchUi {
+    pub intent: Option<i64>,
+    /// Whose stream the server has actually put this client on.
+    pub state: Option<i64>,
+    pub picture: Option<Arc<Picture>>,
+    pub seq: u64,
+    /// Dropping it stops the decode thread; one thread serves a whole session,
+    /// because the access units are handed out once per engine.
+    decoder: Option<DecodeHandle>,
+    /// Decoded frames per second, pictures and errors, as the decode thread
+    /// last reported them.
+    pub stats: Option<(f32, u64, u64)>,
+    pub video: VideoStats,
+    pub popped: Option<window::Id>,
+    /// The window the stage has taken over, which is not always the main one.
+    pub fullscreen: Option<window::Id>,
+    pub volume: f32,
+    /// `video.bytes` as of the last report, for the rate below.
+    last_bytes: u64,
+    pub kbps: u32,
+    /// Whether the next `VoiceState` for the joined room decides the watch a
+    /// reconnect kept: it is only worth asking for again while that user shares.
+    resume_pending: bool,
+}
+
+impl Default for WatchUi {
+    fn default() -> Self {
+        Self {
+            intent: None,
+            state: None,
+            picture: None,
+            seq: 0,
+            decoder: None,
+            stats: None,
+            video: VideoStats::default(),
+            popped: None,
+            fullscreen: None,
+            volume: 1.0,
+            last_bytes: 0,
+            kbps: 0,
+            resume_pending: false,
+        }
+    }
 }
 
 /// Where push-to-talk edges come from. `Global` is a listener actually running;
@@ -586,6 +732,32 @@ pub enum Message {
     SetPeerVolume(i64, f32),
     PeerVolumeReleased(i64),
     TogglePeerMute(i64),
+    /// The screen-share picker, and what is chosen in it.
+    OpenSharePicker,
+    SourcesListed(Result<Vec<Source>, String>),
+    PickSource(SourceId),
+    SetPickerAudio(bool),
+    ConfirmShare,
+    StopShare,
+    /// What the share thread reports about the capture it owns.
+    Share(ShareEvent),
+    WatchShare(i64),
+    StopWatching,
+    /// What the decode thread reports about the stream it reads. Never logged
+    /// whole: a picture is somebody's screen.
+    Stage(StageEvent),
+    PopOutStage,
+    PopInStage,
+    ToggleFullscreen,
+    SetShareVolume(f32),
+    /// The end of a drag, which is what writes the volume to disk.
+    ShareVolumeReleased,
+    SetShareResolution(String),
+    SetShareFps(u32),
+    SetShareBitrateAuto(bool),
+    SetShareBitrate(u32),
+    ShareBitrateReleased,
+    SetShareAudio(bool),
     /// One per frame while the splash is up.
     SplashTick(Instant),
     SplashSkip,
@@ -617,7 +789,7 @@ impl App {
         disabled: Option<String>,
     ) -> Self {
         let screen = if session.is_some() {
-            Screen::Chat(Box::new(ChatState::new()))
+            chat_screen(&config)
         } else {
             Screen::login(config.username.clone())
         };
@@ -712,6 +884,11 @@ impl App {
     pub fn title(&self, window: window::Id) -> String {
         if self.splash == Some(window) {
             return "Vorcall".to_owned();
+        }
+        if let Screen::Chat(chat) = &self.screen
+            && chat.voice.watch.popped == Some(window)
+        {
+            return format!("{} · Vorcall", sharer_name(chat));
         }
         let unread = match &self.screen {
             Screen::Chat(chat) => chat.total_unread(),
@@ -1147,6 +1324,101 @@ impl App {
                 self.save_config();
                 Task::none()
             }
+            Message::OpenSharePicker => self.open_share_picker(),
+            Message::SourcesListed(result) => {
+                if let Screen::Chat(chat) = &mut self.screen
+                    && let Some(Dialog::SharePicker { sources, .. }) = &mut chat.dialog
+                {
+                    *sources = match result {
+                        Ok(listed) => SourcesState::Ready(listed),
+                        Err(error) => SourcesState::Failed(error),
+                    };
+                }
+                Task::none()
+            }
+            Message::PickSource(source_id) => {
+                if let Screen::Chat(chat) = &mut self.screen
+                    && let Some(Dialog::SharePicker { selected, .. }) = &mut chat.dialog
+                {
+                    *selected = Some(source_id);
+                }
+                Task::none()
+            }
+            Message::SetPickerAudio(value) => {
+                if let Screen::Chat(chat) = &mut self.screen
+                    && let Some(Dialog::SharePicker { audio, .. }) = &mut chat.dialog
+                {
+                    *audio = value;
+                }
+                Task::none()
+            }
+            Message::ConfirmShare => self.confirm_share(),
+            Message::StopShare => self.stop_share(),
+            Message::Share(event) => self.on_share_event(event),
+            Message::WatchShare(user_id) => self.watch_share(user_id),
+            Message::StopWatching => self.stop_watching(),
+            Message::Stage(event) => self.on_stage_event(event),
+            Message::PopOutStage => self.pop_out_stage(),
+            Message::PopInStage => {
+                let Screen::Chat(chat) = &mut self.screen else {
+                    return Task::none();
+                };
+                let watch = &mut chat.voice.watch;
+                let Some(id) = watch.popped.take() else {
+                    return Task::none();
+                };
+                if watch.fullscreen == Some(id) {
+                    watch.fullscreen = None;
+                }
+                window::close(id)
+            }
+            Message::ToggleFullscreen => self.toggle_fullscreen(),
+            Message::SetShareVolume(volume) => {
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.voice.set_share_volume(volume);
+                }
+                Task::none()
+            }
+            Message::ShareVolumeReleased => {
+                // Every step of the drag reached the mixer already; only its
+                // end reaches the disk.
+                if let Screen::Chat(chat) = &self.screen {
+                    self.config.share_volume = chat.voice.watch.volume;
+                }
+                self.save_config();
+                Task::none()
+            }
+            Message::SetShareResolution(resolution) => {
+                self.config.share_resolution = resolution;
+                self.save_config();
+                Task::none()
+            }
+            Message::SetShareFps(fps) => {
+                self.config.share_fps = fps;
+                self.save_config();
+                Task::none()
+            }
+            Message::SetShareBitrateAuto(auto) => {
+                // Manual starts where automatic left off, so the slider does
+                // not jump the moment it appears.
+                self.config.share_bitrate_kbps = (!auto).then(|| auto_bitrate_kbps(&self.config));
+                self.save_config();
+                Task::none()
+            }
+            Message::SetShareBitrate(kbps) => {
+                self.config.share_bitrate_kbps =
+                    Some(kbps.clamp(SHARE_MIN_BITRATE_KBPS, SHARE_MAX_BITRATE_KBPS));
+                Task::none()
+            }
+            Message::ShareBitrateReleased => {
+                self.save_config();
+                Task::none()
+            }
+            Message::SetShareAudio(value) => {
+                self.config.share_audio = value;
+                self.save_config();
+                Task::none()
+            }
             Message::MediaConnected(Ok(handoff)) => self.media_connected(handoff),
             Message::MediaConnected(Err(reason)) => {
                 let Screen::Chat(chat) = &mut self.screen else {
@@ -1217,6 +1489,17 @@ impl App {
                 Task::none()
             }
             Message::WindowClosed(id) => {
+                // The stage goes back into the main window; the watch itself
+                // carries on.
+                if let Screen::Chat(chat) = &mut self.screen {
+                    let watch = &mut chat.voice.watch;
+                    if watch.popped == Some(id) {
+                        watch.popped = None;
+                    }
+                    if watch.fullscreen == Some(id) {
+                        watch.fullscreen = None;
+                    }
+                }
                 if self.splash == Some(id) {
                     self.splash = None;
                     self.entrance = None;
@@ -1309,6 +1592,12 @@ impl App {
                 Some(entrance) => entrance.view(Message::SplashSkip),
                 None => iced::widget::Space::new().into(),
             };
+        }
+
+        if let Screen::Chat(chat) = &self.screen
+            && chat.voice.watch.popped == Some(window)
+        {
+            return view::popped_stage(chat);
         }
 
         match &self.screen {
@@ -1464,7 +1753,7 @@ impl App {
         tracing::info!(user_id = session.user_id, "signed in");
         self.session = Some(session);
         self.session_generation = self.session_generation.wrapping_add(1);
-        self.screen = Screen::Chat(Box::new(ChatState::new()));
+        self.screen = chat_screen(&self.config);
         operation::focus(Id::new(view::INPUT_ID))
     }
 
@@ -1827,8 +2116,7 @@ impl App {
             return Task::none();
         };
 
-        chat.voice.intent = false;
-        chat.voice.joining = false;
+        chat.voice.give_up_intents();
         let room_id = chat.voice.room_id.clone();
         if !chat.send_command(Command::LeaveVoice { room_id }) {
             // The intent stays cleared either way: the server drops the slot
@@ -1949,8 +2237,271 @@ impl App {
         chat.voice.peer_audio = peer_audio;
         chat.voice.apply_all_peer_audio();
 
+        // The share starts again on the new sender. The `VoiceState` behind
+        // the `VoiceReady` normally lands before this, so the watch is usually
+        // decided right here rather than left waiting for one.
+        let share = chat.voice.resume_share();
+        chat.resume_watch();
+
         let hotkey = self.start_hotkey();
-        Task::batch([closing, Task::run(events, Message::Audio), hotkey])
+        Task::batch([closing, Task::run(events, Message::Audio), share, hotkey])
+    }
+
+    /// Offers the picker. A system that cannot capture at all never gets here:
+    /// the sidebar draws no button for it.
+    fn open_share_picker(&mut self) -> Task<Message> {
+        let capabilities = vorcall_screen::capabilities();
+        let audio = self.config.share_audio;
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        if !can_share(&chat.voice, &capabilities) {
+            return Task::none();
+        }
+
+        chat.dialog = Some(Dialog::SharePicker {
+            sources: if capabilities.portal_picker {
+                SourcesState::Ready(Vec::new())
+            } else {
+                SourcesState::Loading
+            },
+            selected: None,
+            audio,
+        });
+        if capabilities.portal_picker {
+            return Task::none();
+        }
+
+        // Listing the screens talks to the window server and blocks; on macOS
+        // it is also what raises the screen-recording prompt.
+        Task::perform(
+            tokio::task::spawn_blocking(vorcall_screen::enumerate),
+            |joined| {
+                let listed = match joined {
+                    Ok(listed) => listed.map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                Message::SourcesListed(listed)
+            },
+        )
+    }
+
+    fn confirm_share(&mut self) -> Task<Message> {
+        let preset = share_preset(&self.config);
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        let Some(Dialog::SharePicker {
+            selected, audio, ..
+        }) = chat.dialog.take()
+        else {
+            return Task::none();
+        };
+
+        let request = CaptureRequest {
+            source: selected,
+            fps: preset.fps,
+            cursor: true,
+            audio,
+            max_size: capture_box(preset.resolution),
+        };
+        let Some(session) = chat.voice.session.as_ref() else {
+            chat.notice = Some("Join voice first".to_owned());
+            return Task::none();
+        };
+        let sender = session.engine.sender();
+        let share_far_end = session.audio.share_far_end();
+
+        chat.voice.share.intent = Some(ShareIntent {
+            request: request.clone(),
+            preset,
+        });
+        chat.voice.share.starting = true;
+        let thread = chat.voice.share.ensure_thread();
+        chat.voice.share.send(ShareCommand::Start {
+            request,
+            preset,
+            sender,
+            share_far_end,
+        });
+        thread
+    }
+
+    fn stop_share(&mut self) -> Task<Message> {
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        let room_id = chat.voice.room_id.clone();
+        chat.voice.share.intent = None;
+        chat.voice.share.send(ShareCommand::Stop);
+        chat.voice.share.stopped();
+        chat.send_or_notice(Command::StopShare { room_id });
+        Task::none()
+    }
+
+    fn on_share_event(&mut self, event: ShareEvent) -> Task<Message> {
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        match event {
+            ShareEvent::Started {
+                width,
+                height,
+                output,
+                audio,
+                backend,
+            } => {
+                tracing::info!(
+                    width,
+                    height,
+                    output = ?output,
+                    audio = ?audio,
+                    backend,
+                    "a screen share is running"
+                );
+                chat.voice.share.backend = Some(backend);
+                chat.voice.share.audio = audio;
+                let room_id = chat.voice.room_id.clone();
+                chat.send_or_notice(Command::StartShare {
+                    room_id,
+                    audio: audio.is_some(),
+                });
+            }
+            ShareEvent::Stats(stats) => {
+                tracing::debug!(
+                    capture_fps = stats.capture_fps,
+                    encode_fps = stats.encode_fps,
+                    kbps = stats.kbps,
+                    output = ?stats.output,
+                    keyframes = stats.keyframes,
+                    keyframe_requests = stats.keyframe_requests,
+                    dropped = stats.dropped_frames,
+                    skipped = stats.skipped_frames,
+                    audio_frames = stats.audio_frames,
+                    "sharing a screen"
+                );
+                chat.voice.share.stats = Some(stats);
+            }
+            ShareEvent::Failed(reason) | ShareEvent::Ended(reason) => {
+                // The server is only told about a share it was told about.
+                if chat.voice.share.active {
+                    let room_id = chat.voice.room_id.clone();
+                    chat.send_command(Command::StopShare { room_id });
+                }
+                chat.voice.share.intent = None;
+                chat.voice.share.stopped();
+                chat.notice = Some(reason);
+            }
+        }
+        Task::none()
+    }
+
+    fn watch_share(&mut self, user_id: i64) -> Task<Message> {
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        let room_id = chat.voice.room_id.clone();
+        if !can_watch(&chat.voice, chat.member_id, &room_id, user_id) {
+            return Task::none();
+        }
+        chat.voice.watch.intent = Some(user_id);
+        chat.send_or_notice(Command::WatchShare { room_id, user_id });
+        Task::none()
+    }
+
+    /// Asks to come off the stream. What is on screen stays until the server
+    /// answers with the `WatchState` that ends it.
+    fn stop_watching(&mut self) -> Task<Message> {
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        let room_id = chat.voice.room_id.clone();
+        chat.voice.watch.intent = None;
+        chat.send_or_notice(Command::UnwatchShare { room_id });
+        Task::none()
+    }
+
+    fn on_stage_event(&mut self, event: StageEvent) -> Task<Message> {
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        match event {
+            StageEvent::Picture { picture, seq } => {
+                chat.voice.watch.picture = Some(picture);
+                chat.voice.watch.seq = seq;
+            }
+            StageEvent::Stats {
+                decode_fps,
+                pictures,
+                errors,
+                dropped,
+            } => {
+                tracing::debug!(
+                    decode_fps,
+                    pictures,
+                    errors,
+                    dropped,
+                    "watching a shared screen"
+                );
+                chat.voice.watch.stats = Some((decode_fps, pictures, errors));
+            }
+            StageEvent::Failed(reason) => chat.notice = Some(reason),
+        }
+        Task::none()
+    }
+
+    fn pop_out_stage(&mut self) -> Task<Message> {
+        let settings = self.stage_settings();
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        let watch = &mut chat.voice.watch;
+        if watch.state.is_none() || watch.popped.is_some() {
+            return Task::none();
+        }
+        // The stage leaves the window it was in, so nothing there is fullscreen
+        // for it any more.
+        let restore = match watch.fullscreen.take() {
+            Some(id) => window::set_mode(id, window::Mode::Windowed),
+            None => Task::none(),
+        };
+
+        let (id, opening) = window::open(settings);
+        watch.popped = Some(id);
+        Task::batch([restore, opening.discard()])
+    }
+
+    fn stage_settings(&self) -> window::Settings {
+        window::Settings {
+            size: Size::new(STAGE_WINDOW.0, STAGE_WINDOW.1),
+            icon: self.icon.clone(),
+            platform_specific: platform_specific(false),
+            ..window::Settings::default()
+        }
+    }
+
+    /// The stage takes over whichever window shows it, and gives it back.
+    fn toggle_fullscreen(&mut self) -> Task<Message> {
+        let main = self.main_window;
+        let Screen::Chat(chat) = &mut self.screen else {
+            return Task::none();
+        };
+        let watch = &mut chat.voice.watch;
+        if let Some(id) = watch.fullscreen.take() {
+            return window::set_mode(id, window::Mode::Windowed);
+        }
+        let Some(id) = watch.popped.or(main) else {
+            return Task::none();
+        };
+        watch.fullscreen = Some(id);
+        window::set_mode(id, window::Mode::Fullscreen)
+    }
+
+    fn in_fullscreen(&self) -> bool {
+        match &self.screen {
+            Screen::Chat(chat) => chat.voice.watch.fullscreen.is_some(),
+            _ => false,
+        }
     }
 
     fn on_audio(&mut self, event: AudioEvent) -> Task<Message> {
@@ -2039,6 +2590,10 @@ impl App {
             return self.bind_ptt(binding_from_key(&key));
         }
         if escape {
+            // The stage owns Escape while it owns a whole window.
+            if self.in_fullscreen() {
+                return self.toggle_fullscreen();
+            }
             return self.close_overlay();
         }
         if self.key_is_ptt(&key) {
@@ -2380,7 +2935,9 @@ impl App {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .speaking(SPEAKING_WINDOW);
-        let stats = (voice.ticks % STATS_EVERY == 0).then(|| session.engine.stats());
+        let report = voice.ticks % STATS_EVERY == 0;
+        let stats = report.then(|| session.engine.stats());
+        let video = session.engine.video_stats();
 
         voice.ticks = voice.ticks.wrapping_add(1);
         voice.speaking_local = speaking
@@ -2389,6 +2946,19 @@ impl App {
             .collect();
         if let Some(stats) = stats {
             voice.stats = stats;
+        }
+
+        voice.watch.video = video;
+        if report {
+            // The viewer measures no bitrate of its own; what the depacketizer
+            // took in over the second between two reports is the rate.
+            let bytes = voice.watch.video.bytes;
+            let received = bytes.saturating_sub(voice.watch.last_bytes);
+            voice.watch.last_bytes = bytes;
+            voice.watch.kbps = (received as f64 * 8.0
+                / 1_000.0
+                / (f64::from(STATS_EVERY) * VOICE_TICK.as_secs_f64()))
+                as u32;
         }
         Task::none()
     }
@@ -3106,6 +3676,27 @@ impl ChatState {
         room
     }
 
+    /// Acts on the watch intent a reconnect kept, against the roster this
+    /// session has. Without one yet the answer waits for the next `VoiceState`
+    /// for the joined room, which is what asks again.
+    fn resume_watch(&mut self) {
+        let decision = watch_resume(
+            self.voice.watch.intent,
+            &self.voice.sharing,
+            self.voice.roster_seen,
+        );
+        self.voice.watch.resume_pending = decision == WatchResume::Pending;
+
+        match decision {
+            WatchResume::Request(user_id) => {
+                let room_id = self.voice.room_id.clone();
+                self.send_command(Command::WatchShare { room_id, user_id });
+            }
+            WatchResume::Clear => self.voice.watch.intent = None,
+            WatchResume::Pending | WatchResume::Nothing => {}
+        }
+    }
+
     /// Every connection event except the two that end the session and the live
     /// message, which both need more than the chat state.
     fn apply(&mut self, event: Event, focused: bool) -> Task<Message> {
@@ -3168,6 +3759,7 @@ impl ChatState {
                 self.voice.joining = false;
                 self.voice.pending_ssrc = 0;
                 self.voice.members.clear();
+                self.voice.sharing.clear();
                 self.voice.by_ssrc.clear();
                 self.voice.speaking_server.clear();
                 // Voice membership is per connection, in every room.
@@ -3411,21 +4003,31 @@ impl ChatState {
                 let VoiceRoster {
                     members: held,
                     speaking,
+                    sharing,
                 } = roster;
                 *held = members
                     .iter()
                     .map(|member| (member.user_id, member.clone()))
                     .collect();
+                *sharing = sharing_map(&members);
                 speaking.retain(|user_id| held.contains_key(user_id));
 
-                if room_id == self.voice.room_id {
-                    self.voice.reset_members(members);
+                if room_id != self.voice.room_id {
+                    return Task::none();
+                }
+                self.voice.reset_members(members);
+
+                // The media path came up before this roster did, so the watch a
+                // reconnect kept is still waiting to be judged.
+                if self.voice.watch.resume_pending {
+                    self.resume_watch();
                 }
                 Task::none()
             }
             Event::VoiceMemberJoined { room_id, member } => {
                 let roster = self.voice_rosters.entry(room_id.clone()).or_default();
                 roster.speaking.remove(&member.user_id);
+                set_sharing(&mut roster.sharing, &member);
                 roster.members.insert(member.user_id, member.clone());
 
                 if room_id == self.voice.room_id {
@@ -3437,6 +4039,7 @@ impl ChatState {
                 if let Some(roster) = self.voice_rosters.get_mut(&room_id) {
                     roster.members.remove(&user_id);
                     roster.speaking.remove(&user_id);
+                    roster.sharing.remove(&user_id);
                 }
                 if room_id != self.voice.room_id {
                     return Task::none();
@@ -3446,8 +4049,7 @@ impl ChatState {
                 // another device. Nothing is on the relay any more, so neither
                 // the engine nor the sidebar may claim there is.
                 if user_id == self.member_id && self.voice.intent {
-                    self.voice.intent = false;
-                    self.voice.joining = false;
+                    self.voice.give_up_intents();
                     return self.voice.close_session();
                 }
                 Task::none()
@@ -3470,6 +4072,72 @@ impl ChatState {
                     } else {
                         self.voice.speaking_server.remove(&user_id);
                     }
+                }
+                Task::none()
+            }
+            Event::ShareStarted {
+                room_id,
+                user_id,
+                audio,
+            } => {
+                self.voice_rosters
+                    .entry(room_id.clone())
+                    .or_default()
+                    .sharing
+                    .insert(user_id, audio);
+                if room_id != self.voice.room_id {
+                    return Task::none();
+                }
+                self.voice.sharing.insert(user_id, audio);
+                // The server has the share, so the capture running here is one
+                // other people can now ask to watch.
+                if user_id == self.member_id {
+                    self.voice.share.active = true;
+                    self.voice.share.starting = false;
+                }
+                Task::none()
+            }
+            Event::ShareStopped { room_id, user_id } => {
+                if let Some(roster) = self.voice_rosters.get_mut(&room_id) {
+                    roster.sharing.remove(&user_id);
+                }
+                if room_id != self.voice.room_id {
+                    return Task::none();
+                }
+                self.voice.sharing.remove(&user_id);
+                // The server ended this client's own share — the voice slot
+                // went, or a limit was reached — so the capture goes with it.
+                // A frame about a share already stopped from here is stale, and
+                // would otherwise kill the one started right after it.
+                if user_id == self.member_id && self.voice.share.active {
+                    self.voice.share.send(ShareCommand::Stop);
+                    self.voice.share.intent = None;
+                    self.voice.share.stopped();
+                }
+                // Nothing to go back to once that screen is gone.
+                if self.voice.watch.intent == Some(user_id) {
+                    self.voice.watch.intent = None;
+                }
+                Task::none()
+            }
+            Event::WatchState { room_id, user_id } => {
+                if room_id != self.voice.room_id {
+                    return Task::none();
+                }
+                match user_id {
+                    Some(user_id) => self.voice.start_watching(user_id),
+                    None => self.voice.leave_stage(),
+                }
+            }
+            Event::ShareWatchers { room_id, count } => {
+                if room_id != self.voice.room_id {
+                    return Task::none();
+                }
+                let (paused, keyframe) = pause_decision(self.voice.share.watchers, count);
+                self.voice.share.watchers = count;
+                self.voice.share.send(ShareCommand::SetPaused(paused));
+                if keyframe {
+                    self.voice.share.send(ShareCommand::ForceKeyframe);
                 }
                 Task::none()
             }
@@ -3631,8 +4299,9 @@ impl RoomUi {
 }
 
 impl VoiceUi {
-    /// Drops the media path and leaves `intent` alone: a reconnect rejoins with
-    /// it. Closing the engine is what stops its tasks; dropping it does not.
+    /// Drops the media path and leaves every intent alone: a reconnect rejoins,
+    /// shares again and asks to watch again with them. Closing the engine is
+    /// what stops its tasks; dropping it does not.
     fn close_session(&mut self) -> Task<Message> {
         self.ptt_held = false;
         self.transmitting = false;
@@ -3644,8 +4313,18 @@ impl VoiceUi {
         // the binding.
         self.drop_hotkey();
 
+        // Whatever `sharing` holds describes the session that is going.
+        self.roster_seen = false;
+        // The capture feeds the engine that is going, and the decoder reads a
+        // stream that ends with it.
+        self.share.send(ShareCommand::Stop);
+        self.share.stopped();
+        self.watch.decoder = None;
+        self.forget_stream();
+        let stage = self.close_stage_windows();
+
         let Some(session) = self.session.take() else {
-            return Task::none();
+            return stage;
         };
         tracing::debug!(
             ssrc = session.ssrc,
@@ -3654,7 +4333,138 @@ impl VoiceUi {
             "closing the voice session"
         );
         session.audio.send(AudioCommand::Close);
-        Task::perform(session.engine.close(), |()| Message::Noop)
+        Task::batch([
+            stage,
+            Task::perform(session.engine.close(), |()| Message::Noop),
+        ])
+    }
+
+    /// Everything the stage shows about a stream that is over. The watch intent
+    /// is not part of it.
+    fn forget_stream(&mut self) {
+        self.watch.state = None;
+        self.watch.picture = None;
+        self.watch.seq = 0;
+        self.watch.stats = None;
+        self.watch.video = VideoStats::default();
+        self.watch.last_bytes = 0;
+        self.watch.kbps = 0;
+    }
+
+    /// Puts the pop-out away and gives a window that went fullscreen for the
+    /// stage its decorations back.
+    fn close_stage_windows(&mut self) -> Task<Message> {
+        let restore = match self.watch.fullscreen.take() {
+            Some(id) => window::set_mode(id, window::Mode::Windowed),
+            None => Task::none(),
+        };
+        let close = match self.watch.popped.take() {
+            Some(id) => window::close(id),
+            None => Task::none(),
+        };
+        Task::batch([restore, close])
+    }
+
+    /// What a leave gives up: the voice slot and both screen-share intents, so
+    /// none of them is asserted again on the next connection.
+    fn give_up_intents(&mut self) {
+        self.intent = false;
+        self.joining = false;
+        self.share.intent = None;
+        self.watch.intent = None;
+    }
+
+    /// Starts the share a reconnect kept, on the new engine's sender.
+    fn resume_share(&mut self) -> Task<Message> {
+        let Some(intent) = &self.share.intent else {
+            return Task::none();
+        };
+        let (request, preset) = (intent.request.clone(), intent.preset);
+
+        let Some(session) = &self.session else {
+            return Task::none();
+        };
+        let sender = session.engine.sender();
+        let share_far_end = session.audio.share_far_end();
+
+        self.share.starting = true;
+        let thread = self.share.ensure_thread();
+        self.share.send(ShareCommand::Start {
+            request,
+            preset,
+            sender,
+            share_far_end,
+        });
+        thread
+    }
+
+    /// The server put this client on a sharer's stream. One decode thread
+    /// serves a whole session: the engine hands its access units out once, so
+    /// switching sharers only re-points the engine at another ssrc.
+    fn start_watching(&mut self, user_id: i64) -> Task<Message> {
+        let ssrc = self.members.get(&user_id).map(|member| member.ssrc);
+        if ssrc.is_none() {
+            tracing::debug!(user_id, "watching a sharer the roster does not name");
+        }
+        let volume = self.watch.volume;
+        let first = self.watch.decoder.is_none();
+
+        let Some(session) = &self.session else {
+            return Task::none();
+        };
+        session.engine.watch(ssrc);
+        {
+            let playout = session.engine.playout();
+            let mut playout = playout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            playout.set_share_gain(volume);
+        }
+        let units = first.then(|| session.engine.take_access_units()).flatten();
+
+        self.forget_stream();
+        self.watch.state = Some(user_id);
+
+        let Some(units) = units else {
+            if first {
+                tracing::warn!("this session has no access units left to decode");
+            }
+            return Task::none();
+        };
+        let (decoder, events) = share::spawn_decode_thread(units);
+        self.watch.decoder = Some(decoder);
+        Task::run(events, Message::Stage)
+    }
+
+    /// The server took this client off every stream. The decoder stays: it is
+    /// the session's, and it simply starves until the next watch.
+    fn leave_stage(&mut self) -> Task<Message> {
+        if let Some(session) = &self.session {
+            session.engine.watch(None);
+            let playout = session.engine.playout();
+            playout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove_share();
+        }
+        self.forget_stream();
+        self.close_stage_windows()
+    }
+
+    /// The watched share's volume, live: the mixer holds it, and only the end
+    /// of a drag writes it to the configuration.
+    fn set_share_volume(&mut self, volume: f32) {
+        self.watch.volume = volume.clamp(0.0, SHARE_VOLUME_MAX);
+        let volume = self.watch.volume;
+
+        let Some(session) = &self.session else {
+            return;
+        };
+        let playout = session.engine.playout();
+        playout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_share_gain(volume);
     }
 
     /// Stops the listener and moves past it: no start still in flight, no
@@ -3674,6 +4484,8 @@ impl VoiceUi {
     }
 
     fn reset_members(&mut self, members: Vec<VoiceMember>) {
+        self.roster_seen = true;
+        self.sharing = sharing_map(&members);
         self.by_ssrc = members
             .iter()
             .map(|member| (member.ssrc, member.user_id))
@@ -3696,6 +4508,7 @@ impl VoiceUi {
         self.speaking_server.remove(&user_id);
         self.speaking_local.remove(&user_id);
         self.by_ssrc.insert(member.ssrc, user_id);
+        set_sharing(&mut self.sharing, &member);
         self.members.insert(user_id, member);
         // A rejoin brings a new ssrc, so the tuning has to follow it.
         self.apply_peer_audio(user_id);
@@ -3707,6 +4520,7 @@ impl VoiceUi {
         }
         self.speaking_server.remove(&user_id);
         self.speaking_local.remove(&user_id);
+        self.sharing.remove(&user_id);
         if self.expanded_member == Some(user_id) {
             self.expanded_member = None;
         }
@@ -3750,6 +4564,186 @@ impl VoiceUi {
 fn apply_tuning(playout: &mut Playout, member: &VoiceMember, audio: PeerAudio) {
     playout.set_gain(member.ssrc, audio.volume);
     playout.set_muted(member.ssrc, audio.muted);
+}
+
+/// A fresh chat screen, with the preferences its state mirrors already in it.
+fn chat_screen(config: &Config) -> Screen {
+    let mut chat = ChatState::new();
+    chat.voice.watch.volume = config.share_volume;
+    Screen::Chat(Box::new(chat))
+}
+
+/// Who shares in a room, and whether that share carries audio.
+fn sharing_map(members: &[VoiceMember]) -> BTreeMap<i64, bool> {
+    members
+        .iter()
+        .filter(|member| member.sharing)
+        .map(|member| (member.user_id, member.share_audio))
+        .collect()
+}
+
+/// One member's share, as the frame that carried them describes it.
+fn set_sharing(sharing: &mut BTreeMap<i64, bool>, member: &VoiceMember) {
+    if member.sharing {
+        sharing.insert(member.user_id, member.share_audio);
+    } else {
+        sharing.remove(&member.user_id);
+    }
+}
+
+/// Whether a screen can be shared from here: a live voice session, nothing of
+/// ours already on the wire, and a backend that can capture at all.
+pub fn can_share(voice: &VoiceUi, capabilities: &Capabilities) -> bool {
+    capabilities.backend != NO_CAPTURE
+        && voice.session.is_some()
+        && !voice.share.active
+        && !voice.share.starting
+}
+
+/// Whether `user_id`'s share can be watched from the room `room_id` names.
+pub fn can_watch(voice: &VoiceUi, me: i64, room_id: &str, user_id: i64) -> bool {
+    watch_rule(
+        voice.session.is_some() && voice.room_id == room_id,
+        voice.sharing.contains_key(&user_id),
+        user_id == me,
+    )
+}
+
+/// Watching takes a live voice session in the room whose roster is on screen,
+/// a peer sharing in it, and somebody other than oneself.
+fn watch_rule(in_this_voice_room: bool, sharing: bool, is_me: bool) -> bool {
+    in_this_voice_room && sharing && !is_me
+}
+
+/// What a fresh media session does about a watch intent a reconnect kept.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchResume {
+    /// That screen is still being shared: ask for the stream again.
+    Request(i64),
+    /// The roster is in and it is not: there is nothing to go back to.
+    Clear,
+    /// No roster for this session yet, so nothing can be judged.
+    Pending,
+    Nothing,
+}
+
+/// A reconnect keeps the watch intent; whether it is worth asking for again is
+/// the fresh roster's word, and without one the answer has to wait for it.
+fn watch_resume(
+    intent: Option<i64>,
+    sharing: &BTreeMap<i64, bool>,
+    roster_seen: bool,
+) -> WatchResume {
+    let Some(user_id) = intent else {
+        return WatchResume::Nothing;
+    };
+    if !roster_seen {
+        return WatchResume::Pending;
+    }
+    if sharing.contains_key(&user_id) {
+        WatchResume::Request(user_id)
+    } else {
+        WatchResume::Clear
+    }
+}
+
+/// What a new watcher count means for the capture: nobody watching pauses the
+/// encoder, and whoever arrives after a pause can only start at a keyframe.
+fn pause_decision(previous: u32, now: u32) -> (bool, bool) {
+    (now == 0, previous == 0 && now > 0)
+}
+
+/// Everyone sharing in the joined room, as the stage's picker lists them. This
+/// client is never in it: its own screen is not watched here.
+pub fn sharer_list(voice: &VoiceUi, me: i64) -> Vec<(i64, String)> {
+    voice
+        .sharing
+        .keys()
+        .filter(|user_id| **user_id != me)
+        .filter_map(|user_id| {
+            let member = voice.members.get(user_id)?;
+            Some((*user_id, member.username.clone()))
+        })
+        .collect()
+}
+
+/// Whose screen the stage is showing.
+pub fn sharer_name(chat: &ChatState) -> &str {
+    let Some(user_id) = chat.voice.watch.state else {
+        return UNKNOWN_SHARER;
+    };
+    chat.voice
+        .members
+        .get(&user_id)
+        .map(|member| member.username.as_str())
+        .or_else(|| {
+            chat.users
+                .get(&user_id)
+                .map(|member| member.username.as_str())
+        })
+        .unwrap_or(UNKNOWN_SHARER)
+}
+
+/// The preset a share starts with. Anything the configuration cannot name is
+/// the default rather than a refusal to share.
+fn share_preset(config: &Config) -> Preset {
+    Preset {
+        resolution: config.share_resolution.parse().unwrap_or(Resolution::P720),
+        fps: FrameRate::from_hz(config.share_fps).unwrap_or(FrameRate::F30),
+        bitrate_kbps: config.share_bitrate_kbps,
+    }
+}
+
+/// The frame the capture backend is asked to aim for where it can scale for us.
+/// A share at the source's own resolution asks for nothing.
+fn capture_box(resolution: Resolution) -> Option<(u32, u32)> {
+    match resolution {
+        Resolution::Source => None,
+        Resolution::P720 => Some((1280, 720)),
+        Resolution::P1080 => Some((1920, 1080)),
+        Resolution::P1440 => Some((2560, 1440)),
+        Resolution::P2160 => Some((3840, 2160)),
+    }
+}
+
+/// What the preset would have asked the encoder for on its own, which is where
+/// a manual bitrate starts.
+fn auto_bitrate_kbps(config: &Config) -> u32 {
+    let preset = Preset {
+        bitrate_kbps: None,
+        ..share_preset(config)
+    };
+    preset.bitrate_kbps(capture_box(preset.resolution).unwrap_or(preset::MAX_SOURCE))
+}
+
+/// What this machine can share, in the sentence under the settings. `running`
+/// is the backend a live share actually got, which is the one worth naming.
+pub fn share_sentence(capabilities: &Capabilities, running: Option<&'static str>) -> String {
+    if capabilities.backend == NO_CAPTURE {
+        return "This system cannot share a screen.".to_owned();
+    }
+
+    let mut parts = vec![
+        format!("Capture: {}", running.unwrap_or(capabilities.backend)),
+        if capabilities.windows {
+            "whole screens and single windows".to_owned()
+        } else {
+            "whole screens only".to_owned()
+        },
+        if capabilities.audio {
+            "shared audio carries what this machine plays, without Vorcall's own voices".to_owned()
+        } else {
+            "no audio with the share on this system".to_owned()
+        },
+    ];
+    if capabilities.portal_picker {
+        parts.push("the system dialog picks the screen or window".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    parts.push(
+        "Screen Recording permission is required, and re-granted after every update".to_owned(),
+    );
+    parts.join(" · ")
 }
 
 impl Screen {
@@ -4405,6 +5399,157 @@ mod tests {
 
         assert!(handoff.take().is_some());
         assert!(handoff.take().is_none());
+    }
+
+    fn voice_member(user_id: i64, username: &str) -> VoiceMember {
+        VoiceMember {
+            user_id,
+            username: username.to_owned(),
+            ssrc: user_id as u32,
+            sharing: false,
+            share_audio: false,
+        }
+    }
+
+    /// A client that is sharing one screen and watching somebody else's.
+    fn sharing_voice() -> VoiceUi {
+        VoiceUi {
+            room_id: GENERAL_ROOM.to_owned(),
+            intent: true,
+            sharing: [(9, true)].into_iter().collect(),
+            share: ShareUi {
+                intent: Some(ShareIntent {
+                    request: CaptureRequest {
+                        source: None,
+                        fps: FrameRate::F30,
+                        cursor: true,
+                        audio: true,
+                        max_size: Some((1280, 720)),
+                    },
+                    preset: share_preset(&Config::default()),
+                }),
+                starting: true,
+                active: true,
+                ..ShareUi::default()
+            },
+            watch: WatchUi {
+                intent: Some(9),
+                state: Some(9),
+                seq: 12,
+                ..WatchUi::default()
+            },
+            ..VoiceUi::default()
+        }
+    }
+
+    /// A reconnect drops the media path and everything drawn from it. What was
+    /// asked for is exactly what survives one, so the new session shares and
+    /// watches again by itself.
+    #[test]
+    fn a_reconnect_keeps_the_share_intent_and_the_watch_intent() {
+        let mut voice = sharing_voice();
+
+        let _ = voice.close_session();
+
+        assert!(voice.share.intent.is_some());
+        assert_eq!(voice.watch.intent, Some(9));
+        assert!(!voice.share.active);
+        assert!(!voice.share.starting);
+        assert_eq!(voice.watch.state, None);
+        assert_eq!(voice.watch.seq, 0);
+    }
+
+    #[test]
+    fn a_share_stopped_for_the_watched_user_drops_the_watch_intent() {
+        let mut chat = ChatState::new();
+        chat.member_id = 7;
+        chat.voice.sharing.insert(9, true);
+        chat.voice.watch.intent = Some(9);
+
+        let _ = chat.apply(
+            Event::ShareStopped {
+                room_id: GENERAL_ROOM.to_owned(),
+                user_id: 9,
+            },
+            false,
+        );
+
+        assert_eq!(chat.voice.watch.intent, None);
+        assert!(!chat.voice.sharing.contains_key(&9));
+    }
+
+    #[test]
+    fn leaving_voice_clears_both_intents() {
+        let mut voice = sharing_voice();
+
+        voice.give_up_intents();
+
+        assert!(!voice.intent);
+        assert!(!voice.joining);
+        assert!(voice.share.intent.is_none());
+        assert_eq!(voice.watch.intent, None);
+    }
+
+    #[test]
+    fn watch_is_offered_only_in_voice_for_a_sharing_peer_that_is_not_me() {
+        assert!(watch_rule(true, true, false));
+        // Not in that room's voice channel, so there is no stream to ask for.
+        assert!(!watch_rule(false, true, false));
+        // In voice with them, but they are sharing nothing.
+        assert!(!watch_rule(true, false, false));
+        // One's own screen is not watched here.
+        assert!(!watch_rule(true, true, true));
+    }
+
+    #[test]
+    fn the_stage_sharer_list_excludes_me_and_keeps_usernames() {
+        let voice = VoiceUi {
+            members: [(7, "me"), (9, "bea"), (4, "ana")]
+                .into_iter()
+                .map(|(user_id, username)| (user_id, voice_member(user_id, username)))
+                .collect(),
+            sharing: [(4, false), (7, false), (9, true), (11, false)]
+                .into_iter()
+                .collect(),
+            ..VoiceUi::default()
+        };
+
+        // 11 shares but is not in the roster, so there is no name to list it
+        // under.
+        assert_eq!(
+            sharer_list(&voice, 7),
+            vec![(4, "ana".to_owned()), (9, "bea".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_reconnect_re_requests_the_watch_when_the_sharer_is_still_there() {
+        let sharing: BTreeMap<i64, bool> = [(9, true)].into_iter().collect();
+
+        assert_eq!(
+            watch_resume(Some(9), &sharing, true),
+            WatchResume::Request(9)
+        );
+        // The roster is in and that screen is gone with it.
+        assert_eq!(watch_resume(Some(4), &sharing, true), WatchResume::Clear);
+        // The media path came up first: nothing can be judged until the roster
+        // for this session lands.
+        assert_eq!(
+            watch_resume(Some(9), &BTreeMap::new(), false),
+            WatchResume::Pending
+        );
+        assert_eq!(watch_resume(None, &sharing, true), WatchResume::Nothing);
+    }
+
+    #[test]
+    fn a_watcher_count_rising_from_zero_forces_a_keyframe() {
+        // Nobody watching: the encoder stops, and nothing has to be forced.
+        assert_eq!(pause_decision(0, 0), (true, false));
+        // The first watcher can only start at a keyframe.
+        assert_eq!(pause_decision(0, 1), (false, true));
+        // A second one joins a stream that is already running.
+        assert_eq!(pause_decision(1, 2), (false, false));
+        assert_eq!(pause_decision(2, 0), (true, false));
     }
 
     fn member(user_id: i64, username: &str) -> Member {

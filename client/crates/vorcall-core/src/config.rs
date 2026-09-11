@@ -14,6 +14,15 @@ pub const VAD_MIN_DB: f32 = -60.0;
 pub const VAD_MAX_DB: f32 = -20.0;
 pub const VAD_DEFAULT_DB: f32 = -45.0;
 
+/// What the settings screen offers for a screen share, coarsest last; "source"
+/// keeps the captured size.
+pub const SHARE_RESOLUTIONS: [&str; 5] = ["source", "720p", "1080p", "1440p", "2160p"];
+pub const SHARE_DEFAULT_RESOLUTION: &str = "720p";
+pub const SHARE_FRAME_RATES: [u32; 3] = [15, 30, 60];
+pub const SHARE_DEFAULT_FPS: u32 = 30;
+pub const SHARE_MIN_BITRATE_KBPS: u32 = 1_000;
+pub const SHARE_MAX_BITRATE_KBPS: u32 = 30_000;
+
 /// How audio leaves the machine: while the push-to-talk binding is held, or whenever the noise gate is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +89,22 @@ pub struct Config {
     pub echo_cancellation: bool,
     #[serde(default)]
     pub auto_gain: bool,
+    /// One of [`SHARE_RESOLUTIONS`]; anything else falls back to the default on load.
+    #[serde(default = "default_share_resolution")]
+    pub share_resolution: String,
+    /// One of [`SHARE_FRAME_RATES`].
+    #[serde(default = "default_share_fps")]
+    pub share_fps: u32,
+    /// `None` = let the encoder pick from resolution and frame rate; a value is
+    /// clamped to SHARE_MIN_BITRATE_KBPS..=SHARE_MAX_BITRATE_KBPS on load.
+    #[serde(default)]
+    pub share_bitrate_kbps: Option<u32>,
+    /// Whether a share the local user starts carries audio.
+    #[serde(default = "default_true")]
+    pub share_audio: bool,
+    /// Playback volume for a watched share, 0.0..=2.0.
+    #[serde(default = "default_volume")]
+    pub share_volume: f32,
     /// Keyed by the peer's user id in decimal — TOML table keys are strings.
     #[serde(default)]
     pub peer_audio: BTreeMap<String, PeerAudio>,
@@ -99,6 +124,11 @@ impl Default for Config {
             noise_suppression: true,
             echo_cancellation: true,
             auto_gain: false,
+            share_resolution: SHARE_DEFAULT_RESOLUTION.to_owned(),
+            share_fps: SHARE_DEFAULT_FPS,
+            share_bitrate_kbps: None,
+            share_audio: true,
+            share_volume: 1.0,
             peer_audio: BTreeMap::new(),
         }
     }
@@ -136,6 +166,14 @@ fn default_vad_threshold_db() -> f32 {
     VAD_DEFAULT_DB
 }
 
+fn default_share_resolution() -> String {
+    SHARE_DEFAULT_RESOLUTION.to_owned()
+}
+
+fn default_share_fps() -> u32 {
+    SHARE_DEFAULT_FPS
+}
+
 /// Clamps values that could only have reached here from a hand-edited or
 /// stale `config.toml`, so every other caller can trust the ranges hold.
 fn normalize(config: &mut Config) {
@@ -143,6 +181,27 @@ fn normalize(config: &mut Config) {
         VAD_DEFAULT_DB
     } else {
         config.vad_threshold_db.clamp(VAD_MIN_DB, VAD_MAX_DB)
+    };
+
+    let resolution = config.share_resolution.to_ascii_lowercase();
+    config.share_resolution = SHARE_RESOLUTIONS
+        .iter()
+        .find(|known| **known == resolution)
+        .map(|known| (*known).to_owned())
+        .unwrap_or_else(default_share_resolution);
+
+    if !SHARE_FRAME_RATES.contains(&config.share_fps) {
+        config.share_fps = SHARE_DEFAULT_FPS;
+    }
+
+    config.share_bitrate_kbps = config
+        .share_bitrate_kbps
+        .map(|kbps| kbps.clamp(SHARE_MIN_BITRATE_KBPS, SHARE_MAX_BITRATE_KBPS));
+
+    config.share_volume = if config.share_volume.is_nan() {
+        1.0
+    } else {
+        config.share_volume.clamp(0.0, 2.0)
     };
 
     for audio in config.peer_audio.values_mut() {
@@ -235,12 +294,59 @@ mod tests {
     }
 
     #[test]
+    fn a_config_without_the_share_keys_still_loads() {
+        let raw = r#"
+            username = "x"
+            ptt_key = "F8"
+        "#;
+        let mut config: Config = toml::from_str(raw).expect("parses a config missing share keys");
+        normalize(&mut config);
+
+        assert_eq!(config.share_resolution, SHARE_DEFAULT_RESOLUTION);
+        assert_eq!(config.share_fps, SHARE_DEFAULT_FPS);
+        assert_eq!(config.share_bitrate_kbps, None);
+        assert!(config.share_audio);
+        assert_eq!(config.share_volume, 1.0);
+    }
+
+    #[test]
+    fn share_settings_are_normalised() {
+        let mut config = Config {
+            share_resolution: "1080P".to_owned(),
+            share_fps: 25,
+            share_bitrate_kbps: Some(90_000),
+            share_volume: 7.5,
+            ..Config::default()
+        };
+        normalize(&mut config);
+
+        assert_eq!(config.share_resolution, "1080p");
+        assert_eq!(config.share_fps, SHARE_DEFAULT_FPS);
+        assert_eq!(config.share_bitrate_kbps, Some(SHARE_MAX_BITRATE_KBPS));
+        assert_eq!(config.share_volume, 2.0);
+
+        config.share_resolution = "potato".to_owned();
+        config.share_bitrate_kbps = Some(10);
+        config.share_volume = f32::NAN;
+        normalize(&mut config);
+
+        assert_eq!(config.share_resolution, SHARE_DEFAULT_RESOLUTION);
+        assert_eq!(config.share_bitrate_kbps, Some(SHARE_MIN_BITRATE_KBPS));
+        assert_eq!(config.share_volume, 1.0);
+    }
+
+    #[test]
     fn round_trips_through_toml() {
         let mut config = Config {
             transmit_mode: TransmitMode::VoiceActivation,
             vad_threshold_db: -30.0,
             echo_cancellation: false,
             auto_gain: true,
+            share_resolution: "1440p".to_owned(),
+            share_fps: 60,
+            share_bitrate_kbps: Some(8_000),
+            share_audio: false,
+            share_volume: 0.75,
             ..Default::default()
         };
         config.set_peer_audio(
@@ -345,5 +451,16 @@ mod tests {
         assert!(raw.contains("noise_suppression = true"));
         assert!(raw.contains("echo_cancellation = true"));
         assert!(raw.contains("auto_gain = false"));
+    }
+
+    /// Like `input_device`, an unset bitrate leaves no key behind at all.
+    #[test]
+    fn share_keys_serialize_snake_case_without_an_unset_bitrate() {
+        let raw = toml::to_string(&Config::default()).expect("serializes");
+        assert!(raw.contains(r#"share_resolution = "720p""#));
+        assert!(raw.contains("share_fps = 30"));
+        assert!(raw.contains("share_audio = true"));
+        assert!(!raw.contains("share_bitrate_kbps"));
+        assert!(!raw.contains("input_device"));
     }
 }

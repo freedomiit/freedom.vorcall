@@ -29,7 +29,8 @@ use tokio_tungstenite::tungstenite::{
 use vorcall_proto::v1::{
     Attachment, ChatMessage, ClientFrame, CreateRoom, DeleteMessage, EditMessage, ErrorCode, Hello,
     JoinRoom, JoinVoice, LeaveRoom, LeaveVoice, MarkRead, Member, MessagePage, OpenDm, Ping, React,
-    Reaction, Room, RoomEntry, SendMessage, ServerFrame, VoiceMember, client_frame, server_frame,
+    Reaction, Room, RoomEntry, SendMessage, ServerFrame, StartShare, StopShare, UnwatchShare,
+    VoiceMember, WatchShare, client_frame, server_frame,
 };
 
 use crate::attachments;
@@ -122,6 +123,22 @@ pub enum Command {
         room_id: String,
     },
     LeaveVoice {
+        room_id: String,
+    },
+    /// Sent once the local capture is running; idempotent server-side.
+    StartShare {
+        room_id: String,
+        audio: bool,
+    },
+    StopShare {
+        room_id: String,
+    },
+    /// Replaces any previous watch.
+    WatchShare {
+        room_id: String,
+        user_id: i64,
+    },
+    UnwatchShare {
         room_id: String,
     },
 }
@@ -320,6 +337,30 @@ pub enum Event {
         user_id: i64,
         speaking: bool,
     },
+    ShareStarted {
+        room_id: String,
+        user_id: i64,
+        audio: bool,
+    },
+    ShareStopped {
+        room_id: String,
+        user_id: i64,
+    },
+    /// Which share this client is watching now; `None` means none.
+    WatchState {
+        room_id: String,
+        user_id: Option<i64>,
+    },
+    /// How many peers are watching the local share.
+    ShareWatchers {
+        room_id: String,
+        count: u32,
+    },
+}
+
+/// `WatchState.user_id` is 0 when the server means "not watching anyone".
+fn watch_target(user_id: i64) -> Option<i64> {
+    (user_id != 0).then_some(user_id)
 }
 
 /// A log-safe rendering of a received frame: `VoiceReady` carries the media key,
@@ -599,6 +640,14 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
         // No event: the UI re-sends JoinVoice after every Connected.
         Command::JoinVoice { room_id } | Command::LeaveVoice { room_id } => {
             tracing::debug!(%room_id, "cannot change voice membership while disconnected");
+            true
+        }
+        // No event: the UI re-asserts the share state after the next VoiceReady.
+        Command::StartShare { room_id, .. }
+        | Command::StopShare { room_id }
+        | Command::WatchShare { room_id, .. }
+        | Command::UnwatchShare { room_id } => {
+            tracing::debug!(%room_id, "cannot change screen share while disconnected");
             true
         }
         // No event either: the UI disables these while disconnected.
@@ -935,6 +984,19 @@ where
                     }
                     Some(server_frame::Payload::Speaking(speaking)) => {
                         tracing::debug!(room = %speaking.room_id, "ignoring a voice frame before Welcome");
+                    }
+                    // Share frames cannot precede Welcome either.
+                    Some(server_frame::Payload::ShareStarted(started)) => {
+                        tracing::debug!(room = %started.room_id, "ignoring a share frame before Welcome");
+                    }
+                    Some(server_frame::Payload::ShareStopped(stopped)) => {
+                        tracing::debug!(room = %stopped.room_id, "ignoring a share frame before Welcome");
+                    }
+                    Some(server_frame::Payload::WatchState(state)) => {
+                        tracing::debug!(room = %state.room_id, "ignoring a share frame before Welcome");
+                    }
+                    Some(server_frame::Payload::ShareWatchers(watchers)) => {
+                        tracing::debug!(room = %watchers.room_id, "ignoring a share frame before Welcome");
                     }
                     // Room and message frames cannot precede Welcome either.
                     Some(server_frame::Payload::RoomList(list)) => {
@@ -1710,6 +1772,31 @@ where
                                     speaking: speaking.speaking,
                                 });
                             }
+                            Some(server_frame::Payload::ShareStarted(started)) => {
+                                emit_or_break!('live, events, Event::ShareStarted {
+                                    room_id: started.room_id,
+                                    user_id: started.user_id,
+                                    audio: started.audio,
+                                });
+                            }
+                            Some(server_frame::Payload::ShareStopped(stopped)) => {
+                                emit_or_break!('live, events, Event::ShareStopped {
+                                    room_id: stopped.room_id,
+                                    user_id: stopped.user_id,
+                                });
+                            }
+                            Some(server_frame::Payload::WatchState(state)) => {
+                                emit_or_break!('live, events, Event::WatchState {
+                                    room_id: state.room_id,
+                                    user_id: watch_target(state.user_id),
+                                });
+                            }
+                            Some(server_frame::Payload::ShareWatchers(watchers)) => {
+                                emit_or_break!('live, events, Event::ShareWatchers {
+                                    room_id: watchers.room_id,
+                                    count: watchers.count,
+                                });
+                            }
                             // A Pong only had to reach the watchdog above.
                             Some(server_frame::Payload::Pong(_)) => {}
                             // A payload this build does not know: a newer server
@@ -1925,6 +2012,22 @@ where
                     Command::LeaveVoice { room_id } => send_or_break!(
                         'live, sink, "LeaveVoice",
                         client_frame::Payload::LeaveVoice(LeaveVoice { room_id })
+                    ),
+                    Command::StartShare { room_id, audio } => send_or_break!(
+                        'live, sink, "StartShare",
+                        client_frame::Payload::StartShare(StartShare { room_id, audio })
+                    ),
+                    Command::StopShare { room_id } => send_or_break!(
+                        'live, sink, "StopShare",
+                        client_frame::Payload::StopShare(StopShare { room_id })
+                    ),
+                    Command::WatchShare { room_id, user_id } => send_or_break!(
+                        'live, sink, "WatchShare",
+                        client_frame::Payload::WatchShare(WatchShare { room_id, user_id })
+                    ),
+                    Command::UnwatchShare { room_id } => send_or_break!(
+                        'live, sink, "UnwatchShare",
+                        client_frame::Payload::UnwatchShare(UnwatchShare { room_id })
                     ),
                     Command::LoadHistory { room_id } => {
                         if history.enqueue(room_id.clone()) {
@@ -2276,5 +2379,11 @@ mod tests {
             }
             other => panic!("expected a FetchFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_watch_state_of_zero_means_nobody() {
+        assert_eq!(watch_target(0), None);
+        assert_eq!(watch_target(7), Some(7));
     }
 }

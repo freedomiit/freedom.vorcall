@@ -150,7 +150,17 @@ else
     fi
 fi
 
-# --- 8. production .env -----------------------------------------------------
+# --- 8. socket buffers for the media relay ----------------------------------
+step "socket buffers for the media relay"
+# The relay requests 8 MiB buffers for screen share; without the caps below the kernel clamps them silently to ~208 KiB.
+sudo tee /etc/sysctl.d/90-vorcall.conf >/dev/null <<'EOF'
+# Vorcall media relay: let the container's UDP socket ask for 8 MiB buffers (screen share).
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+EOF
+sudo sysctl --system >/dev/null
+
+# --- 9. production .env -----------------------------------------------------
 step "production .env"
 mkdir -p "$APP_DIR"
 # Bind-mounted read-only into the backend; the release workflow scps manifests and binaries here.
@@ -178,7 +188,7 @@ else
     echo "bake the same Vorcall__ServerKey into client builds via VORCALL_SERVER_KEY"
 fi
 
-# --- 9. deploy public key ---------------------------------------------------
+# --- 10. deploy public key ---------------------------------------------------
 step "deploy SSH key"
 if [ -n "${DEPLOY_PUBKEY:-}" ]; then
     mkdir -p ~/.ssh
@@ -197,7 +207,7 @@ else
     echo "DEPLOY_PUBKEY not set, skipping"
 fi
 
-# --- 10. summary ------------------------------------------------------------
+# --- 11. summary ------------------------------------------------------------
 step "summary"
 sudo certbot certificates -d "$DOMAIN" 2>/dev/null | grep -i 'expiry date' || \
     echo "certificate expiry: unknown"

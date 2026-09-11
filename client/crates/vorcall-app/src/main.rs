@@ -9,6 +9,7 @@ mod audio;
 mod brand;
 mod images;
 mod notify;
+mod share;
 mod update_ui;
 mod view;
 mod voice;

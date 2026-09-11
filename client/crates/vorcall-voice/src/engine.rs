@@ -1,20 +1,32 @@
 //! The UDP side of a voice room: one socket to the relay, a send path safe to
 //! call from the audio thread, keepalive pings for reachability and round-trip
 //! time, and the receive task that feeds [`Playout`].
+//!
+//! The same socket, key and ssrc carry a screen share: its video as fragmented
+//! access units ([`crate::video`]) and its audio as a stereo stream of its own.
+//! A client watches at most one sharer at a time, and every datagram type draws
+//! its sequence number from the one counter, so no nonce is ever reused.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use socket2::{Domain, Socket, Type};
 use tokio::net::{UdpSocket, lookup_host};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use crate::SAMPLE_RATE;
 use crate::crypto::MediaCipher;
 use crate::jitter::Incoming;
-use crate::packet::{Header, MAX_DATAGRAM, MIN_DATAGRAM, PONG_SEQ_BIT, PacketType};
+use crate::packet::{Header, MAX_DATAGRAM, MIN_DATAGRAM, PONG_SEQ_BIT, PacketError, PacketType};
 use crate::playout::{PeerStats, Playout};
+use crate::video::{
+    AccessUnit, Depacketizer, FragmentHeader, MAX_VIDEO_DATA, VIDEO_HEADER_LEN, VideoStats,
+    fragments,
+};
 
 pub const PING_INTERVAL: Duration = Duration::from_secs(5);
 pub const LINK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -24,6 +36,19 @@ const PENDING_PINGS: usize = 8;
 /// One MTU's worth of slack, so an oversized datagram is seen and rejected
 /// rather than silently truncated into something that looks valid.
 const RECV_BUFFER: usize = 2048;
+/// However many holes a viewer sees, it asks the sharer this often at most.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+/// Fragments handed to the kernel before the sender pauses: a keyframe is a
+/// burst of hundreds of datagrams and the send buffer is not infinite.
+const VIDEO_BURST: usize = 16;
+/// Long enough for the kernel to drain a burst, short enough to be invisible
+/// inside a frame interval.
+const BURST_PAUSE: Duration = Duration::from_millis(1);
+/// 4 MiB each way: a keyframe arrives as one burst, and the few hundred KiB a
+/// socket gets by default would lose most of it.
+const SOCKET_BUFFER_BYTES: usize = 4 << 20;
+/// `Shared::watched` holding no ssrc at all.
+const NOT_WATCHING: i64 = -1;
 
 pub struct MediaConfig {
     pub host: String,
@@ -49,6 +74,10 @@ pub struct Stats {
     pub bytes_received: u64,
     /// Datagrams that failed length/header/AEAD checks.
     pub rejected: u64,
+    /// Video and share audio from a sharer this client is not watching.
+    pub ignored: u64,
+    /// Datagrams the socket refused, usually a full send buffer.
+    pub send_failures: u64,
     pub rtt_last_ms: Option<f64>,
     pub rtt_min_ms: Option<f64>,
     pub rtt_avg_ms: Option<f64>,
@@ -56,6 +85,9 @@ pub struct Stats {
     pub rtt_samples: u32,
     pub link: Link,
     pub peers: Vec<(u32, PeerStats)>,
+    pub video: VideoStats,
+    /// Keyframe requests other clients sent this one, as the sharer.
+    pub keyframe_requests_received: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +98,8 @@ pub enum EngineError {
     Bind(std::io::Error),
     #[error("cannot send a media datagram: {0}")]
     Send(std::io::Error),
+    #[error("cannot frame a media datagram: {0}")]
+    Packet(#[from] PacketError),
     #[error("the media engine is closed")]
     Closed,
 }
@@ -86,7 +120,15 @@ struct Shared {
     packets_received: AtomicU64,
     bytes_received: AtomicU64,
     rejected: AtomicU64,
-    /// Audio and pings draw from one counter so a nonce is never reused.
+    ignored: AtomicU64,
+    send_failures: AtomicU64,
+    keyframe_requests_received: AtomicU64,
+    /// Raised by an incoming keyframe request, lowered by the sharer reading
+    /// it: requests arriving between reads coalesce into one keyframe.
+    keyframe_request: AtomicBool,
+    /// The sharer whose video and share audio are accepted, or [`NOT_WATCHING`].
+    watched: AtomicI64,
+    /// Every datagram type draws from one counter so a nonce is never reused.
     seq: AtomicU64,
     started: Instant,
     pending_pings: Mutex<VecDeque<u64>>,
@@ -137,6 +179,118 @@ impl FrameSender {
         };
         send(&self.socket, &self.shared, &self.cipher.seal(&header, opus))
     }
+
+    /// One 20 ms stereo frame of the screen share's own audio.
+    pub fn send_share_audio(&self, opus: &[u8], marker: bool) -> Result<(), EngineError> {
+        let header = Header {
+            kind: PacketType::ShareAudio,
+            marker,
+            ssrc: self.ssrc,
+            seq: self.shared.seq.fetch_add(1, Ordering::Relaxed),
+            ts: self.shared.ts(),
+        };
+        send(&self.socket, &self.shared, &self.cipher.seal(&header, opus))
+    }
+
+    /// Cuts one encoded access unit into fragments and puts them all on the
+    /// wire under one timestamp, returning how many there were.
+    ///
+    /// This blocks: every [`VIDEO_BURST`] fragments it sleeps for a
+    /// millisecond, so it belongs on a worker thread and never on the UI or
+    /// audio thread. A fragment the socket refuses is counted in
+    /// [`Stats::send_failures`] and the rest of the unit still goes out; the
+    /// call only fails when every one of them did.
+    pub fn send_video(
+        &self,
+        frame_id: u32,
+        keyframe: bool,
+        data: &[u8],
+    ) -> Result<usize, EngineError> {
+        // One clock reading for the whole unit: the fragments are one frame.
+        let ts = self.shared.ts();
+        let mut plaintext = Vec::with_capacity(VIDEO_HEADER_LEN + MAX_VIDEO_DATA);
+        let mut count = 0usize;
+        let mut sent = 0usize;
+        let mut last_error = None;
+
+        for (index, (fragment, chunk)) in fragments(frame_id, keyframe, data)?.enumerate() {
+            if index > 0 && index % VIDEO_BURST == 0 {
+                std::thread::sleep(BURST_PAUSE);
+            }
+            plaintext.clear();
+            plaintext.extend_from_slice(&fragment.encode());
+            plaintext.extend_from_slice(chunk);
+
+            let header = Header {
+                kind: PacketType::Video,
+                marker: false,
+                ssrc: self.ssrc,
+                seq: self.shared.seq.fetch_add(1, Ordering::Relaxed),
+                ts,
+            };
+            count += 1;
+            match send(
+                &self.socket,
+                &self.shared,
+                &self.cipher.seal(&header, &plaintext),
+            ) {
+                Ok(()) => sent += 1,
+                Err(EngineError::Send(error)) => last_error = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+
+        match last_error {
+            Some(error) if sent == 0 => Err(EngineError::Send(error)),
+            _ => Ok(count),
+        }
+    }
+
+    /// Asks `target_ssrc` for a keyframe, as a viewer.
+    pub fn request_keyframe(&self, target_ssrc: u32) -> Result<(), EngineError> {
+        send_keyframe_request(
+            &self.socket,
+            &self.cipher,
+            &self.shared,
+            self.ssrc,
+            target_ssrc,
+        )
+    }
+
+    /// Whether a viewer asked for a keyframe since the last call, as the
+    /// sharer. Requests arriving between two calls coalesce into one.
+    pub fn take_keyframe_request(&self) -> bool {
+        self.shared.keyframe_request.swap(false, Ordering::Relaxed)
+    }
+}
+
+fn send_keyframe_request(
+    socket: &UdpSocket,
+    cipher: &MediaCipher,
+    shared: &Shared,
+    ssrc: u32,
+    target_ssrc: u32,
+) -> Result<(), EngineError> {
+    let header = Header {
+        kind: PacketType::KeyframeRequest,
+        marker: false,
+        ssrc,
+        seq: shared.seq.fetch_add(1, Ordering::Relaxed),
+        ts: shared.ts(),
+    };
+    send(
+        socket,
+        shared,
+        &cipher.seal(&header, &target_ssrc.to_be_bytes()),
+    )
+}
+
+/// The sharer this client is watching, if any.
+fn watched(shared: &Shared) -> Option<u32> {
+    match shared.watched.load(Ordering::Relaxed) {
+        NOT_WATCHING => None,
+        ssrc => u32::try_from(ssrc).ok(),
+    }
 }
 
 fn send(socket: &UdpSocket, shared: &Shared, datagram: &[u8]) -> Result<(), EngineError> {
@@ -152,7 +306,28 @@ fn send(socket: &UdpSocket, shared: &Shared, datagram: &[u8]) -> Result<(), Engi
             shared.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
             Ok(())
         }
-        Err(error) => Err(EngineError::Send(error)),
+        Err(error) => {
+            shared.send_failures.fetch_add(1, Ordering::Relaxed);
+            Err(EngineError::Send(error))
+        }
+    }
+}
+
+/// What the [`MediaEngine`] knows about the video stream it is watching.
+struct VideoState {
+    depacketizer: Depacketizer,
+    /// Requests sent for this stream; reset along with the depacketizer.
+    keyframe_requests: u64,
+    last_request_at: Option<Instant>,
+}
+
+impl VideoState {
+    fn new() -> Self {
+        Self {
+            depacketizer: Depacketizer::new(),
+            keyframe_requests: 0,
+            last_request_at: None,
+        }
     }
 }
 
@@ -160,6 +335,9 @@ pub struct MediaEngine {
     sender: FrameSender,
     playout: Arc<Mutex<Playout>>,
     shared: Arc<Shared>,
+    video: Arc<Mutex<VideoState>>,
+    /// Handed out once, to whoever decodes the watched share's video.
+    access_units: Mutex<Option<UnboundedReceiver<AccessUnit>>>,
     receive_task: JoinHandle<()>,
     ping_task: JoinHandle<()>,
 }
@@ -172,13 +350,8 @@ impl MediaEngine {
             .find(|address| address.is_ipv4())
             .ok_or_else(|| EngineError::Resolve(format!("no IPv4 address for {}", config.host)))?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(EngineError::Bind)?;
-        // Connecting the socket makes the kernel drop datagrams from anyone but
-        // the relay, so the receive path never sees off-path traffic.
-        socket.connect(relay).await.map_err(EngineError::Bind)?;
-        let socket = Arc::new(socket);
+        let (socket, recv_buffer, send_buffer) = bind_socket(relay)?;
+        let socket = Arc::new(UdpSocket::from_std(socket).map_err(EngineError::Bind)?);
 
         let cipher = Arc::new(MediaCipher::new(&config.key));
         let shared = Arc::new(Shared {
@@ -187,20 +360,35 @@ impl MediaEngine {
             packets_received: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            ignored: AtomicU64::new(0),
+            send_failures: AtomicU64::new(0),
+            keyframe_requests_received: AtomicU64::new(0),
+            keyframe_request: AtomicBool::new(false),
+            watched: AtomicI64::new(NOT_WATCHING),
             seq: AtomicU64::new(0),
             started: Instant::now(),
             pending_pings: Mutex::new(VecDeque::new()),
             rtt: Mutex::new(Rtt::default()),
         });
         let playout = Arc::new(Mutex::new(Playout::new()));
+        let video = Arc::new(Mutex::new(VideoState::new()));
+        let (access_units, incoming_units) = unbounded_channel();
 
-        tracing::debug!(%relay, ssrc = config.ssrc, "media engine connected");
+        tracing::debug!(
+            %relay,
+            ssrc = config.ssrc,
+            recv_buffer,
+            send_buffer,
+            "media engine connected"
+        );
 
         let receive_task = tokio::spawn(receive_loop(
             Arc::clone(&socket),
             Arc::clone(&cipher),
             Arc::clone(&shared),
             Arc::clone(&playout),
+            Arc::clone(&video),
+            access_units,
             config.ssrc,
         ));
         let ping_task = tokio::spawn(ping_loop(
@@ -219,9 +407,52 @@ impl MediaEngine {
             },
             playout,
             shared,
+            video,
+            access_units: Mutex::new(Some(incoming_units)),
             receive_task,
             ping_task,
         })
+    }
+
+    /// Chooses the sharer whose video and share audio are accepted; `None`
+    /// drops both from everyone, counted in [`Stats::ignored`].
+    ///
+    /// Switching starts over: a new depacketizer, no share stream left in the
+    /// playout, and one keyframe request so the stream begins at a frame the
+    /// decoder can actually start from.
+    pub fn watch(&self, ssrc: Option<u32>) {
+        self.shared
+            .watched
+            .store(ssrc.map_or(NOT_WATCHING, i64::from), Ordering::Relaxed);
+        *lock(&self.video) = VideoState::new();
+        lock(&self.playout).remove_share();
+
+        let Some(target) = ssrc else {
+            return;
+        };
+        {
+            let mut video = lock(&self.video);
+            video.keyframe_requests += 1;
+            video.last_request_at = Some(Instant::now());
+        }
+        if let Err(error) = self.sender.request_keyframe(target) {
+            tracing::debug!(%error, "keyframe request not sent");
+        }
+    }
+
+    /// The watched sharer's reassembled access units. Created at connect and
+    /// handed out once; `None` afterwards.
+    pub fn take_access_units(&self) -> Option<UnboundedReceiver<AccessUnit>> {
+        lock(&self.access_units).take()
+    }
+
+    /// The watched stream's reassembly counters, which start over whenever
+    /// [`watch`](Self::watch) points somewhere else.
+    pub fn video_stats(&self) -> VideoStats {
+        let video = lock(&self.video);
+        let mut stats = video.depacketizer.stats();
+        stats.keyframe_requests = video.keyframe_requests;
+        stats
     }
 
     pub fn sender(&self) -> FrameSender {
@@ -233,6 +464,7 @@ impl MediaEngine {
     }
 
     pub fn stats(&self) -> Stats {
+        let video = self.video_stats();
         let rtt = lock(&self.shared.rtt);
         let link = match rtt.last_pong_at {
             None => Link::Connecting,
@@ -245,6 +477,8 @@ impl MediaEngine {
             packets_received: self.shared.packets_received.load(Ordering::Relaxed),
             bytes_received: self.shared.bytes_received.load(Ordering::Relaxed),
             rejected: self.shared.rejected.load(Ordering::Relaxed),
+            ignored: self.shared.ignored.load(Ordering::Relaxed),
+            send_failures: self.shared.send_failures.load(Ordering::Relaxed),
             rtt_last_ms: rtt.last_ms,
             rtt_min_ms: rtt.min_ms,
             rtt_avg_ms: (rtt.samples > 0).then(|| rtt.sum_ms / f64::from(rtt.samples)),
@@ -252,6 +486,11 @@ impl MediaEngine {
             rtt_samples: rtt.samples,
             link,
             peers: lock(&self.playout).stats(),
+            video,
+            keyframe_requests_received: self
+                .shared
+                .keyframe_requests_received
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -264,11 +503,38 @@ impl MediaEngine {
     }
 }
 
+/// The media socket: IPv4, connected to the relay, with kernel buffers wide
+/// enough for a keyframe's burst. Returns the sizes the kernel granted, which
+/// it is free to clamp.
+fn bind_socket(relay: SocketAddr) -> Result<(std::net::UdpSocket, usize, usize), EngineError> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).map_err(EngineError::Bind)?;
+    // Best effort: a kernel that refuses the size is no reason to lose the call.
+    if let Err(error) = socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES) {
+        tracing::debug!(%error, "media socket receive buffer left at its default");
+    }
+    if let Err(error) = socket.set_send_buffer_size(SOCKET_BUFFER_BYTES) {
+        tracing::debug!(%error, "media socket send buffer left at its default");
+    }
+    socket
+        .bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())
+        .map_err(EngineError::Bind)?;
+    // Connecting the socket makes the kernel drop datagrams from anyone but
+    // the relay, so the receive path never sees off-path traffic.
+    socket.connect(&relay.into()).map_err(EngineError::Bind)?;
+    socket.set_nonblocking(true).map_err(EngineError::Bind)?;
+
+    let recv_buffer = socket.recv_buffer_size().unwrap_or(0);
+    let send_buffer = socket.send_buffer_size().unwrap_or(0);
+    Ok((socket.into(), recv_buffer, send_buffer))
+}
+
 async fn receive_loop(
     socket: Arc<UdpSocket>,
     cipher: Arc<MediaCipher>,
     shared: Arc<Shared>,
     playout: Arc<Mutex<Playout>>,
+    video: Arc<Mutex<VideoState>>,
+    access_units: UnboundedSender<AccessUnit>,
     ssrc: u32,
 ) {
     let mut buffer = [0u8; RECV_BUFFER];
@@ -314,6 +580,72 @@ async fn receive_loop(
                         payload,
                     },
                 );
+            }
+            PacketType::Video => {
+                if watched(&shared) != Some(header.ssrc) {
+                    shared.ignored.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let (fragment, data) = match FragmentHeader::decode(&payload) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        tracing::debug!(%error, "rejected a video fragment");
+                        shared.rejected.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                let now = Instant::now();
+                let (unit, ask) = {
+                    let mut video = lock(&video);
+                    let unit = video.depacketizer.push(now, header.ts, fragment, data);
+                    let ask = video.depacketizer.needs_keyframe()
+                        && video.last_request_at.is_none_or(|at| {
+                            now.saturating_duration_since(at) >= KEYFRAME_REQUEST_INTERVAL
+                        });
+                    if ask {
+                        video.keyframe_requests += 1;
+                        video.last_request_at = Some(now);
+                    }
+                    (unit, ask)
+                };
+                if let Some(unit) = unit {
+                    // Nobody is decoding any more: the unit just goes.
+                    let _ = access_units.send(unit);
+                }
+                if ask
+                    && let Err(error) =
+                        send_keyframe_request(&socket, &cipher, &shared, ssrc, header.ssrc)
+                {
+                    tracing::debug!(%error, "keyframe request not sent");
+                }
+            }
+            PacketType::ShareAudio => {
+                if watched(&shared) != Some(header.ssrc) {
+                    shared.ignored.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                lock(&playout).push_share(
+                    header.ssrc,
+                    Incoming {
+                        seq: header.seq,
+                        ts: header.ts,
+                        marker: header.marker,
+                        payload,
+                    },
+                );
+            }
+            PacketType::KeyframeRequest => {
+                // Any request at all means "send a keyframe"; the target ssrc
+                // is the relay's business, not the sharer's.
+                if payload.len() < 4 {
+                    tracing::debug!("keyframe request without a target ssrc");
+                    continue;
+                }
+                shared.keyframe_request.store(true, Ordering::Relaxed);
+                shared
+                    .keyframe_requests_received
+                    .fetch_add(1, Ordering::Relaxed);
             }
             PacketType::Pong => record_pong(&shared, &header, &payload),
             PacketType::Ping => {}
@@ -390,12 +722,117 @@ async fn ping_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FRAME_SAMPLES;
-    use crate::codec::Encoder;
+    use crate::codec::{Encoder, STEREO_FRAME_SAMPLES, StereoEncoder};
     use crate::packet::{HEADER_LEN, TAG_LEN, VERSION};
     use crate::tone::Tone;
+    use crate::{FRAME_SAMPLES, video};
 
     const KEY: [u8; 32] = [3u8; 32];
+
+    /// A loopback stand-in for the relay, which has already learned the
+    /// client's address from a datagram just as the real one does.
+    struct Relay {
+        socket: UdpSocket,
+        cipher: MediaCipher,
+    }
+
+    impl Relay {
+        async fn start(ssrc: u32) -> (Relay, MediaEngine) {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("relay socket");
+            let port = socket.local_addr().expect("relay address").port();
+            let engine = MediaEngine::connect(MediaConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                key: KEY,
+                ssrc,
+            })
+            .await
+            .expect("connects");
+
+            // The relay can only answer an address it has already seen. The
+            // engine's first keepalive can lose the race against its socket
+            // becoming writable, and the next one is 5 s out, so the address is
+            // knocked loose with throwaway audio instead of waited on.
+            let mut buffer = [0u8; RECV_BUFFER];
+            let mut client = None;
+            for _ in 0..200 {
+                let _ = engine.sender().send_audio(b"hello", false);
+                if let Ok(read) =
+                    tokio::time::timeout(Duration::from_millis(5), socket.recv_from(&mut buffer))
+                        .await
+                {
+                    client = Some(read.expect("the relay reads").1);
+                    break;
+                }
+            }
+            let client = client.expect("the client never reached the relay");
+            socket.connect(client).await.expect("learns the client");
+            (
+                Relay {
+                    socket,
+                    cipher: MediaCipher::new(&KEY),
+                },
+                engine,
+            )
+        }
+
+        /// The next datagram of `kind`, or `None` once `within` has passed.
+        async fn recv(&self, kind: PacketType, within: Duration) -> Option<(Header, Vec<u8>)> {
+            let deadline = Instant::now() + within;
+            let mut buffer = [0u8; RECV_BUFFER];
+            loop {
+                let left = deadline.checked_duration_since(Instant::now())?;
+                let read = tokio::time::timeout(left, self.socket.recv(&mut buffer))
+                    .await
+                    .ok()?
+                    .expect("the relay reads");
+                let (header, payload) = self.cipher.open(&buffer[..read]).expect("opens");
+                if header.kind == kind {
+                    return Some((header, payload));
+                }
+            }
+        }
+
+        async fn send(&self, header: &Header, payload: &[u8]) {
+            self.socket
+                .send(&self.cipher.seal(header, payload))
+                .await
+                .expect("the relay sends");
+        }
+
+        /// One video fragment as the sharer `ssrc` would have sent it.
+        async fn send_fragment(
+            &self,
+            ssrc: u32,
+            seq: u64,
+            ts: u32,
+            fragment: FragmentHeader,
+            data: &[u8],
+        ) {
+            let mut plaintext = fragment.encode().to_vec();
+            plaintext.extend_from_slice(data);
+            self.send(
+                &Header {
+                    kind: PacketType::Video,
+                    marker: false,
+                    ssrc,
+                    seq,
+                    ts,
+                },
+                &plaintext,
+            )
+            .await;
+        }
+    }
+
+    fn fragment(frame_id: u32, index: u16, count: u16, keyframe: bool) -> FragmentHeader {
+        FragmentHeader {
+            frame_id,
+            index,
+            count,
+            keyframe,
+        }
+    }
 
     async fn wait_for(mut ready: impl FnMut() -> bool) {
         for _ in 0..2_000 {
@@ -536,5 +973,342 @@ mod tests {
         assert!(datagram.len() <= MAX_DATAGRAM);
         assert_eq!(datagram[0], VERSION);
         assert_eq!(datagram.len(), HEADER_LEN + 8 + TAG_LEN);
+    }
+
+    #[tokio::test]
+    async fn a_video_unit_goes_out_as_fragments_under_one_timestamp() {
+        let (relay, engine) = Relay::start(11).await;
+        let unit: Vec<u8> = (0..5_000u32).map(|index| index as u8).collect();
+
+        // 5 000 bytes over 1 156-byte fragments: five of them, no burst pause.
+        let count = engine.sender().send_video(9, true, &unit).expect("sends");
+        assert_eq!(count, 5);
+
+        let mut rejoined = Vec::new();
+        let mut previous_seq = None;
+        let mut previous_ts = None;
+        for index in 0..5u16 {
+            let (header, payload) = relay
+                .recv(PacketType::Video, Duration::from_secs(1))
+                .await
+                .expect("a fragment arrives");
+            assert_eq!(header.ssrc, 11);
+            assert!(!header.marker);
+            if let Some(seq) = previous_seq {
+                assert!(header.seq > seq, "{} follows {seq}", header.seq);
+            }
+            if let Some(ts) = previous_ts {
+                assert_eq!(header.ts, ts, "the unit was split across timestamps");
+            }
+            previous_seq = Some(header.seq);
+            previous_ts = Some(header.ts);
+
+            let (fragment, data) = FragmentHeader::decode(&payload).expect("a fragment header");
+            assert_eq!(fragment.frame_id, 9);
+            assert_eq!(fragment.index, index);
+            assert_eq!(fragment.count, 5);
+            assert!(fragment.keyframe);
+            assert!(payload.len() <= MAX_DATAGRAM - HEADER_LEN - TAG_LEN);
+            rejoined.extend_from_slice(data);
+        }
+        assert_eq!(rejoined, unit);
+
+        assert!(
+            matches!(
+                engine.sender().send_video(10, false, &[]),
+                Err(EngineError::Packet(PacketError::TooShort))
+            ),
+            "an empty unit is not a frame"
+        );
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn watching_a_sharer_asks_it_for_a_keyframe() {
+        let (relay, engine) = Relay::start(11).await;
+        engine.watch(Some(77));
+
+        let (header, payload) = relay
+            .recv(PacketType::KeyframeRequest, Duration::from_millis(100))
+            .await
+            .expect("a keyframe request arrives");
+        assert_eq!(header.ssrc, 11);
+        assert_eq!(payload, 77u32.to_be_bytes());
+        assert_eq!(engine.video_stats().keyframe_requests, 1);
+
+        // Pointing somewhere else starts the stream's counters over.
+        engine.watch(None);
+        assert_eq!(engine.video_stats(), VideoStats::default());
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn video_from_a_sharer_nobody_watches_is_ignored() {
+        let (relay, engine) = Relay::start(11).await;
+        engine.watch(Some(77));
+        let mut units = engine.take_access_units().expect("the receiver");
+        assert!(engine.take_access_units().is_none(), "handed out twice");
+
+        relay
+            .send_fragment(
+                99,
+                1,
+                960,
+                fragment(1, 0, 1, true),
+                b"not the watched sharer",
+            )
+            .await;
+        relay
+            .send(
+                &Header {
+                    kind: PacketType::ShareAudio,
+                    marker: true,
+                    ssrc: 99,
+                    seq: 2,
+                    ts: 960,
+                },
+                b"not the watched sharer either",
+            )
+            .await;
+
+        wait_for(|| engine.stats().ignored >= 2).await;
+        assert_eq!(engine.stats().rejected, 0);
+        assert_eq!(engine.video_stats().fragments, 0);
+        assert!(units.try_recv().is_err(), "an ignored unit was delivered");
+        assert!(lock(&engine.playout()).share_stats().is_none());
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_watched_unit_is_reassembled_and_handed_over() {
+        let (relay, engine) = Relay::start(11).await;
+        engine.watch(Some(77));
+        let mut units = engine.take_access_units().expect("the receiver");
+
+        let unit: Vec<u8> = (0..2_000u32).map(|index| index as u8).collect();
+        let cut: Vec<(FragmentHeader, &[u8])> = video::fragments(4, true, &unit)
+            .expect("fragments")
+            .collect();
+        assert_eq!(cut.len(), 2);
+        // Out of order, to prove the reassembly does not rely on arrival order.
+        for (index, (header, data)) in cut.iter().enumerate().rev() {
+            relay
+                .send_fragment(77, 10 + index as u64, 48_000, *header, data)
+                .await;
+        }
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), units.recv())
+            .await
+            .expect("a unit arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.frame_id, 4);
+        assert!(delivered.keyframe);
+        assert_eq!(delivered.ts, 48_000);
+        assert_eq!(delivered.data, unit);
+
+        let stats = engine.video_stats();
+        assert_eq!(stats.frames, 1);
+        assert_eq!(stats.keyframes, 1);
+        assert_eq!(stats.fragments, 2);
+        assert_eq!(stats.dropped, 0);
+        // The request `watch` sent, and no other: nothing was missing.
+        assert_eq!(stats.keyframe_requests, 1);
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_lost_fragment_costs_exactly_one_keyframe_request() {
+        let (relay, engine) = Relay::start(11).await;
+        engine.watch(Some(77));
+        let mut units = engine.take_access_units().expect("the receiver");
+        relay
+            .recv(PacketType::KeyframeRequest, Duration::from_secs(1))
+            .await
+            .expect("the request `watch` sends");
+        // Requests are paced from that one, so the stream starts once its
+        // interval has passed; otherwise the hole below would be held back.
+        tokio::time::sleep(KEYFRAME_REQUEST_INTERVAL).await;
+
+        // Frame 1 whole, frame 2 missing its middle, frame 3 whole: completing
+        // frame 3 is what gives up on frame 2.
+        relay
+            .send_fragment(77, 20, 960, fragment(1, 0, 1, true), b"one")
+            .await;
+        relay
+            .send_fragment(77, 21, 1_920, fragment(2, 0, 3, false), b"two-a")
+            .await;
+        relay
+            .send_fragment(77, 22, 1_920, fragment(2, 2, 3, false), b"two-c")
+            .await;
+        relay
+            .send_fragment(77, 23, 2_880, fragment(3, 0, 1, false), b"three")
+            .await;
+
+        let first = tokio::time::timeout(Duration::from_secs(2), units.recv())
+            .await
+            .expect("the keyframe arrives")
+            .expect("the channel is open");
+        assert_eq!(first.data, b"one");
+
+        relay
+            .recv(PacketType::KeyframeRequest, Duration::from_millis(600))
+            .await
+            .expect("the hole is reported");
+        assert!(
+            relay
+                .recv(PacketType::KeyframeRequest, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "the hole was reported twice"
+        );
+
+        // The keyframe that answers it is delivered, and asks for nothing more.
+        relay
+            .send_fragment(77, 24, 3_840, fragment(4, 0, 1, true), b"four")
+            .await;
+        let recovered = tokio::time::timeout(Duration::from_secs(2), units.recv())
+            .await
+            .expect("the next keyframe arrives")
+            .expect("the channel is open");
+        assert_eq!(recovered.frame_id, 4);
+        assert_eq!(recovered.data, b"four");
+        assert!(
+            relay
+                .recv(PacketType::KeyframeRequest, Duration::from_millis(200))
+                .await
+                .is_none(),
+            "a delivered keyframe still asked for one"
+        );
+
+        let stats = engine.video_stats();
+        assert_eq!(stats.frames, 2);
+        assert_eq!(stats.keyframe_requests, 2);
+        // Frame 2 abandoned and frame 3 gated behind the missing keyframe.
+        assert_eq!(stats.dropped, 2);
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_full_size_fragment_is_carried_and_a_larger_datagram_is_not() {
+        let (relay, engine) = Relay::start(11).await;
+        engine.watch(Some(77));
+        let mut units = engine.take_access_units().expect("the receiver");
+
+        // The largest fragment there is: exactly MAX_DATAGRAM on the wire.
+        let unit = vec![7u8; MAX_VIDEO_DATA];
+        let cut: Vec<(FragmentHeader, &[u8])> = video::fragments(1, true, &unit)
+            .expect("fragments")
+            .collect();
+        assert_eq!(cut.len(), 1);
+        assert_eq!(
+            HEADER_LEN + VIDEO_HEADER_LEN + cut[0].1.len() + TAG_LEN,
+            MAX_DATAGRAM
+        );
+        relay.send_fragment(77, 40, 960, cut[0].0, cut[0].1).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), units.recv())
+            .await
+            .expect("a unit arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, unit);
+
+        // One byte more and the receive path drops it before the cipher.
+        let oversized = vec![7u8; MAX_VIDEO_DATA + 1];
+        relay
+            .send_fragment(77, 41, 1_920, fragment(2, 0, 1, true), &oversized)
+            .await;
+        wait_for(|| engine.stats().rejected >= 1).await;
+        assert_eq!(engine.video_stats().frames, 1);
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn keyframe_requests_reach_the_sharer_and_coalesce() {
+        let (relay, engine) = Relay::start(11).await;
+        let sender = engine.sender();
+        assert!(!sender.take_keyframe_request());
+
+        for seq in 0..2u64 {
+            relay
+                .send(
+                    &Header {
+                        kind: PacketType::KeyframeRequest,
+                        marker: false,
+                        ssrc: 77,
+                        seq,
+                        ts: 0,
+                    },
+                    &11u32.to_be_bytes(),
+                )
+                .await;
+        }
+        wait_for(|| engine.stats().keyframe_requests_received >= 2).await;
+
+        assert!(sender.take_keyframe_request(), "the request was lost");
+        assert!(!sender.take_keyframe_request(), "one request, one keyframe");
+        assert_eq!(engine.stats().rejected, 0);
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn share_audio_from_the_watched_sharer_reaches_the_playout() {
+        let (relay, engine) = Relay::start(11).await;
+        engine.watch(Some(77));
+
+        let mut encoder = StereoEncoder::new().expect("encoder");
+        let mut tone = Tone::new(440.0, 0.5);
+        let mut left = [0.0f32; FRAME_SAMPLES];
+        let mut pcm = [0.0f32; STEREO_FRAME_SAMPLES];
+        let mut frame = [0u8; 1156];
+        tone.fill(&mut left);
+        for (pair, sample) in pcm.as_chunks_mut::<2>().0.iter_mut().zip(left.iter()) {
+            pair[0] = *sample;
+            pair[1] = *sample;
+        }
+        let written = encoder.encode(&pcm, &mut frame).expect("encodes");
+
+        relay
+            .send(
+                &Header {
+                    kind: PacketType::ShareAudio,
+                    marker: true,
+                    ssrc: 77,
+                    seq: 30,
+                    ts: 960,
+                },
+                &frame[..written],
+            )
+            .await;
+
+        let playout = engine.playout();
+        wait_for(|| lock(&playout).share_stats().is_some()).await;
+        let (ssrc, stats) = lock(&playout).share_stats().expect("the share reports");
+        assert_eq!(ssrc, 77);
+        assert_eq!(stats.received, 1);
+        // A share stream is not a speaker.
+        assert!(engine.stats().peers.is_empty());
+
+        // Watching someone else drops it.
+        engine.watch(None);
+        assert!(lock(&playout).share_stats().is_none());
+        engine.close().await;
+    }
+
+    #[test]
+    fn the_media_socket_asks_for_wide_kernel_buffers() {
+        let relay: SocketAddr = "127.0.0.1:9".parse().expect("an address");
+        let plain = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("a socket");
+        let default_recv = plain.recv_buffer_size().expect("a receive buffer");
+        let default_send = plain.send_buffer_size().expect("a send buffer");
+
+        let (_socket, recv_buffer, send_buffer) = bind_socket(relay).expect("binds");
+        assert!(
+            recv_buffer >= default_recv,
+            "{recv_buffer} < {default_recv}"
+        );
+        assert!(
+            send_buffer >= default_send,
+            "{send_buffer} < {default_send}"
+        );
     }
 }

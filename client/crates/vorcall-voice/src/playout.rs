@@ -1,19 +1,27 @@
 //! Every remote speaker, decoded and summed into one frame.
 //!
 //! The engine's receive task feeds packets in by ssrc; the audio thread calls
-//! [`Playout::next_frame`] every 20 ms. Each speaker owns its jitter buffer and
-//! its decoder, so one speaker's loss or reset never disturbs another's.
+//! [`Playout::next_frame`] (or [`Playout::next_stereo_frame`]) every 20 ms.
+//! Each speaker owns its jitter buffer and its decoder, so one speaker's loss
+//! or reset never disturbs another's.
+//!
+//! A watched screen share's audio is a stream of its own: stereo, one at a
+//! time, with its own buffer, decoder and volume, mixed in next to the voices.
+//! Unlike a speaker it is never reaped for going quiet — a shared window that
+//! plays nothing sends nothing, and the stream is the watcher's choice rather
+//! than something inferred from traffic.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant};
 
 use crate::FRAME_SAMPLES;
-use crate::codec::Decoder;
+use crate::codec::{Decoder, STEREO_FRAME_SAMPLES, StereoDecoder};
 use crate::jitter::{Frame, Incoming, JitterBuffer};
 
 /// A speaker heard from this long ago is gone; its decoder is dropped so stale
-/// ssrcs do not accumulate over a long call.
+/// ssrcs do not accumulate over a long call. The share stream is exempt: see
+/// [`Playout::push_share`].
 const SPEAKER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 200 %: enough to rescue a quiet talker without turning the mix to mush.
 const MAX_GAIN: f32 = 2.0;
@@ -32,6 +40,14 @@ pub struct PeerStats {
 struct Speaker {
     jitter: JitterBuffer,
     decoder: Decoder,
+    decoded_frames: u64,
+}
+
+/// The one screen share being watched, if any.
+struct Share {
+    ssrc: u32,
+    jitter: JitterBuffer,
+    decoder: StereoDecoder,
     decoded_frames: u64,
 }
 
@@ -56,6 +72,9 @@ pub struct Playout {
     /// Kept apart from `speakers` so a setting made before the first packet, or
     /// while an idle speaker is reaped and heard from again, survives.
     tuning: HashMap<u32, Tuning>,
+    share: Option<Share>,
+    /// Outside `share` for the same reason `tuning` is outside `speakers`.
+    share_gain: f32,
 }
 
 impl Playout {
@@ -63,6 +82,8 @@ impl Playout {
         Self {
             speakers: HashMap::new(),
             tuning: HashMap::new(),
+            share: None,
+            share_gain: 1.0,
         }
     }
 
@@ -86,11 +107,23 @@ impl Playout {
     }
 
     /// Sums one 20 ms frame from every speaker into `out` and returns how many
-    /// of them contributed audio.
+    /// of them contributed audio. A watched share's audio is folded in as its
+    /// own downmix, so the mono path hears it too; it is not a speaker and is
+    /// not counted as one.
     pub fn next_frame(&mut self, out: &mut [f32; FRAME_SAMPLES]) -> usize {
-        let now = Instant::now();
+        self.mix(Instant::now(), out, false)
+    }
+
+    /// The same mix, interleaved stereo: every voice reaches both channels
+    /// equally and the share stream keeps its own left and right.
+    pub fn next_stereo_frame(&mut self, out: &mut [f32; STEREO_FRAME_SAMPLES]) -> usize {
+        self.mix(Instant::now(), out, true)
+    }
+
+    fn mix(&mut self, now: Instant, out: &mut [f32], stereo: bool) -> usize {
         out.fill(0.0);
         let mut mixed = 0;
+        let mut audible = false;
         let mut decoded = [0.0f32; FRAME_SAMPLES];
 
         for (ssrc, speaker) in self.speakers.iter_mut() {
@@ -113,12 +146,22 @@ impl Playout {
                 continue;
             }
             mixed += 1;
-            for (sum, sample) in out.iter_mut().zip(decoded.iter()) {
-                *sum += *sample * factor;
+            audible = true;
+            if stereo {
+                for (pair, sample) in out.as_chunks_mut::<2>().0.iter_mut().zip(decoded.iter()) {
+                    pair[0] += *sample * factor;
+                    pair[1] += *sample * factor;
+                }
+            } else {
+                for (sum, sample) in out.iter_mut().zip(decoded.iter()) {
+                    *sum += *sample * factor;
+                }
             }
         }
 
-        if mixed > 0 {
+        audible |= self.mix_share(out, stereo, now);
+
+        if audible {
             for sample in out.iter_mut() {
                 *sample = sample.clamp(-1.0, 1.0);
             }
@@ -130,8 +173,96 @@ impl Playout {
                 .last_packet_at()
                 .is_some_and(|last| now.saturating_duration_since(last) < SPEAKER_TIMEOUT)
         });
-
         mixed
+    }
+
+    /// Adds the share stream to `out`; `true` when anything was heard.
+    fn mix_share(&mut self, out: &mut [f32], stereo: bool, now: Instant) -> bool {
+        let Some(share) = self.share.as_mut() else {
+            return false;
+        };
+        let packet = match share.jitter.pull(now) {
+            Frame::Packet(payload) => Some(payload),
+            Frame::Lost => None,
+            Frame::Idle => return false,
+        };
+        let mut decoded = [0.0f32; STEREO_FRAME_SAMPLES];
+        if let Err(error) = share.decoder.decode(packet.as_deref(), &mut decoded) {
+            tracing::debug!(%error, "dropping an undecodable share frame");
+            return false;
+        }
+        share.decoded_frames += 1;
+
+        let gain = self.share_gain;
+        if gain == 0.0 {
+            return false;
+        }
+        if stereo {
+            for (pair, source) in out
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(decoded.as_chunks::<2>().0.iter())
+            {
+                pair[0] += source[0] * gain;
+                pair[1] += source[1] * gain;
+            }
+        } else {
+            for (sum, source) in out.iter_mut().zip(decoded.as_chunks::<2>().0.iter()) {
+                *sum += (source[0] + source[1]) * 0.5 * gain;
+            }
+        }
+        true
+    }
+
+    /// Feeds the watched share's audio. A packet from a different ssrc starts a
+    /// new stream: one share is heard at a time.
+    ///
+    /// The stream lives until [`remove_share`](Self::remove_share) or another
+    /// sharer takes it over; silence never retires it. A share whose endpoint
+    /// is idle — a loopback capture with nothing playing — sends nothing for
+    /// minutes, and dropping it would cost the buffer and the decoder every
+    /// time the sound came back.
+    pub fn push_share(&mut self, ssrc: u32, packet: Incoming) {
+        let now = Instant::now();
+        if self.share.as_ref().is_none_or(|share| share.ssrc != ssrc) {
+            match StereoDecoder::new() {
+                Ok(decoder) => {
+                    self.share = Some(Share {
+                        ssrc,
+                        jitter: JitterBuffer::new(),
+                        decoder,
+                        decoded_frames: 0,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(ssrc, %error, "no decoder for the share, dropping packet");
+                    return;
+                }
+            }
+        }
+        if let Some(share) = self.share.as_mut() {
+            share.jitter.push(now, packet);
+        }
+    }
+
+    /// The share's volume, clamped to 0.0..=2.0 like a speaker's. Default 1.0,
+    /// and it outlives the stream it applies to.
+    pub fn set_share_gain(&mut self, gain: f32) {
+        self.share_gain = gain.clamp(0.0, MAX_GAIN);
+    }
+
+    pub fn remove_share(&mut self) {
+        self.share = None;
+    }
+
+    pub fn share_stats(&self) -> Option<(u32, PeerStats)> {
+        self.share.as_ref().map(|share| {
+            (
+                share.ssrc,
+                peer_stats(&share.jitter, share.decoded_frames, share.decoder.resets()),
+            )
+        })
     }
 
     /// The ssrcs whose last packet arrived within `within` — the local speaking
@@ -180,28 +311,38 @@ impl Playout {
         self.tuning.remove(&ssrc);
     }
 
+    /// The speakers only; the share stream is reported by
+    /// [`share_stats`](Self::share_stats).
     pub fn stats(&self) -> Vec<(u32, PeerStats)> {
         let mut stats: Vec<(u32, PeerStats)> = self
             .speakers
             .iter()
             .map(|(ssrc, speaker)| {
-                let jitter = speaker.jitter.stats();
                 (
                     *ssrc,
-                    PeerStats {
-                        received: jitter.received,
-                        lost: jitter.lost,
-                        concealed: jitter.concealed,
-                        late: jitter.late,
-                        duplicates: jitter.duplicates,
-                        decoded_frames: speaker.decoded_frames,
-                        decoder_resets: speaker.decoder.resets(),
-                    },
+                    peer_stats(
+                        &speaker.jitter,
+                        speaker.decoded_frames,
+                        speaker.decoder.resets(),
+                    ),
                 )
             })
             .collect();
         stats.sort_unstable_by_key(|(ssrc, _)| *ssrc);
         stats
+    }
+}
+
+fn peer_stats(jitter: &JitterBuffer, decoded_frames: u64, decoder_resets: u32) -> PeerStats {
+    let stats = jitter.stats();
+    PeerStats {
+        received: stats.received,
+        lost: stats.lost,
+        concealed: stats.concealed,
+        late: stats.late,
+        duplicates: stats.duplicates,
+        decoded_frames,
+        decoder_resets,
     }
 }
 
@@ -214,7 +355,7 @@ impl Default for Playout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::Encoder;
+    use crate::codec::{Encoder, StereoEncoder};
     use crate::tone::{Tone, rms};
 
     fn opus_frames(amplitude: f32, count: usize) -> Vec<Vec<u8>> {
@@ -415,5 +556,196 @@ mod tests {
         playout.remove(1);
         assert!(playout.stats().is_empty());
         assert_eq!(playout.tuning(1), (1.0, false));
+    }
+
+    fn stereo_opus_frames(count: usize) -> Vec<Vec<u8>> {
+        let mut encoder = StereoEncoder::new().expect("encoder");
+        let mut tone = Tone::new(440.0, 0.5);
+        let mut left = [0.0f32; FRAME_SAMPLES];
+        let mut pcm = [0.0f32; STEREO_FRAME_SAMPLES];
+        let mut packet = [0u8; 1156];
+        (0..count)
+            .map(|_| {
+                // Left only, so the mix has to keep the channels apart.
+                tone.fill(&mut left);
+                for (pair, sample) in pcm.as_chunks_mut::<2>().0.iter_mut().zip(left.iter()) {
+                    pair[0] = *sample;
+                    pair[1] = 0.0;
+                }
+                let written = encoder.encode(&pcm, &mut packet).expect("encodes");
+                packet[..written].to_vec()
+            })
+            .collect()
+    }
+
+    fn feed_share(playout: &mut Playout, ssrc: u32, frames: &[Vec<u8>]) {
+        for (index, payload) in frames.iter().enumerate() {
+            playout.push_share(
+                ssrc,
+                Incoming {
+                    seq: index as u64,
+                    ts: (index as u32) * 960,
+                    marker: index == 0,
+                    payload: payload.clone(),
+                },
+            );
+        }
+    }
+
+    fn stereo_frame_after(
+        playout: &mut Playout,
+        pulls: usize,
+    ) -> ([f32; STEREO_FRAME_SAMPLES], usize) {
+        let mut out = [0.0f32; STEREO_FRAME_SAMPLES];
+        let mut mixed = 0;
+        for _ in 0..pulls {
+            mixed = playout.next_stereo_frame(&mut out);
+        }
+        (out, mixed)
+    }
+
+    fn channel(frame: &[f32; STEREO_FRAME_SAMPLES], index: usize) -> Vec<f32> {
+        frame.iter().skip(index).step_by(2).copied().collect()
+    }
+
+    #[test]
+    fn a_voice_reaches_both_channels_equally() {
+        let mut playout = Playout::new();
+        feed(&mut playout, 1, &opus_frames(0.5, 6));
+
+        let (frame, mixed) = stereo_frame_after(&mut playout, 3);
+        assert_eq!(mixed, 1);
+        let (left, right) = (channel(&frame, 0), channel(&frame, 1));
+        assert!(rms(&left) > 0.01, "the voice is silent: {}", rms(&left));
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn the_share_keeps_its_own_left_and_right() {
+        let mut playout = Playout::new();
+        feed_share(&mut playout, 42, &stereo_opus_frames(6));
+
+        let (frame, mixed) = stereo_frame_after(&mut playout, 3);
+        // The share is heard but is not a speaker.
+        assert_eq!(mixed, 0);
+        let (left, right) = (channel(&frame, 0), channel(&frame, 1));
+        assert!(rms(&left) > 0.01, "the share is silent: {}", rms(&left));
+        // Measured: left 0.355, right 7.4e-13 — the codec's mid/side coding
+        // leaves an all-zero channel all but exactly zero.
+        assert!(
+            rms(&right) < rms(&left) * 0.01,
+            "left {}, right {}",
+            rms(&left),
+            rms(&right)
+        );
+    }
+
+    #[test]
+    fn the_mono_mix_carries_the_share_downmix() {
+        let frames = stereo_opus_frames(6);
+        let mut stereo = Playout::new();
+        feed_share(&mut stereo, 42, &frames);
+        let (stereo_frame, _) = stereo_frame_after(&mut stereo, 3);
+
+        let mut mono = Playout::new();
+        feed_share(&mut mono, 42, &frames);
+        let (mono_frame, mixed) = frame_after(&mut mono, 3);
+        assert_eq!(mixed, 0);
+
+        // Left only in, so the downmix is half of it.
+        let left = rms(&channel(&stereo_frame, 0));
+        let down = rms(&mono_frame);
+        assert!(down > 0.005, "the mono mix lost the share: {down}");
+        assert!(
+            (down - left * 0.5).abs() < left * 0.05,
+            "downmix {down}, expected about {}",
+            left * 0.5
+        );
+    }
+
+    #[test]
+    fn the_share_is_not_a_speaker() {
+        let mut playout = Playout::new();
+        feed_share(&mut playout, 42, &stereo_opus_frames(3));
+        feed(&mut playout, 7, &opus_frames(0.5, 3));
+
+        assert_eq!(playout.speaking(Duration::from_millis(200)), vec![7]);
+        assert_eq!(playout.stats().len(), 1);
+        assert_eq!(playout.stats()[0].0, 7);
+
+        let (ssrc, stats) = playout.share_stats().expect("the share reports");
+        assert_eq!(ssrc, 42);
+        assert_eq!(stats.received, 3);
+        assert_eq!(stats.decoded_frames, 0);
+        assert_eq!(stats.decoder_resets, 0);
+
+        playout.remove_share();
+        assert!(playout.share_stats().is_none());
+        assert_eq!(playout.speaking(Duration::from_millis(200)), vec![7]);
+    }
+
+    #[test]
+    fn a_second_sharer_replaces_the_stream() {
+        let frames = stereo_opus_frames(4);
+        let mut playout = Playout::new();
+        feed_share(&mut playout, 42, &frames);
+        feed_share(&mut playout, 43, &frames[..2]);
+
+        let (ssrc, stats) = playout.share_stats().expect("the share reports");
+        assert_eq!(ssrc, 43);
+        assert_eq!(stats.received, 2);
+    }
+
+    #[test]
+    fn the_share_gain_clamps_silences_and_outlives_the_stream() {
+        let frames = stereo_opus_frames(6);
+        let mut playout = Playout::new();
+        playout.set_share_gain(5.0);
+        playout.set_share_gain(0.0);
+        feed_share(&mut playout, 42, &frames);
+
+        let (silent, mixed) = stereo_frame_after(&mut playout, 3);
+        assert_eq!(mixed, 0);
+        assert_eq!(rms(&silent), 0.0);
+        // Muted but still drained, like a muted speaker.
+        assert_eq!(playout.share_stats().expect("reports").1.decoded_frames, 3);
+
+        // A new stream under the same setting is just as silent.
+        playout.remove_share();
+        feed_share(&mut playout, 43, &frames);
+        let (still_silent, _) = stereo_frame_after(&mut playout, 3);
+        assert_eq!(rms(&still_silent), 0.0);
+
+        playout.set_share_gain(3.0);
+        let (loud, _) = stereo_frame_after(&mut playout, 1);
+        assert!(rms(&loud) > 0.0, "the share stayed silent after unmuting");
+        assert!(
+            loud.iter().all(|sample| (-1.0..=1.0).contains(sample)),
+            "the boosted share left the valid range"
+        );
+    }
+
+    #[test]
+    fn a_silent_share_stream_is_kept_until_removed() {
+        let mut playout = Playout::new();
+        feed_share(&mut playout, 42, &stereo_opus_frames(6));
+        feed(&mut playout, 7, &opus_frames(0.5, 6));
+        let (_, mixed) = stereo_frame_after(&mut playout, 3);
+        assert_eq!(mixed, 1);
+        assert!(playout.share_stats().is_some());
+
+        // Long past the speaker timeout, with nothing arriving in between.
+        let mut out = [0.0f32; STEREO_FRAME_SAMPLES];
+        let later = Instant::now() + SPEAKER_TIMEOUT + Duration::from_secs(1);
+        playout.mix(later, &mut out, true);
+
+        let (ssrc, stats) = playout.share_stats().expect("the share is still there");
+        assert_eq!(ssrc, 42);
+        assert_eq!(stats.received, 6);
+        // The voice beside it was reaped on the same pass.
+        assert!(playout.stats().is_empty());
+
+        playout.remove_share();
+        assert!(playout.share_stats().is_none());
     }
 }

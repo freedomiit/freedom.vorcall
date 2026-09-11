@@ -146,7 +146,7 @@ One voice channel per text room. Voice membership is separate from text membersh
 
 Audience: `VoiceState`, `VoiceMemberJoined`, `VoiceMemberLeft` and `Speaking` go to every member of the text room, whether or not they are in voice. `VoiceReady` goes only to the joiner — it carries that session's key and ssrc.
 
-`VoiceMember` is `{user_id, username, ssrc}`; `user_id` is the same stable id as in `Member`.
+`VoiceMember` is `{user_id, username, ssrc, sharing, share_audio}`; `user_id` is the same stable id as in `Member`. The two share flags are described under Screen share.
 
 `VoiceState` is also sent right after every `RoomState` — at `Hello`, after a session replacement and after `JoinRoom`, `CreateRoom` or `OpenDm` — possibly with zero members, so a client always learns the voice occupancy of a room it is in.
 
@@ -158,6 +158,27 @@ Audience: `VoiceState`, `VoiceMemberJoined`, `VoiceMemberLeft` and `Speaking` go
 
 Ordering: voice membership changes and their broadcasts are serialized with text membership under the same server lock. A connection never sees a voice frame for a room before that room's `RoomState`.
 
+### Screen share
+
+Sharing rides the voice channel: a user may only share in a room it already has a voice session in, and the share ends with that session.
+
+- `StartShare{room_id, audio}` — invalid or unknown room: non-fatal `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Sharing disabled on the server: non-fatal `ERROR_CODE_SHARE_UNAVAILABLE`. The room already at its sharer limit: non-fatal `ERROR_CODE_SHARE_LIMIT`. Otherwise the session is marked as sharing, `ShareStarted{room_id, user_id, audio}` is broadcast to every member of the **text room, the sharer included**, and the sharer receives `ShareWatchers{room_id, count}`. The frame is idempotent: repeating it — including with a different `audio` — re-sends both frames and does not count against the limit again.
+- `StopShare{room_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. In voice but not sharing: non-fatal `ERROR_CODE_NOT_SHARING`. Otherwise `ShareStopped{room_id, user_id}` is broadcast to the same audience and every watcher of that share receives `WatchState{room_id, user_id = 0}`.
+- `WatchShare{room_id, user_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. The viewer not in that room's voice channel: `ERROR_CODE_NOT_IN_VOICE`. The named user not sharing in that room, or the viewer itself: `ERROR_CODE_NOT_SHARING`. Otherwise the watch replaces whatever the viewer was watching before — a viewer watches at most one share per voice session (the app holds one voice session, so one share at a time) — the viewer receives `WatchState{room_id, user_id}`, and both the new sharer and the one the viewer left receive a fresh `ShareWatchers`.
+- `UnwatchShare{room_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Otherwise idempotent: the caller receives `WatchState{room_id, user_id = 0}` and the sharer it was watching, if any, a fresh `ShareWatchers`.
+
+Audience: `ShareStarted` and `ShareStopped` go to every member of the text room, in voice or not. `WatchState` goes only to the viewer it describes; `ShareWatchers` only to the sharer, on every change to its watcher count.
+
+`VoiceMember.sharing` and `VoiceMember.share_audio` carry the same facts in `VoiceState` and `VoiceMemberJoined`, so a client that joins a room late learns who is already sharing without waiting for a `ShareStarted`.
+
+A share ends whenever the voice session behind it ends — `LeaveVoice`, `LeaveRoom`, the connection ending, or a session replacement. `ShareStopped` is then sent **before** `VoiceMemberLeft`, and the share's watchers receive `WatchState{user_id = 0}`. A viewer's watch ends the same way when the viewer's own voice session ends, silently: no frame is sent for it.
+
+Share audio reaches that share's watchers only — it is never mixed into the room's voice audio, so a member who is in voice but not watching hears nothing of it.
+
+The server keeps at most `Vorcall:MaxSharersPerRoom` (default 3) sharers per room, and `Vorcall:ShareEnabled` (default true) is the kill switch that makes every `StartShare` answer `ERROR_CODE_SHARE_UNAVAILABLE`.
+
+Sharing and watching are client intent and survive a reconnect the way "in voice" does: after `Welcome` and the new `JoinVoice`/`VoiceReady`, a client that was sharing sends `StartShare` again, and a client that was watching sends `WatchShare` again — the latter only if the watched user is still listed as sharing in the new `VoiceState`.
+
 ### Media transport
 
 Media takes a separate UDP path, IPv4, default port 5005 (`Vorcall:VoicePort`), advertised in `VoiceReady`. An empty `VoiceReady.host` means the host part of the WebSocket URL.
@@ -166,25 +187,45 @@ Every datagram is big-endian, with the header in clear and used as AEAD associat
 
 ```
 offset 0   ver    u8   = 1
-offset 1   type   u8   1 = audio, 2 = ping, 3 = pong
-offset 2   flags  u8   bit 0 = first packet of a talk spurt; other bits 0
+offset 1   type   u8   1 = audio, 2 = ping, 3 = pong, 4 = video, 5 = share audio, 6 = keyframe request
+offset 2   flags  u8   bit 0 = marker (talk-spurt start for audio, first packet of a share-audio run); other bits 0
 offset 3   ssrc   u32
 offset 7   seq    u64
 offset 15  ts     u32  sender's 48 kHz sample clock
 offset 19  ciphertext, then tag (16 bytes)
 ```
 
+`ts` is the sender's 48 kHz clock for every type; on a video packet it is the capture instant of the frame it belongs to.
+
 Cipher: IETF ChaCha20-Poly1305 (RFC 8439). The key is the 32-byte session key from `VoiceReady`; the nonce is the 12 header bytes `ssrc || seq`. The header is authenticated, not encrypted.
 
-- **Client to relay** — sealed with the client's own session key. `seq` starts at 0 and increases by one per packet of any type. Bit 63 of `seq` is never set by a client.
+- **Client to relay** — sealed with the client's own session key. `seq` starts at 0 and increases by one per packet of any type, share media included: one counter per session, never one per stream. Bit 63 of `seq` is never set by a client.
 - **Relay to client, audio** — the relay opens the packet with the sender's key, re-seals the plaintext with the recipient's key under the unchanged header, so the recipient sees the original sender's `ssrc`, `seq` and `ts`, and forwards it to every other voice member of the room. No mixing, no transcoding.
 - **Relay to client, pong** — the same header as the ping except `type = 3` and `seq = ping.seq | (1 << 63)`, sealed with that session's key. The bit keeps the pong nonce distinct from the ping nonce.
+- **Relay to client, share media** — types 4 and 5 are accepted only from a session that is sharing (type 5 only when that share was started with `audio`), and are re-sealed per recipient under the unchanged header and forwarded **only to that sharer's watchers**, never to the rest of the room. They leave from a per-session sender worker rather than the receive path, which stays free for audio.
+- **Relay to client, keyframe request** — type 6 is accepted only from a viewer that is watching the session named by `target_ssrc`, and is forwarded to that target re-sealed with the target's key, the payload unchanged.
 
 Ping/pong payload: 8 bytes, an opaque client clock value echoed unchanged. Clients send a ping every 5 s from the moment they hold a `VoiceReady`, regardless of push-to-talk, to keep NAT and conntrack mappings alive and to measure the media path RTT. A client that receives no pong for 15 s reports the media link as down.
 
 Audio payload: exactly one Opus packet of 20 ms at 48 kHz mono, CELT-only mode, 48 kbps CBR.
 
-The relay processes each inbound datagram in this order: size (≤ 512 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2}`) → session lookup by ssrc → per-session rate limit (100 packets/s sustained, burst 200) → AEAD open → replay window (128 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason and logs per-room counters every 30 s while the room has voice members.
+Video payload (type 4), one fragment of an encoded frame:
+
+```
+offset 0   frame_id  u32
+offset 4   index     u16  fragment index within the frame
+offset 6   count     u16  number of fragments the frame was split into
+offset 8   flags     u8   bit 0 = keyframe (an IDR access unit carrying SPS/PPS); other bits 0
+offset 9   data      up to 1156 bytes of the encoded frame
+```
+
+Share audio payload (type 5): exactly one Opus packet of 20 ms at 48 kHz **stereo**, CELT-only mode, 96 kbps CBR.
+
+Keyframe request payload (type 6): 4 bytes, `target_ssrc u32` — the sharer the request is for. A viewer sends at most 2 per second; a sharer coalesces the requests it receives into at most one extra keyframe.
+
+The relay processes each inbound datagram in this order: size (≤ 1200 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2, 4, 5, 6}`) → session lookup by ssrc → per-session rate limit — share media (types 4 and 5) is charged to a byte budget (`Vorcall:ShareMaxKbps`, default 30000 kbit/s, burst the larger of 1.5 MiB and half a second of that rate) instead of the packet bucket, and types 1, 2 and 6 to the packet bucket (100 packets/s sustained, burst 200) → AEAD open → replay window (1024 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason — the share-media reasons being share-rate, not-sharing, not-watching and queue-full — and logs per-room counters every 30 s while the room has voice members.
+
+`Speaking` is derived from type 1 alone: share media never marks a session as speaking. The relay's UDP socket buffers are 8 MiB in each direction, which the host sysctl in `deploy/provision-host.sh` has to allow.
 
 The relay only ever sends to an address it learned this way: a member whose address is not known yet receives nothing. A media session ends when the voice membership ends; late packets for a removed ssrc are dropped as unknown.
 
@@ -194,12 +235,14 @@ The relay only ever sends to an address it learned this way: a member whose addr
 
 "In voice" is user intent and survives reconnects: after every `Welcome` a client that was in voice sends `JoinVoice` again and rebuilds its media path with the new key. The old socket and key are discarded on disconnect. A non-fatal `ERROR_CODE_NOT_A_MEMBER` or `ERROR_CODE_VOICE_UNAVAILABLE` in answer to `JoinVoice` clears the intent.
 
+Within `Media` a client may also be **Sharing** — `StartShare` sent once its own capture is running, ended by `StopShare` or by the voice session ending — and **Watching{user}** — `WatchShare` sent, confirmed by `WatchState` naming that user. On confirmation the client sends one keyframe request, and one more after every detected loss, at most one per 500 ms; after a loss it discards non-keyframe video until the next keyframe arrives.
+
 The receive side keeps one jitter buffer per ssrc: adaptive 60–100 ms, packet loss concealment for missing sequence numbers, late packets dropped. Push-to-talk gates sending only; pings continue while muted or deafened.
 
 ## Server session state machine (per connection)
 
 1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. `Hello` may also carry `client_version` (e.g. `"0.2.0"`) and `client_platform` (e.g. `"linux-x86_64"`), both optional: the server logs them and stores them on the account (`users.last_client_version`/`last_client_platform`/`last_seen_at`) for the admin CLI's `users list` and `users outdated`. Neither field is enforced — a client that omits them (any build before the updater) still connects normally. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by the Hello sequence described under Rooms and presence — `RoomState`+`VoiceState` per room, then `RoomList` — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
-2. **Ready** — handles `JoinRoom`, `LeaveRoom`, `CreateRoom`, `OpenDm` and `MarkRead` as described under Rooms and presence, `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages, `JoinVoice`/`LeaveVoice` as described under Voice, and `Ping`/`Pong`. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
+2. **Ready** — handles `JoinRoom`, `LeaveRoom`, `CreateRoom`, `OpenDm` and `MarkRead` as described under Rooms and presence, `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages, `JoinVoice`/`LeaveVoice` as described under Voice, `StartShare`/`StopShare`/`WatchShare`/`UnwatchShare` as described under Screen share, and `Ping`/`Pong`. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
 3. **Any state** — unparsable bytes or a text frame: fatal protocol error, close 1008. No frame received for 120 s: close 1001. A connection whose outbound queue exceeds 256 frames is closed with 1013. On server shutdown every socket is closed with 1001. If a connection's outbound queue is already full when a fatal error occurs, the `Error` frame may be dropped and only the close frame (1013 or 1008) is delivered: a slow consumer is closed as a slow consumer.
 
 The server also sends WebSocket-level keep-alive pings every 30 s; clients answer with pong frames automatically.
@@ -222,7 +265,7 @@ The server also sends WebSocket-level keep-alive pings every 30 s; clients answe
 
 ## Forward compatibility
 
-A client that receives a `ServerFrame` whose payload it does not recognise — including an empty payload — logs it and ignores it. Only undecodable bytes are a protocol error. Servers may therefore add new `ServerFrame` payloads without a version bump. New `ClientFrame` payloads still require server support; an unknown client payload is a fatal `ERROR_CODE_PROTOCOL` as today. The voice frames were added under version 1: a client without voice support ignores them. So were the five server payloads `RoomList`, `RoomUpdated`, `MessageEdited`, `MessageDeleted` and `ReactionsChanged`, and the six client payloads `CreateRoom`, `OpenDm`, `MarkRead`, `EditMessage`, `DeleteMessage` and `React`. A client built before them sees only `general`, never edits, deletes or reacts, and renders `<@id>` tokens raw.
+A client that receives a `ServerFrame` whose payload it does not recognise — including an empty payload — logs it and ignores it. Only undecodable bytes are a protocol error. Servers may therefore add new `ServerFrame` payloads without a version bump. New `ClientFrame` payloads still require server support; an unknown client payload is a fatal `ERROR_CODE_PROTOCOL` as today. The voice frames were added under version 1: a client without voice support ignores them. So were the five server payloads `RoomList`, `RoomUpdated`, `MessageEdited`, `MessageDeleted` and `ReactionsChanged`, and the six client payloads `CreateRoom`, `OpenDm`, `MarkRead`, `EditMessage`, `DeleteMessage` and `React`. A client built before them sees only `general`, never edits, deletes or reacts, and renders `<@id>` tokens raw. The screen share arrived under version 1 as well: the four server payloads `ShareStarted`, `ShareStopped`, `WatchState` and `ShareWatchers`, the four client payloads `StartShare`, `StopShare`, `WatchShare` and `UnwatchShare`, and the two `VoiceMember` fields `sharing` and `share_audio`. A client built before them ignores the frames and reads the two fields as false, so it never sees or joins a share. The release's `min_version` is `0.4.0`, so such a client is asked to update by the manifest rather than refused by the protocol.
 
 ## Limits (summary)
 
@@ -260,12 +303,17 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 | Client ping interval | 30 s |
 | Outbound queue per connection | 256 frames |
 | Voice media port | 5005/udp, configurable |
-| Media datagram | 35..512 bytes |
+| Media datagram | 35..1200 bytes |
 | Media key | 32 bytes, per voice session |
-| Replay window | 128 sequence numbers |
+| Replay window | 1024 sequence numbers |
 | Media rate limit | 100 packets/s per session, burst 200 |
 | Speaking hysteresis | 250 ms |
 | Client media ping | every 5 s |
 | Media link timeout | 15 s without pong |
 | Jitter buffer | 60–100 ms adaptive |
 | Opus frame | 20 ms, 48 kHz mono, 48 kbps CBR |
+| Video fragment payload | 1156 bytes of frame data |
+| Share audio frame | 20 ms, 48 kHz stereo, 96 kbps CBR |
+| Share media budget | 30 Mbit/s per session, configurable |
+| Sharers per room | 3, configurable |
+| Keyframe requests | 2/s per viewer |

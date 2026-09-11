@@ -83,6 +83,10 @@ message ClientFrame {
     EditMessage edit_message = 11;
     DeleteMessage delete_message = 12;
     React react = 13;
+    StartShare start_share = 14;
+    StopShare stop_share = 15;
+    WatchShare watch_share = 16;
+    UnwatchShare unwatch_share = 17;
   }
 }
 
@@ -169,6 +173,10 @@ message ServerFrame {
     MessageEdited message_edited = 15;
     MessageDeleted message_deleted = 16;
     ReactionsChanged reactions_changed = 17;
+    ShareStarted share_started = 18;
+    ShareStopped share_stopped = 19;
+    WatchState watch_state = 20;
+    ShareWatchers share_watchers = 21;
   }
 }
 
@@ -209,6 +217,8 @@ message VoiceMember {
   int64 user_id = 1;
   string username = 2;
   uint32 ssrc = 3;                // non-zero, unique across live voice sessions
+  bool sharing = 4;               // the user is sharing their screen in this room
+  bool share_audio = 5;           // that share carries audio
 }
 
 // Sent only to the joiner: where to send media and with which key.
@@ -241,6 +251,51 @@ message Speaking {
   string room_id = 1;
   int64 user_id = 2;
   bool speaking = 3;
+}
+
+// Starts a screen share; requires a voice session in that room. Idempotent: repeating it re-sends the frames.
+message StartShare {
+  string room_id = 1;
+  bool audio = 2;                 // the share carries audio as well as video
+}
+
+message StopShare {
+  string room_id = 1;
+}
+
+// Watch one sharer of that room; replaces a previous watch in any room.
+message WatchShare {
+  string room_id = 1;
+  int64 user_id = 2;              // the sharer to watch; never the caller
+}
+
+message UnwatchShare {
+  string room_id = 1;
+}
+
+// Sent to every member of the text room, the sharer included.
+message ShareStarted {
+  string room_id = 1;
+  int64 user_id = 2;
+  bool audio = 3;
+}
+
+// Same audience as ShareStarted.
+message ShareStopped {
+  string room_id = 1;
+  int64 user_id = 2;
+}
+
+// Sent to the viewer only: which share it is watching now.
+message WatchState {
+  string room_id = 1;
+  int64 user_id = 2;              // 0 = not watching
+}
+
+// Sent to the sharer only, on every change to its watcher count.
+message ShareWatchers {
+  string room_id = 1;
+  uint32 count = 2;
 }
 
 // Every room the account can see: every public room plus its own DMs.
@@ -285,6 +340,9 @@ enum ErrorCode {
   ERROR_CODE_INVALID_ATTACHMENT = 12; // non-fatal: attachment unknown, foreign, wrong room or already linked
   ERROR_CODE_INVALID_ROOM_NAME = 13; // non-fatal: the name is empty, too long or slugs to nothing usable
   ERROR_CODE_INVALID_REACTION = 14;  // non-fatal: emoji outside the accepted set
+  ERROR_CODE_NOT_SHARING = 15;       // non-fatal: StopShare while not sharing, or WatchShare of someone who is not sharing (yourself included)
+  ERROR_CODE_SHARE_LIMIT = 16;       // non-fatal: the room already has the maximum number of sharers
+  ERROR_CODE_SHARE_UNAVAILABLE = 17; // non-fatal: sharing is disabled on this server
 }
 
 message Error {

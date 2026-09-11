@@ -3,6 +3,7 @@
 mod composer;
 mod message;
 mod rooms;
+pub mod stage;
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
@@ -10,17 +11,22 @@ use iced::widget::{
     radio, row, scrollable, slider, stack, text, text_input, toggler,
 };
 use iced::{Color, ContentFit, Element, Font, Length, Theme, font};
-use vorcall_core::config::{TransmitMode, VAD_MAX_DB, VAD_MIN_DB};
+use vorcall_core::config::{
+    SHARE_FRAME_RATES, SHARE_MAX_BITRATE_KBPS, SHARE_MIN_BITRATE_KBPS, SHARE_RESOLUTIONS,
+    TransmitMode, VAD_MAX_DB, VAD_MIN_DB,
+};
 use vorcall_core::connection::GENERAL_ROOM;
 use vorcall_core::{Config, Member, VoiceMember};
+use vorcall_screen::{Source, SourceId, SourceKind};
 use vorcall_voice::{Link, Stats};
 
 use crate::app::{
-    ChatState, Dialog, HotkeyStatus, ImageState, MESSAGE_LIMIT, Message, Page, RoomUi,
-    SettingsState, Status, VoiceUi, hotkey_sentence, key_label,
+    ChatState, Dialog, HotkeyStatus, ImageState, MESSAGE_LIMIT, Message, NO_CAPTURE, Page, RoomUi,
+    SettingsState, SourcesState, Status, VoiceUi, WatchUi, can_share, can_watch, hotkey_sentence,
+    key_label, share_sentence, sharer_list, sharer_name,
 };
 use crate::brand::mark::mark;
-use crate::brand::palette::{DANGER, MUTED, SUCCESS, WARNING};
+use crate::brand::palette::{DANGER, DEEP, MUTED, SUCCESS, WARNING};
 use crate::update_ui::{self, UpdateView};
 
 pub const MESSAGES_ID: &str = "vorcall-messages";
@@ -35,6 +41,8 @@ const FIELD_WIDTH: f32 = 320.0;
 /// The threshold slider and the level meter share a width, so the gate and the
 /// level it is measured against line up.
 const METER_WIDTH: f32 = 220.0;
+/// How much of the source list is on screen before it scrolls.
+const SOURCES_HEIGHT: f32 = 240.0;
 
 pub fn login<'a>(
     username: &str,
@@ -141,6 +149,12 @@ pub fn chat<'a>(
     username: &'a str,
     update: UpdateView<'a>,
 ) -> Element<'a, Message> {
+    // Fullscreen is the stage and nothing else: no header, no panes, no dialog
+    // over it.
+    if watching_here(chat) && chat.voice.watch.fullscreen.is_some() {
+        return stage::view(stage_view(chat), stage_handlers());
+    }
+
     let mut content = column![header(chat, config.transmit_mode, username)];
     // The banner belongs to the window, not to a page: it stays put while the
     // settings are open.
@@ -148,17 +162,8 @@ pub fn chat<'a>(
         content = content.push(banner);
     }
     let content = match &chat.page {
-        // The composer belongs to the message column: neither pane beside it
-        // has anything to write in.
         Page::Chat => content.push(
-            row![
-                rooms::pane(chat),
-                column![messages(chat), composer::view(chat)]
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                sidebar(chat, config),
-            ]
-            .height(Length::Fill),
+            row![rooms::pane(chat), centre(chat), sidebar(chat, config)].height(Length::Fill),
         ),
         Page::Settings(state) => content.push(settings(state, config, &chat.voice, update)),
     };
@@ -167,6 +172,78 @@ pub fn chat<'a>(
         Some(dialog) => stack![content, overlay(dialog, chat)].into(),
         None => content.into(),
     }
+}
+
+/// Whether the stage belongs in this window: something is being watched and
+/// the pop-out is not holding it.
+fn watching_here(chat: &ChatState) -> bool {
+    chat.voice.watch.state.is_some() && chat.voice.watch.popped.is_none()
+}
+
+/// The message column, or the stage when a share is being watched here. The
+/// composer belongs to this column: neither pane beside it has anything to
+/// write in.
+fn centre(chat: &ChatState) -> Element<'_, Message> {
+    if watching_here(chat) {
+        return container(stage::view(stage_view(chat), stage_handlers()))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+    }
+    column![messages(chat), composer::view(chat)]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The pop-out window's whole content.
+pub fn popped_stage(chat: &ChatState) -> Element<'_, Message> {
+    if chat.voice.watch.state.is_none() {
+        return Space::new().into();
+    }
+    stage::popped(stage_view(chat), stage_handlers())
+}
+
+fn stage_view(chat: &ChatState) -> stage::StageView<'_> {
+    let watch = &chat.voice.watch;
+    let current = watch.state.unwrap_or_default();
+
+    stage::StageView {
+        sharer: sharer_name(chat),
+        sharers: sharer_list(&chat.voice, chat.member_id),
+        current,
+        picture: watch.picture.as_ref(),
+        seq: watch.seq,
+        has_audio: chat.voice.sharing.get(&current).copied().unwrap_or(false),
+        volume: watch.volume,
+        stats: stage_stats(watch),
+        popped: watch.popped.is_some(),
+        fullscreen: watch.fullscreen.is_some(),
+    }
+}
+
+fn stage_handlers() -> stage::StageHandlers<Message> {
+    stage::StageHandlers {
+        watch: Message::WatchShare,
+        stop: Message::StopWatching,
+        pop_out: Message::PopOutStage,
+        pop_in: Message::PopInStage,
+        fullscreen: Message::ToggleFullscreen,
+        volume: Message::SetShareVolume,
+        volume_released: Message::ShareVolumeReleased,
+    }
+}
+
+/// The picture's own size, the decoder's rate, and what the depacketizer took
+/// in: the viewer measures no bitrate of its own.
+fn stage_stats(watch: &WatchUi) -> String {
+    let (width, height) = watch
+        .picture
+        .as_ref()
+        .map_or((0, 0), |picture| (picture.width, picture.height));
+    let fps = watch.stats.map_or(0.0, |(decode_fps, _, _)| decode_fps);
+    let kbps = watch.kbps;
+    format!("{width}×{height} · {fps:.0} fps · {kbps} kbit/s")
 }
 
 fn header<'a>(chat: &ChatState, mode: TransmitMode, username: &'a str) -> Element<'a, Message> {
@@ -322,14 +399,16 @@ fn sidebar<'a>(chat: &'a ChatState, config: &Config) -> Element<'a, Message> {
     .spacing(10)
     .padding(12);
 
-    let mut speakers: Vec<&VoiceMember> = chat
-        .voice_rosters
-        .get(&chat.current_room)
+    let roster = chat.voice_rosters.get(&chat.current_room);
+    let mut speakers: Vec<&VoiceMember> = roster
         .map(|roster| roster.members.values().collect())
         .unwrap_or_default();
     speakers.sort_by_cached_key(|member| member.username.to_lowercase());
     for member in speakers {
-        panel = panel.push(voice_member_row(member, chat));
+        // `members` only holds what the last frame about them said; who shares
+        // now is the roster's own map.
+        let sharing = roster.and_then(|roster| roster.sharing.get(&member.user_id).copied());
+        panel = panel.push(voice_member_row(member, chat, sharing));
     }
     panel = panel.push(voice_controls(chat));
 
@@ -405,12 +484,52 @@ fn voice_controls(chat: &ChatState) -> Element<'_, Message> {
             .on_press(Message::ToggleDeafen),
         ]
         .spacing(6),
+        share_controls(chat),
     ]
     .spacing(6)
     .into()
 }
 
-fn voice_member_row<'a>(member: &'a VoiceMember, chat: &ChatState) -> Element<'a, Message> {
+/// What the sidebar offers about this client's own screen. A system that cannot
+/// capture at all gets no button rather than a disabled one.
+fn share_controls(chat: &ChatState) -> Element<'_, Message> {
+    let capabilities = vorcall_screen::capabilities();
+    if capabilities.backend == NO_CAPTURE {
+        return Space::new().into();
+    }
+
+    let share = &chat.voice.share;
+    if share.active {
+        let audio = if share.audio.is_some() {
+            " · audio"
+        } else {
+            ""
+        };
+        let watchers = share.watchers;
+        return row![
+            button(text("Stop sharing"))
+                .on_press(Message::StopShare)
+                .style(button::danger),
+            text(format!("{watchers} watching{audio}")).color(MUTED),
+        ]
+        .spacing(6)
+        .align_y(Vertical::Center)
+        .into();
+    }
+    if share.starting {
+        return text("Starting…").color(MUTED).into();
+    }
+
+    button(text("Share screen"))
+        .on_press_maybe(can_share(&chat.voice, &capabilities).then_some(Message::OpenSharePicker))
+        .into()
+}
+
+fn voice_member_row<'a>(
+    member: &'a VoiceMember,
+    chat: &ChatState,
+    sharing: Option<bool>,
+) -> Element<'a, Message> {
     let user_id = member.user_id;
     let audio = chat.voice.peer_audio(user_id);
     let speaking = chat.speaking(user_id);
@@ -426,6 +545,10 @@ fn voice_member_row<'a>(member: &'a VoiceMember, chat: &ChatState) -> Element<'a
     ]
     .spacing(6)
     .align_y(Vertical::Center);
+
+    if let Some(share_audio) = sharing {
+        line = line.push(share_badge(chat, user_id, share_audio));
+    }
 
     if user_id == chat.member_id {
         return line.push(text("(you)").color(MUTED)).into();
@@ -453,11 +576,55 @@ fn voice_member_row<'a>(member: &'a VoiceMember, chat: &ChatState) -> Element<'a
         ]
         .spacing(6)
         .align_y(Vertical::Center),
-        button(text(if audio.muted { "Unmute" } else { "Mute" }))
-            .on_press(Message::TogglePeerMute(user_id)),
+        row![
+            button(text(if audio.muted { "Unmute" } else { "Mute" }))
+                .on_press(Message::TogglePeerMute(user_id)),
+            watch_button(chat, user_id),
+        ]
+        .spacing(6),
     ]
     .spacing(4)
     .into()
+}
+
+/// The sharer's badge, which is also the shortest way onto their screen. The
+/// row's own press only fires when this does not: iced offers the event to the
+/// button first.
+fn share_badge<'a>(chat: &ChatState, user_id: i64, share_audio: bool) -> Element<'a, Message> {
+    button(text(if share_audio { "▣ · audio" } else { "▣" }).color(DEEP))
+        .padding([1, 5])
+        .style(button::text)
+        .on_press_maybe(offers_watch(chat, user_id).then_some(Message::WatchShare(user_id)))
+        .into()
+}
+
+/// What the expanded panel offers about that member's screen: their stream,
+/// the one already on the stage, or nothing until the server answers.
+fn watch_button<'a>(chat: &ChatState, user_id: i64) -> Element<'a, Message> {
+    let watch = &chat.voice.watch;
+    if watch.state == Some(user_id) {
+        return button(text("Stop watching"))
+            .on_press(Message::StopWatching)
+            .style(button::danger)
+            .into();
+    }
+    // Asked for and not answered yet: nothing to press.
+    if watch.intent == Some(user_id) {
+        return button(text("Watching")).into();
+    }
+
+    button(text("Watch"))
+        .on_press_maybe(offers_watch(chat, user_id).then_some(Message::WatchShare(user_id)))
+        .into()
+}
+
+/// Whether pressing offers that member's stream: not one's own screen, not the
+/// one already on the stage, and not one already asked for.
+fn offers_watch(chat: &ChatState, user_id: i64) -> bool {
+    let watch = &chat.voice.watch;
+    watch.state != Some(user_id)
+        && watch.intent != Some(user_id)
+        && can_watch(&chat.voice, chat.member_id, &chat.current_room, user_id)
 }
 
 fn settings<'a>(
@@ -560,6 +727,7 @@ fn settings<'a>(
         .spacing(12)
         .align_y(Vertical::Center),
         hotkey,
+        share_settings(config, voice),
         button(text("Back")).on_press(Message::CloseSettings),
         update_ui::section(update),
     ]
@@ -567,6 +735,68 @@ fn settings<'a>(
     .padding(16)
     .width(Length::Fill)
     .into()
+}
+
+/// What a share is worth before it starts. Nothing here reaches a share
+/// already running: the preset is read when the capture begins.
+fn share_settings<'a>(config: &Config, voice: &VoiceUi) -> Element<'a, Message> {
+    let capabilities = vorcall_screen::capabilities();
+
+    let mut section = column![
+        text("Screen share"),
+        row![
+            text("Resolution"),
+            pick_list(
+                SHARE_RESOLUTIONS.map(str::to_owned).to_vec(),
+                Some(config.share_resolution.clone()),
+                Message::SetShareResolution,
+            ),
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center),
+        row(SHARE_FRAME_RATES.map(|hz| {
+            radio(
+                format!("{hz} fps"),
+                hz,
+                Some(config.share_fps),
+                Message::SetShareFps,
+            )
+            .into()
+        }))
+        .spacing(16)
+        .align_y(Vertical::Center),
+        toggler(config.share_bitrate_kbps.is_none())
+            .label("Auto bitrate")
+            .on_toggle(Message::SetShareBitrateAuto),
+    ]
+    .spacing(12);
+
+    if let Some(kbps) = config.share_bitrate_kbps {
+        section = section.push(
+            row![
+                slider(
+                    SHARE_MIN_BITRATE_KBPS as f32..=SHARE_MAX_BITRATE_KBPS as f32,
+                    kbps as f32,
+                    |kbps| Message::SetShareBitrate(kbps as u32),
+                )
+                .step(500.0_f32)
+                .on_release(Message::ShareBitrateReleased)
+                .width(METER_WIDTH),
+                text(format!("{kbps} kbit/s")),
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+        );
+    }
+
+    section = section.push(
+        toggler(config.share_audio)
+            .label("Share audio")
+            .on_toggle(Message::SetShareAudio),
+    );
+    section
+        .push(text(share_sentence(&capabilities, voice.share.backend)).color(MUTED))
+        .into()
 }
 
 /// The microphone level the audio thread last reported, against the same scale
@@ -640,7 +870,95 @@ fn overlay<'a>(dialog: &'a Dialog, chat: &'a ChatState) -> Element<'a, Message> 
         Dialog::ChangePassword { .. } => change_password(dialog),
         Dialog::NewRoom { name, error } => new_room(name, error.as_deref()),
         Dialog::Image(id) => picture(chat, *id),
+        Dialog::SharePicker {
+            sources,
+            selected,
+            audio,
+        } => share_picker(sources, selected.as_ref(), *audio),
     }
+}
+
+/// What to share. Where the system owns the picker there is nothing to list:
+/// the choice is made in its own dialog once the capture starts.
+fn share_picker<'a>(
+    sources: &'a SourcesState,
+    selected: Option<&'a SourceId>,
+    audio: bool,
+) -> Element<'a, Message> {
+    let capabilities = vorcall_screen::capabilities();
+    let mut form = column![text("Share a screen").size(20).font(bold())].spacing(12);
+
+    if capabilities.portal_picker {
+        form = form
+            .push(text("You will pick the screen or window in the system dialog.").color(MUTED));
+    } else {
+        form = form.push(source_list(sources, selected));
+    }
+
+    form = form.push(
+        toggler(audio)
+            .label("Share audio")
+            .on_toggle(Message::SetPickerAudio),
+    );
+    // The system's own picker answers for the source, so there is nothing left
+    // to choose here first.
+    let ready = capabilities.portal_picker || selected.is_some();
+    form = form.push(
+        row![
+            button(text("Share"))
+                .on_press_maybe(ready.then_some(Message::ConfirmShare))
+                .padding(10),
+            button(text("Cancel"))
+                .on_press(Message::CloseDialog)
+                .padding(10),
+        ]
+        .spacing(8),
+    );
+
+    form_dialog(form.into())
+}
+
+/// The displays first, then the windows: sharing a whole screen is the common
+/// case, and a long window list must not push it off the top.
+fn source_list<'a>(
+    sources: &'a SourcesState,
+    selected: Option<&'a SourceId>,
+) -> Element<'a, Message> {
+    let listed = match sources {
+        SourcesState::Loading => return text("Looking for screens…").color(MUTED).into(),
+        SourcesState::Failed(error) => return text(error.as_str()).color(DANGER).into(),
+        SourcesState::Ready(listed) => listed,
+    };
+    if listed.is_empty() {
+        return text("Nothing to share").color(MUTED).into();
+    }
+
+    let ordered = listed
+        .iter()
+        .filter(|source| source.kind == SourceKind::Display)
+        .chain(
+            listed
+                .iter()
+                .filter(|source| source.kind != SourceKind::Display),
+        );
+    let rows = column(ordered.map(|source| source_row(source, selected == Some(&source.id))))
+        .spacing(4)
+        .width(Length::Fill);
+
+    scrollable(rows).height(SOURCES_HEIGHT).into()
+}
+
+fn source_row(source: &Source, picked: bool) -> Element<'_, Message> {
+    let label = format!("{} · {}×{}", source.title, source.width, source.height);
+    button(text(label))
+        .width(Length::Fill)
+        .style(if picked {
+            button::primary
+        } else {
+            button::secondary
+        })
+        .on_press(Message::PickSource(source.id.clone()))
+        .into()
 }
 
 fn new_room<'a>(name: &'a str, error: Option<&'a str>) -> Element<'a, Message> {
@@ -838,6 +1156,10 @@ fn status_line(
                 label.push_str(" · voice: no media");
                 colour = WARNING;
             }
+        }
+        if voice.share.active {
+            let kbps = voice.share.stats.as_ref().map_or(0, |stats| stats.kbps);
+            label.push_str(&format!(" · sharing {kbps} kbit/s"));
         }
         // Push-to-talk still works, but only while this window has the focus.
         if mode == TransmitMode::PushToTalk

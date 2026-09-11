@@ -16,6 +16,11 @@
 //! of two. Unlike [`crate::codec`], nothing here catches panics — a cleanup
 //! failure surfaces as an error and the caller decides whether to drop the
 //! chain and capture raw.
+//!
+//! [`ShareCleanup`] is the same idea one layer over: when a screen share
+//! captures the machine's own loudspeaker output, Vorcall's own playout is in
+//! that capture and would go back out to the room as an echo. It is a second
+//! canceller, stereo in and stereo out, with nothing but AEC3 in it.
 
 use std::collections::VecDeque;
 
@@ -23,6 +28,7 @@ use aec3::graph::GraphError;
 use aec3::nodes::audio::AudioFormat;
 use aec3::pipelines::linear;
 
+use crate::codec::STEREO_FRAME_SAMPLES;
 use crate::{FRAME_SAMPLES, SAMPLE_RATE};
 
 /// 10 ms at 48 kHz, mono: the block the chain actually processes.
@@ -31,7 +37,11 @@ pub const BLOCK_SAMPLES: usize = 480;
 /// the reference queue grow without bound, so anything older is dropped.
 pub const FAR_END_MAX_SAMPLES: usize = SAMPLE_RATE as usize / 5;
 
+/// The same 10 ms, interleaved stereo.
+const STEREO_BLOCK_SAMPLES: usize = 2 * BLOCK_SAMPLES;
+
 const _: () = assert!(FRAME_SAMPLES == 2 * BLOCK_SAMPLES);
+const _: () = assert!(STEREO_FRAME_SAMPLES == 2 * STEREO_BLOCK_SAMPLES);
 
 /// Fed to the canceller in place of the far end when echo cancellation is off,
 /// keeping the always-present AEC3 running at the capture cadence.
@@ -186,6 +196,109 @@ impl InputCleanup {
 
     /// The newest metrics the canceller emitted; `None` until it has, or when
     /// echo cancellation is off.
+    pub fn metrics(&self) -> Option<EchoMetrics> {
+        self.last_metrics
+    }
+
+    /// Blocks the pipeline produced no output for, left as captured.
+    pub fn passed_through(&self) -> u64 {
+        self.passed_through
+    }
+}
+
+/// The share capture's echo canceller: it subtracts what Vorcall itself played
+/// from a system-loopback capture, so a viewer does not hear the room's own
+/// voices coming back through the share.
+///
+/// Only AEC3 runs. The share carries music, game sound, a video — program
+/// material that the noise suppressor and the automatic gain, both tuned for
+/// one talker, would wreck.
+pub struct ShareCleanup {
+    pipeline: linear::LinearPipeline,
+    far_end: VecDeque<f32>,
+    block: [f32; BLOCK_SAMPLES],
+    out: [f32; STEREO_BLOCK_SAMPLES],
+    last_metrics: Option<EchoMetrics>,
+    passed_through: u64,
+}
+
+impl ShareCleanup {
+    pub fn new() -> Result<Self, CleanupError> {
+        // Mono reference against a stereo capture: what the loudspeaker played
+        // is one mix, and the crate's pipeline takes the two formats apart.
+        let pipeline = linear::builder(
+            AudioFormat::ten_ms(SAMPLE_RATE, 1),
+            AudioFormat::ten_ms(SAMPLE_RATE, 2),
+        )
+        .enable_high_pass_filter(false)
+        .enable_noise_suppression(false)
+        .enable_gain_controller2(false)
+        .export_metrics(true)
+        .build()
+        .map_err(|error| CleanupError::Build(error.to_string()))?;
+
+        Ok(Self {
+            pipeline,
+            far_end: VecDeque::with_capacity(FAR_END_MAX_SAMPLES),
+            block: [0.0; BLOCK_SAMPLES],
+            out: [0.0; STEREO_BLOCK_SAMPLES],
+            last_metrics: None,
+            passed_through: 0,
+        })
+    }
+
+    /// Appends the mono downmix of what the loudspeaker played. Keeps only the
+    /// newest [`FAR_END_MAX_SAMPLES`], dropping the oldest.
+    pub fn push_far_end(&mut self, samples: &[f32]) {
+        let keep = samples.len().min(FAR_END_MAX_SAMPLES);
+        let excess = (self.far_end.len() + keep).saturating_sub(FAR_END_MAX_SAMPLES);
+        self.far_end.drain(..excess);
+        self.far_end.extend(&samples[samples.len() - keep..]);
+    }
+
+    pub fn pending_far_end(&self) -> usize {
+        self.far_end.len()
+    }
+
+    /// Cleans one 20 ms interleaved stereo frame in place. On `Err` the frame's
+    /// contents are unspecified and the caller drops the chain.
+    pub fn process(&mut self, frame: &mut [f32; STEREO_FRAME_SAMPLES]) -> Result<(), CleanupError> {
+        let (halves, _) = frame.as_chunks_mut::<STEREO_BLOCK_SAMPLES>();
+        for half in halves {
+            // One reference block per capture block, so the two streams stay on
+            // one clock; a caller that has nothing to give played silence.
+            if self.far_end.len() >= BLOCK_SAMPLES {
+                let render = self.far_end.drain(..BLOCK_SAMPLES);
+                for (slot, sample) in self.block.iter_mut().zip(render) {
+                    *slot = sample;
+                }
+            } else {
+                self.block.fill(0.0);
+            }
+            let fed = self.pipeline.handle_render_frame(&self.block);
+            fed.map_err(process_error)?;
+
+            let produced = self.pipeline.process_capture_frame(half, &mut self.out);
+            if produced.map_err(process_error)? {
+                half.copy_from_slice(&self.out);
+            } else {
+                self.passed_through += 1;
+            }
+
+            if let Some(packet) = self.pipeline.try_pull_metrics().map_err(process_error)? {
+                let metrics = packet.payload();
+                self.last_metrics = Some(EchoMetrics {
+                    delay_ms: metrics.delay_ms,
+                    echo_return_loss_db: metrics.echo_return_loss,
+                    echo_return_loss_enhancement_db: metrics.echo_return_loss_enhancement,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The newest metrics the canceller emitted; `None` until it has.
     pub fn metrics(&self) -> Option<EchoMetrics> {
         self.last_metrics
     }
@@ -607,7 +720,9 @@ mod tests {
         assert_eq!(cleanup.far_end_head(), Some(expected_head));
 
         let mut fresh = InputCleanup::new(CleanupSettings::default()).expect("the chain builds");
-        let oversized: Vec<f32> = (1..=(FAR_END_MAX_SAMPLES + 2_400)).map(|n| n as f32).collect();
+        let oversized: Vec<f32> = (1..=(FAR_END_MAX_SAMPLES + 2_400))
+            .map(|n| n as f32)
+            .collect();
         fresh.push_far_end(&oversized);
         assert_eq!(fresh.pending_far_end(), FAR_END_MAX_SAMPLES);
         assert_eq!(fresh.far_end_head(), Some(2_401.0));
@@ -627,5 +742,155 @@ mod tests {
     fn no_block_was_passed_through_in_lockstep() {
         let passed_through = converged_echo_run().passed_through;
         assert_eq!(passed_through, 0, "{passed_through}");
+    }
+
+    fn stereo_frame_of(mut source: impl FnMut() -> f32) -> [f32; STEREO_FRAME_SAMPLES] {
+        let mut frame = [0.0f32; STEREO_FRAME_SAMPLES];
+        for pair in frame.as_chunks_mut::<2>().0.iter_mut() {
+            let sample = source();
+            pair[0] = sample;
+            pair[1] = sample;
+        }
+        frame
+    }
+
+    fn stereo_level(frame: &[f32; STEREO_FRAME_SAMPLES]) -> f32 {
+        dbfs(rms(frame))
+    }
+
+    struct ShareRun {
+        rows: Vec<Row>,
+        metrics: Option<EchoMetrics>,
+        passed_through: u64,
+    }
+
+    /// Plays bursts of noise and hands the share chain both the mono mix it
+    /// played and the stereo loopback capture that carries it back `delay_ms`
+    /// later at unity gain — the loopback case, where the echo is not softened
+    /// by a room at all.
+    fn share_echo_run(
+        delay_ms: usize,
+        seconds: usize,
+        mut near: impl FnMut(usize) -> Option<[f32; STEREO_FRAME_SAMPLES]>,
+    ) -> ShareRun {
+        let mut cleanup = ShareCleanup::new().expect("the chain builds");
+        let mut noise = Lcg(11);
+        let mut path: VecDeque<f32> = vec![0.0; delay_ms * SAMPLE_RATE as usize / 1000].into();
+        let frames = seconds * FPS;
+        let mut rows = Vec::with_capacity(frames);
+
+        for index in 0..frames {
+            let mut far = [0.0f32; FRAME_SAMPLES];
+            if index % 20 < 15 {
+                for sample in far.iter_mut() {
+                    *sample = noise.next() * 0.3;
+                }
+            }
+
+            let near_frame = near(index);
+            let mut captured = [0.0f32; STEREO_FRAME_SAMPLES];
+            for (pair, played) in captured.as_chunks_mut::<2>().0.iter_mut().zip(far.iter()) {
+                path.push_back(*played);
+                let echo = path.pop_front().unwrap_or(0.0);
+                pair[0] = echo + noise.next() * 0.001;
+                pair[1] = echo + noise.next() * 0.001;
+            }
+            if let Some(near_frame) = &near_frame {
+                for (slot, played) in captured.iter_mut().zip(near_frame.iter()) {
+                    *slot += played;
+                }
+            }
+
+            let input_db = stereo_level(&captured);
+            cleanup.push_far_end(&far);
+            cleanup
+                .process(&mut captured)
+                .expect("the chain accepts a frame");
+            rows.push(Row {
+                frame: index,
+                input_db,
+                output_db: stereo_level(&captured),
+                near_db: near_frame.map_or(SILENCE_DB, |frame| stereo_level(&frame)),
+            });
+        }
+
+        ShareRun {
+            rows,
+            metrics: cleanup.metrics(),
+            passed_through: cleanup.passed_through(),
+        }
+    }
+
+    #[test]
+    fn the_share_chain_cancels_the_loopback_echo() {
+        let run = share_echo_run(40, 6, |_| None);
+        // Measured: 21.0 dB removed, delay estimate 36 ms.
+        let cancelled = avg_db(&run.rows, 3 * FPS, 6 * FPS, |row| {
+            Some(row.input_db - row.output_db)
+        });
+        assert!(cancelled >= 12.0, "{cancelled}");
+        assert_eq!(run.passed_through, 0, "{}", run.passed_through);
+
+        let metrics = run.metrics.expect("the canceller reported metrics");
+        assert!((metrics.delay_ms - 40).abs() <= 30, "{}", metrics.delay_ms);
+    }
+
+    #[test]
+    fn share_audio_with_nothing_playing_back_passes_through() {
+        let mut voice = Voice::new(-18.5);
+        let mut cleanup = ShareCleanup::new().expect("the chain builds");
+        let silence = [0.0f32; FRAME_SAMPLES];
+        let mut rows = Vec::new();
+
+        for index in 0..4 * FPS {
+            let mut frame = stereo_frame_of(|| voice.next());
+            let input_db = stereo_level(&frame);
+            cleanup.push_far_end(&silence);
+            cleanup
+                .process(&mut frame)
+                .expect("the chain accepts a frame");
+            rows.push(Row {
+                frame: index,
+                input_db,
+                output_db: stereo_level(&frame),
+                near_db: input_db,
+            });
+        }
+
+        // Measured drift: 0.13 dB.
+        let drift = avg_db(&rows, FPS, 4 * FPS, |row| {
+            (row.near_db > SILENCE_DB).then_some(row.output_db - row.input_db)
+        })
+        .abs();
+        assert!(drift <= 2.5, "{drift}");
+    }
+
+    #[test]
+    fn a_share_chain_that_was_never_given_a_far_end_changes_nothing() {
+        let mut voice = Voice::new(-18.5);
+        let mut cleanup = ShareCleanup::new().expect("the chain builds");
+        let mut rows = Vec::new();
+
+        for index in 0..4 * FPS {
+            let mut frame = stereo_frame_of(|| voice.next());
+            let input_db = stereo_level(&frame);
+            cleanup
+                .process(&mut frame)
+                .expect("the chain accepts a frame");
+            rows.push(Row {
+                frame: index,
+                input_db,
+                output_db: stereo_level(&frame),
+                near_db: input_db,
+            });
+        }
+
+        assert_eq!(cleanup.pending_far_end(), 0);
+        // Measured drift: 0.13 dB.
+        let drift = avg_db(&rows, FPS, 4 * FPS, |row| {
+            (row.near_db > SILENCE_DB).then_some(row.output_db - row.input_db)
+        })
+        .abs();
+        assert!(drift <= 2.5, "{drift}");
     }
 }

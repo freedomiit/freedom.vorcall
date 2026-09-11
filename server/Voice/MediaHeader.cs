@@ -9,7 +9,10 @@ public readonly record struct MediaHeader(byte Type, byte Flags, uint Ssrc, ulon
 {
     public const int Length = 19;
     public const int TagLength = 16;
-    public const int MaxDatagram = 512;
+
+    // One datagram fits a 1500-byte path MTU with room to spare for the IPv4 and UDP headers and
+    // for a tunnel's own encapsulation.
+    public const int MaxDatagram = 1200;
     public const int MinDatagram = 35;
 
     // Set on a pong's seq so it can never share a nonce with the ping it answers.
@@ -18,6 +21,11 @@ public readonly record struct MediaHeader(byte Type, byte Flags, uint Ssrc, ulon
     public const byte TypeAudio = 1;
     public const byte TypePing = 2;
     public const byte TypePong = 3;
+    public const byte TypeVideo = 4;
+    public const byte TypeShareAudio = 5;
+    public const byte TypeKeyframeRequest = 6;
+
+    // Bit 0 means a talk spurt started on audio, and the first packet of a share-audio run.
     public const byte FlagTalkSpurt = 0x01;
 
     public const int NonceOffset = 3;
@@ -25,7 +33,7 @@ public readonly record struct MediaHeader(byte Type, byte Flags, uint Ssrc, ulon
 
     private const byte Version = 1;
 
-    // Inbound only: a client sends audio and pings, never pongs.
+    // Inbound only: a client sends audio, pings, share media and keyframe requests, never pongs.
     public static bool TryParse(ReadOnlySpan<byte> datagram, out MediaHeader header)
     {
         header = default;
@@ -36,7 +44,8 @@ public readonly record struct MediaHeader(byte Type, byte Flags, uint Ssrc, ulon
 
         var type = datagram[1];
         var flags = datagram[2];
-        if (type is not (TypeAudio or TypePing) || (flags & ~FlagTalkSpurt) != 0)
+        if (type is not (TypeAudio or TypePing or TypeVideo or TypeShareAudio or TypeKeyframeRequest)
+            || (flags & ~FlagTalkSpurt) != 0)
         {
             return false;
         }

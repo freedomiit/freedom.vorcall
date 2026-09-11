@@ -19,6 +19,35 @@ pub struct SpeakingEvent {
     pub speaking: bool,
 }
 
+/// Only under `--share-seconds`: what the local encoder produced and sent.
+pub struct ShareReport {
+    pub frames_encoded: u64,
+    pub keyframes: u64,
+    pub keyframe_requests: u64,
+    pub encode_fps: f64,
+    pub kbps: f64,
+    pub watchers_max: u32,
+    pub bytes: u64,
+    pub threads: u16,
+    pub skipped: u64,
+}
+
+/// Only under `--watch`: what came back from the sharer.
+pub struct WatchReport {
+    pub user: String,
+    pub user_id: i64,
+    pub pictures: u64,
+    pub keyframes: u64,
+    pub dropped: u64,
+    pub decode_errors: u64,
+    pub first_picture_ms: Option<f64>,
+    pub width: u32,
+    pub height: u32,
+    pub decode_fps: f64,
+    pub keyframe_requests_sent: u64,
+    pub share_tone_frames: u64,
+}
+
 #[derive(Default)]
 pub struct Rtt {
     pub min: Option<f64>,
@@ -49,11 +78,23 @@ pub struct Report {
     pub link: &'static str,
     pub peers: Vec<PeerReport>,
     pub speaking_events: Vec<SpeakingEvent>,
+    pub share: Option<ShareReport>,
+    pub watch: Option<WatchReport>,
 }
 
 impl Report {
     pub fn tone_seconds(&self) -> f64 {
         seconds(self.tone_frames)
+    }
+
+    pub fn share_tone_seconds(&self) -> f64 {
+        self.watch
+            .as_ref()
+            .map_or(0.0, |watch| seconds(watch.share_tone_frames))
+    }
+
+    pub fn pictures(&self) -> u64 {
+        self.watch.as_ref().map_or(0, |watch| watch.pictures)
     }
 
     pub fn render(&self) -> String {
@@ -91,12 +132,48 @@ impl Report {
             .collect::<Vec<_>>()
             .join(",");
 
+        let share = self.share.as_ref().map_or(String::new(), |share| {
+            format!(
+                ",\"share\":{{\"frames_encoded\":{},\"keyframes\":{},\"keyframe_requests\":{},\
+\"encode_fps\":{:.2},\"kbps\":{:.1},\"watchers_max\":{},\"bytes\":{},\"threads\":{},\"skipped\":{}}}",
+                share.frames_encoded,
+                share.keyframes,
+                share.keyframe_requests,
+                share.encode_fps,
+                share.kbps,
+                share.watchers_max,
+                share.bytes,
+                share.threads,
+                share.skipped,
+            )
+        });
+
+        let watch = self.watch.as_ref().map_or(String::new(), |watch| {
+            format!(
+                ",\"watch\":{{\"user\":{},\"user_id\":{},\"pictures\":{},\"keyframes\":{},\
+\"dropped\":{},\"decode_errors\":{},\"first_picture_ms\":{},\"width\":{},\"height\":{},\
+\"decode_fps\":{:.2},\"keyframe_requests_sent\":{},\"share_tone_seconds\":{:.2}}}",
+                quote(&watch.user),
+                watch.user_id,
+                watch.pictures,
+                watch.keyframes,
+                watch.dropped,
+                watch.decode_errors,
+                millis(watch.first_picture_ms),
+                watch.width,
+                watch.height,
+                watch.decode_fps,
+                watch.keyframe_requests_sent,
+                seconds(watch.share_tone_frames),
+            )
+        });
+
         format!(
             "{{\"user\":{},\"user_id\":{},\"room\":{},\"ssrc\":{},\
 \"packets_sent\":{},\"packets_received\":{},\"bytes_sent\":{},\"bytes_received\":{},\"rejected\":{},\"send_failures\":{},\"frames_sent\":{},\"frames_gated\":{},\
 \"decoded_seconds\":{:.2},\"tone_seconds\":{:.2},\"gaps\":{},\"late\":{},\
 \"rtt_ms\":{{\"min\":{},\"avg\":{},\"max\":{},\"last\":{},\"samples\":{}}},\
-\"link\":{},\"peers\":[{}],\"speaking_events\":[{}]}}",
+\"link\":{},\"peers\":[{}],\"speaking_events\":[{}]{}{}}}",
             quote(&self.user),
             self.user_id,
             quote(&self.room),
@@ -121,6 +198,8 @@ impl Report {
             quote(self.link),
             peers,
             speaking,
+            share,
+            watch,
         )
     }
 }

@@ -74,8 +74,11 @@ cp "$BINARY" "$APP/Contents/MacOS/vorcall"
 chmod 755 "$APP/Contents/MacOS/vorcall"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# ScreenCaptureKit with own-process audio exclusion needs macOS 13.
 # NSMicrophoneUsageDescription is not optional: macOS kills a bundled app that
 # touches the microphone without one, and push-to-talk does.
+# NSScreenCaptureUsageDescription is what macOS shows on the Screen Recording
+# prompt when a share starts.
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -104,11 +107,13 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.social-networking</string>
     <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
+    <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Vorcall uses the microphone for the voice channel while you hold push-to-talk.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Vorcall records the screen or window you choose to share with your voice channel.</string>
 </dict>
 </plist>
 EOF

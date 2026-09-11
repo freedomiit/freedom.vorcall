@@ -4,7 +4,7 @@ A private chat for a friend group: rooms and DMs, native Rust desktop client, .N
 
 ## Status
 
-MVP. Present: invite-only accounts, a mandatory `general` room plus public rooms anyone can create or join and two-person DMs, a presence sidebar, live messages with reply/edit/delete and reactions, image attachments, unread and mention counts, older history, notifications, voice channels per room with push-to-talk (global per platform, with a window-focused fallback) or voice activation, input cleanup (echo cancellation, noise suppression and an optional automatic gain), plus per-user volume and mute.
+MVP. Present: invite-only accounts, a mandatory `general` room plus public rooms anyone can create or join and two-person DMs, a presence sidebar, live messages with reply/edit/delete and reactions, image attachments, unread and mention counts, older history, notifications, voice channels per room with push-to-talk (global per platform, with a window-focused fallback) or voice activation, input cleanup (echo cancellation, noise suppression and an optional automatic gain), per-user volume and mute, and screen sharing (a monitor or a window, with its audio, watched by other voice members through an H.264 stage rendered in the app).
 
 Deliberately absent: private (invite-only) rooms, file attachments beyond images, OAuth/2FA.
 
@@ -16,13 +16,17 @@ PROTOCOL.md                wire framing, state machines, limits
 server/                    ASP.NET Core (.NET 10) backend, Vorcall.Server.csproj (server/Voice/ is the voice UDP relay,
                             server/Updates/ + server/Api/UpdatesEndpoints.cs serve /api/updates/*)
 client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall-core -> incl. the `update` module,
-                            crates/vorcall-voice -> media engine, crates/vorcall-probe -> headless voice probe binary,
-                            also carries the check-update/apply-update oracle subcommands,
+                            crates/vorcall-voice -> media engine, incl. video.rs (fragmentation/reassembly)
+                            and stereo share audio, crates/vorcall-screen -> screen capture backends
+                            (Windows/macOS/Linux) + the OpenH264 codec, no GUI or audio device,
+                            crates/vorcall-probe -> headless voice probe binary, also carries the
+                            check-update/apply-update oracle subcommands and the share/watch oracle,
                             crates/vorcall-release -> release-side signing tool, binary `vorcall-release`,
-                            crates/vorcall-app -> binary `vorcall`)
+                            crates/vorcall-app -> binary `vorcall`, incl. share.rs -> the share pipeline
+                            and decode threads, view/stage.rs -> the wgpu shader widget)
 client/update-keys.pub     Ed25519 public keys the client trusts for release manifests; empty disables the updater
 deploy/                    nginx site configs and the host provisioning script
-scripts/                   client release build scripts (Linux, Windows cross-build) and update-oracle.sh (updater oracle)
+scripts/                   client release build scripts (Linux, Windows cross-build), push-client.sh (build + push both to the host) and update-oracle.sh
 releases/                  gitignored; local dir the dev server serves under /api/updates/*; production's is the host's
 docker-compose.yml         local dev: Postgres only
 docker-compose.prod.yml    production stack: Postgres + backend, pulled from GHCR
@@ -33,11 +37,11 @@ docker-compose.prod.yml    production stack: Postgres + backend, pulled from GHC
 
 ## Prerequisites
 
-- **Linux (build client + server, run local dev):** Rust via rustup (stable, 1.89+ — MSRV set by notify-rust), .NET SDK 10.0.x, Docker (for the local Postgres), ALSA headers for rodio/cpal: Fedora `sudo dnf install -y alsa-lib-devel`, Debian/Ubuntu `libasound2-dev` (CI installs it).
+- **Linux (build client + server, run local dev):** Rust via rustup (stable, 1.89+ — MSRV set by notify-rust), .NET SDK 10.0.x, Docker (for the local Postgres), a C++ compiler (`g++` or `clang++`, for OpenH264), ALSA headers for rodio/cpal: Fedora `sudo dnf install -y alsa-lib-devel`, Debian/Ubuntu `libasound2-dev` (CI installs it), PipeWire headers and libclang for the screen-share capture bindings: Fedora `sudo dnf install -y pipewire-devel clang-devel`, Debian/Ubuntu `libpipewire-0.3-dev libclang-dev` (CI installs these too).
 - **Cross-build for Windows (from Linux/Fedora):** the above, plus `sudo dnf install -y clang lld llvm`, `rustup target add x86_64-pc-windows-msvc`, `cargo install cargo-xwin`.
-- **macOS (build client from source only):** Xcode command-line tools, rustup.
+- **macOS (build client from source only):** Xcode command-line tools (a C++ compiler for OpenH264), rustup. macOS 13 or newer to run the built client: screen sharing needs ScreenCaptureKit, and the app bundle's `LSMinimumSystemVersion` is 13.0.
 
-Voice adds no build prerequisite beyond the above: `opus-rs` is a pure-Rust codec (no cmake, no system libopus). ALSA headers remain the only Linux-specific requirement, needed for cpal (capture/playback) as well as rodio.
+Voice adds no build prerequisite beyond the above: `opus-rs` is a pure-Rust codec (no cmake, no system libopus). Screen share adds the C++ compiler (OpenH264 is built from vendored C++ by the `cc` crate, no cmake, no nasm) and, on Linux, the PipeWire/libclang packages above; at runtime the Linux binary links `libpipewire-0.3.so.0` (any desktop since 2022 has it — `install.sh` warns if it is missing after a first install). ALSA headers remain a separate Linux-specific requirement, needed for cpal (capture/playback) as well as rodio.
 
 `dotnet` may not be on `PATH`; it can live at `~/.dotnet/dotnet`. The `dotnet-ef` global tool needs `DOTNET_ROOT=~/.dotnet` and `dotnet` on `PATH` (e.g. `PATH=~/.dotnet:$PATH`).
 
@@ -45,7 +49,7 @@ Voice adds no build prerequisite beyond the above: `opus-rs` is a pure-Rust code
 
 The server key and server URL are baked in at compile time (see [Client key and URL](#client-key-and-url) below); they can also be overridden at runtime by environment variables of the same names. `vorcall --version` prints `vorcall <version> <platform>` and exits, useful to check what a build reports.
 
-Since `.github/workflows/release.yml` now builds and signs releases for all three platforms (see [Releases and updates](#releases-and-updates)), these local scripts are mainly a fallback — a one-off build without cutting a release, or a build to debug the pipeline itself.
+The Linux and Windows release binaries are built here, on the owner's machine: `.github/workflows/release.yml` builds only macOS and fetches the other two from the host (see [Cutting a release](#cutting-a-release)). `scripts/push-client.sh` runs both scripts below and pushes their output; running either on its own is for a one-off build that is not a release.
 
 ### Linux
 
@@ -61,11 +65,11 @@ Output: `dist/vorcall-linux-x86_64` and `dist/vorcall-linux-x86_64.tar.gz`, the 
 scripts/build-client-windows.sh
 ```
 
-Output: `dist/vorcall-windows-x86_64.exe`. The binary is unsigned: SmartScreen's "More info" → "Run anyway" on the first run. The per-user installer (`packaging/windows/vorcall.iss`, Inno Setup) is built only by CI on the Windows runner, with the icon `scripts/make-windows-icon.sh` renders on Linux.
+Output: `dist/vorcall-windows-x86_64.exe`. The binary is unsigned: SmartScreen's "More info" → "Run anyway" on the first run. The per-user installer (`packaging/windows/vorcall.iss`, Inno Setup) is built only by CI on the Windows runner, around this exact exe after `scripts/push-client.sh` has pushed it, with the icon `scripts/make-windows-icon.sh` renders on Linux.
 
 ### macOS
 
-CI produces two files for Apple Silicon (ad-hoc signed — see [Releases and updates](#releases-and-updates)): `vorcall-macos-aarch64.dmg`, the `Vorcall.app` bundle a friend installs, and the bare `vorcall-macos-aarch64` the updater fetches. Building from source still works, and `scripts/bundle-client-macos.sh` wraps the result the same way CI does (it needs `brew install librsvg` for the icon):
+macOS is the one platform CI builds. It produces two files for Apple Silicon (ad-hoc signed — see [Releases and updates](#releases-and-updates)): `vorcall-macos-aarch64.dmg`, the `Vorcall.app` bundle a friend installs, and the bare `vorcall-macos-aarch64` the updater fetches. Building from source still works, and `scripts/bundle-client-macos.sh` wraps the result the same way CI does (it needs `brew install librsvg` for the icon):
 
 ```
 cd client && VORCALL_SERVER_KEY=<key> cargo build --release -p vorcall-app && cd ..
@@ -188,6 +192,40 @@ Against production, run the same two-terminal recipe with the two test accounts 
 
 **Limits worth knowing:** 20 ms Opus frames at 48 kbps CBR; one voice channel per room; echo cancellation covers only what Vorcall plays from the voice channel (the notification chime and music from another application still reach the microphone); mouse-button push-to-talk bindings are window-only on Wayland (the portal is keyboard-only).
 
+## Screen share
+
+Any member of a room's voice channel can share a monitor or a window, with its audio, to the other members already in that channel; several members can share at once, and a viewer watches one share at a time. Video is H.264 (OpenH264, a pure-Rust-built BSD-2 port of Cisco's encoder/decoder, no cmake) fragmented over the same UDP session and key as voice, rendered through a wgpu texture in the app. A share ends the moment its voice session does.
+
+**Settings:** the "Screen share" section of the full-screen Settings page holds `share_resolution` (`"source"`, `"720p"`, `"1080p"`, `"1440p"`, `"2160p"`; default `"720p"`), `share_fps` (15/30/60; default 30), an Auto/manual bitrate choice (`share_bitrate_kbps`, absent for Auto, otherwise 1000..30000 kbit/s), `share_audio` (default on) and `share_volume` for what is currently watched (0..200%, default 100%) — all in `config.toml`.
+
+**Quality:** the source is scaled down to fit inside the chosen resolution's box, aspect kept, never upscaled (a `"source"` share is capped at 3840×2160, the largest picture OpenH264 accepts). Auto bitrate reads a table by output size and frame rate (kbit/s): 720p 1500/2500/4000, 1080p 3000/4500/7000, 1440p 5000/8000/12000, 2160p 10000/15000/24000 for 15/30/60 fps; a manual value overrides it. The encoder skips frames rather than exceed the target rate, and the stage shows the rate actually achieved.
+
+**Capture backends:** Windows captures a monitor with Desktop Duplication (the cursor composited in, since Desktop Duplication does not include it) and a window with Windows.Graphics.Capture, falling back to Windows.Graphics.Capture for a monitor too if Desktop Duplication is refused; an unpackaged app still gets the yellow WGC capture border on a captured window, whatever the request. macOS captures both kinds with ScreenCaptureKit. Linux goes through the desktop portal's picker (`org.freedesktop.portal.ScreenCast`) and PipeWire, so Vorcall never lists sources of its own there — the portal's own dialog does, and its choice is remembered (`PersistMode::ExplicitlyRevoked`) so a later share in the same run does not re-prompt; a compositor that only offers DMA-BUF frames ends the capture with a clear reason instead of failing silently.
+
+**macOS caveat:** the Screen Recording permission is tied to the specific (ad-hoc signed) build, so — like Input Monitoring for push-to-talk — it must be re-granted in System Settings → Privacy & Security → Screen Recording after every update, and only takes effect after relaunching. macOS 13 or newer is required.
+
+**Audio:** macOS excludes Vorcall's own playout from a share's audio natively (ScreenCaptureKit); Windows tries process-loopback capture (excluding this process, build 20348+) and falls back to plain loopback; Linux captures the default sink's monitor, which is always the whole desktop. Where the capture includes Vorcall's own voice audio, a second echo canceller (AEC3, echo cancellation only — no noise suppression, no automatic gain, since a share carries music and game sound as well as speech) subtracts it before encoding, so a watcher does not hear the room's own voices coming back through the share.
+
+**Watching:** "Share screen" in the voice controls opens Vorcall's own picker on Windows and macOS (a list of monitors and windows plus a share-audio checkbox) or goes straight to the desktop portal's dialog on Linux. A sharer shows a ▣ badge next to their name in the voice roster; clicking it, or "Watch" in the expanded member panel, opens the stage in the centre pane: a sharer picker (when more than one member is sharing), a volume slider when the share has audio, live stats, Pop out (its own window; closing it brings the stage back to the centre pane), Fullscreen (Esc exits) and Stop watching.
+
+**Network:** share media rides the same UDP path as voice (see Network above), billed against its own byte budget rather than the packet-rate limit voice and pings use. Server options: `Vorcall__ShareEnabled` (default true, the kill switch), `Vorcall__ShareMaxKbps` (default 30000, the per-sharer ceiling), `Vorcall__MaxSharersPerRoom` (default 3). `deploy/provision-host.sh` raises the host's `net.core.rmem_max`/`wmem_max` to 16 MiB so the relay's 8 MiB socket buffers actually take; without that step the kernel clamps them silently. A room's worst-case bandwidth is sharers × watchers × `ShareMaxKbps`.
+
+**Status line:** " · sharing N kbit/s" is appended while a share is active, N being the encoder's currently achieved rate.
+
+**Probe (runtime oracle):** the same two-terminal idea as voice, one probe sharing a synthetic test pattern and the other watching it.
+
+```
+cd client && cargo build -p vorcall-probe
+VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username alice --share-seconds 10 --share-audio --listen-seconds 14
+VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username bob --watch alice --expect-video --expect-share-audio --listen-seconds 14
+```
+
+`--share-size WxH` (default 1280x720), `--share-fps` (15/30/60), `--encode-threads` (H.264 slice threads) and `--bitrate-kbps` tune the sharing side; `--share-seconds` and `--watch` are mutually exclusive within one probe. The sharing probe reports `"share": {frames_encoded, keyframes, keyframe_requests, encode_fps, kbps, watchers_max, bytes, threads, skipped}`; the watching probe reports `"watch": {user, user_id, pictures, keyframes, dropped, decode_errors, first_picture_ms, width, height, decode_fps, keyframe_requests_sent, share_tone_seconds}`. Exit codes add to the voice probe's: `1` also on `--expect-video` with fewer than 5 pictures decoded, or `--expect-share-audio` with less than 1 s of share tone heard.
+
+**Limits worth knowing:** one watched share per viewer; the source is never upscaled; keyframe requests are capped at 2 per second per viewer; a share ends the instant its voice session does, with no local self-preview for the sharer; there is no congestion control or retransmission — a lossy link shows as dropped frames and a black stage until the next keyframe.
+
+See [`PROTOCOL.md`](PROTOCOL.md#screen-share) for the signalling frames, audience rules and error codes, and § Media transport there for the datagram types and the limits table for the full set of numbers.
+
 ## Rooms and messages
 
 `general` is created for every account and cannot be left. Beyond it, rooms are public: anyone can browse the room list and join with `CreateRoom`/`JoinRoom`; a room's id is a slug of its name (`"Team  Chat_2"` → `team-chat-2`), and there is no rename or delete. A DM is a two-person room opened with `OpenDm` (id `dm-<lower user id>-<higher user id>`); it cannot be left either, but the client can hide one from the room list until the next message arrives in it. Each room, DMs included, has its own voice channel.
@@ -244,14 +282,20 @@ Key rotation: add the new public key to `client/update-keys.pub` alongside the o
 
 ### Cutting a release
 
-1. Bump `version` in `client/Cargo.toml` (`[workspace.package]`); bump `min_version` too (`[workspace.metadata.vorcall]`) when older clients must be cut off. Commit and push.
-2. Optionally dispatch the `release` workflow with `publish` unchecked first — a dry run that builds, signs and verifies but reaches neither the host nor a GitHub Release. No tag is needed for the dry run.
-3. `git tag -a vX.Y.Z -m "notes"` && `git push origin vX.Y.Z`. The annotation becomes the manifest's `notes` and the GitHub Release body; a lightweight tag (no `-a`/`-m`) gives empty notes.
-4. Watch the workflow run.
-5. Verify on the host: `ssh user@host 'head -c 300 ~/freedom.vorcall/releases/manifest.json'`.
-6. `users outdated` in the admin CLI (see [Admin CLI](#admin-cli)) lists who has not moved yet.
+CI builds only macOS. The Linux and Windows binaries are built on the owner's machine and pushed to the host first; the workflow fetches them back, compiles the Windows installer around the pushed exe, and signs one manifest covering all three platforms.
 
-The workflow refuses to publish when: the tag does not equal the workspace version; `min_version` is above `version`; any platform build fails; or the signing key's public half is not in `client/update-keys.pub` (which is exactly when clients would reject the manifest).
+1. Bump `version` in `client/Cargo.toml` (`[workspace.package]`); bump `min_version` too (`[workspace.metadata.vorcall]`) when older clients must be cut off. Commit and push.
+2. Optionally dispatch the `release` workflow with `publish` unchecked first — a dry run that builds macOS, then signs and verifies a **macOS-only** manifest. It reaches neither the host nor a GitHub Release, needs no tag, and needs nothing pushed to the host.
+3. `git tag -a vX.Y.Z -m "notes"`. The annotation becomes the manifest's `notes` and the GitHub Release body; a lightweight tag (no `-a`/`-m`) gives empty notes.
+4. `scripts/push-client.sh` — builds `dist/vorcall-linux-x86_64` (+ tarball) and `dist/vorcall-windows-x86_64.exe`, checksums them and scp's them into `~/freedom.vorcall/releases/<version>/` on the host. It needs `client/.env.release`, SSH access to the host and the Windows cross toolchain (`sudo dnf install -y clang lld llvm`, `cargo install cargo-xwin`), and it refuses to run unless the tag `vX.Y.Z` points at HEAD (`--no-tag-check` overrides, for a scratch build).
+5. `git push origin vX.Y.Z`.
+6. Watch the workflow run.
+7. Verify on the host: `ssh user@host 'head -c 300 ~/freedom.vorcall/releases/manifest.json'`.
+8. `users outdated` in the admin CLI (see [Admin CLI](#admin-cli)) lists who has not moved yet.
+
+The workflow refuses to publish when: the tag does not equal the workspace version; `min_version` is above `version`; the macOS build fails; the Linux/Windows binaries are not on the host for that version (run `scripts/push-client.sh` first) or their checksums do not match; or the signing key's public half is not in `client/update-keys.pub` (which is exactly when clients would reject the manifest).
+
+Because the Linux binary is built on the owner's Fedora machine instead of a pinned `ubuntu-22.04` runner, its glibc floor is that machine's glibc: a friend on an older distro can hit `GLIBC_2.xx not found` and needs a build made on an older base.
 
 ### First install per platform
 
@@ -326,14 +370,25 @@ vorcall-probe apply-update --file PATH
 5. `git tag -a v0.3.0 -m "..."` && `git push origin v0.3.0` (see [Cutting a release](#cutting-a-release)); leave `min_version` at 0.2.0 unless friends still on the pre-rooms build must be forced to update.
 6. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
 
+## Rolling out the screen share release
+
+0.4.0 adds screen sharing on top of voice. `min_version` moves to 0.4.0: an older client is asked to update by the manifest rather than left to ignore the new frames, since it has no way to render a share at all.
+
+1. Push `main` — this deploys once.
+2. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — adds the sysctl step that lets the relay's 8 MiB socket buffers actually take (see [Screen share](#screen-share)).
+3. On each desktop: share a window and a monitor, watch from another machine, check audio, pop out, go fullscreen, and (macOS) grant Screen Recording, then relaunch.
+4. The proto changed — regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run the full smoke suite, which now covers screen share too, before cutting the release.
+5. `git tag -a v0.4.0 -m "..."`, then `scripts/push-client.sh` (builds and pushes the Linux and Windows binaries to the host), then `git push origin v0.4.0` (see [Cutting a release](#cutting-a-release)).
+6. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
+
 ## Development gates
 
 ```
-cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app -p vorcall-hotkey
+cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app -p vorcall-hotkey -p vorcall-screen
 ```
 
 ```
 dotnet build server/Vorcall.Server.csproj -warnaserror
 ```
 
-There are no automated tests in the MVP outside `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app` and `vorcall-hotkey`'s unit tests. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph.
+There are no automated tests in the MVP outside `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app`, `vorcall-hotkey` and `vorcall-screen`'s unit tests. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph. `cargo xwin clippy --target x86_64-pc-windows-msvc -p vorcall-screen` (from `client/`) checks the Windows capture backend from Linux; the macOS backend compiles only on `release.yml`'s macOS runner, so a dry-run dispatch (see [Cutting a release](#cutting-a-release)) is the only way to check it without a Mac.

@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! [0]      version = 1
-//! [1]      type (1 audio, 2 ping, 3 pong)
+//! [1]      type (1 audio, 2 ping, 3 pong, 4 video, 5 share audio,
+//!                6 keyframe request)
 //! [2]      flags (bit 0 = marker)
 //! [3..7]   ssrc  u32
 //! [7..15]  seq   u64
@@ -17,7 +18,9 @@
 
 pub const HEADER_LEN: usize = 19;
 pub const TAG_LEN: usize = 16;
-pub const MAX_DATAGRAM: usize = 512;
+/// One datagram fits a 1500-byte path MTU with room to spare for the IPv4 and
+/// UDP headers and for a tunnel's own encapsulation.
+pub const MAX_DATAGRAM: usize = 1200;
 pub const MIN_DATAGRAM: usize = HEADER_LEN + TAG_LEN;
 pub const VERSION: u8 = 1;
 pub const MARKER_FLAG: u8 = 0b0000_0001;
@@ -29,6 +32,12 @@ pub enum PacketType {
     Audio = 1,
     Ping = 2,
     Pong = 3,
+    /// One fragment of a screen-share access unit; see [`crate::video`].
+    Video = 4,
+    /// One 20 ms stereo Opus frame of the screen share's own audio.
+    ShareAudio = 5,
+    /// A viewer asking the sharer for a keyframe; payload is the target ssrc.
+    KeyframeRequest = 6,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +61,8 @@ pub enum PacketError {
     BadType(u8),
     #[error("reserved flag bits set: {0:#010b}")]
     BadFlags(u8),
+    #[error("video fragment {index} of {count} is out of range")]
+    BadFragment { index: u16, count: u16 },
     #[error("authentication tag mismatch")]
     BadTag,
 }
@@ -79,6 +90,9 @@ impl Header {
             1 => PacketType::Audio,
             2 => PacketType::Ping,
             3 => PacketType::Pong,
+            4 => PacketType::Video,
+            5 => PacketType::ShareAudio,
+            6 => PacketType::KeyframeRequest,
             other => return Err(PacketError::BadType(other)),
         };
         let flags = bytes[2];
@@ -121,7 +135,14 @@ mod tests {
 
     #[test]
     fn round_trips_every_type_and_marker() {
-        for kind in [PacketType::Audio, PacketType::Ping, PacketType::Pong] {
+        for kind in [
+            PacketType::Audio,
+            PacketType::Ping,
+            PacketType::Pong,
+            PacketType::Video,
+            PacketType::ShareAudio,
+            PacketType::KeyframeRequest,
+        ] {
             for marker in [false, true] {
                 let header = sample(kind, marker);
                 let decoded = Header::decode(&header.encode()).expect("decodes");
@@ -161,10 +182,10 @@ mod tests {
         ));
 
         let mut bytes = sample(PacketType::Audio, false).encode();
-        bytes[1] = 4;
+        bytes[1] = 7;
         assert!(matches!(
             Header::decode(&bytes),
-            Err(PacketError::BadType(4))
+            Err(PacketError::BadType(7))
         ));
         bytes[1] = 0;
         assert!(matches!(
@@ -199,5 +220,22 @@ mod tests {
     #[test]
     fn minimum_datagram_is_header_plus_tag() {
         assert_eq!(MIN_DATAGRAM, 35);
+    }
+
+    #[test]
+    fn every_wire_type_decodes_from_its_number() {
+        for (number, kind) in [
+            (1u8, PacketType::Audio),
+            (2, PacketType::Ping),
+            (3, PacketType::Pong),
+            (4, PacketType::Video),
+            (5, PacketType::ShareAudio),
+            (6, PacketType::KeyframeRequest),
+        ] {
+            let mut bytes = sample(PacketType::Audio, false).encode();
+            bytes[1] = number;
+            assert_eq!(Header::decode(&bytes).expect("decodes").kind, kind);
+            assert_eq!(kind as u8, number);
+        }
     }
 }

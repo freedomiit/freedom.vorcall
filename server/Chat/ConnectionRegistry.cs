@@ -75,6 +75,48 @@ public enum LeaveVoiceOutcome
     Left,
 }
 
+public enum StartShareOutcome
+{
+    UnknownRoom,
+    Stale,
+    NotInVoice,
+
+    // Sharing is switched off on this server, or the relay never came up.
+    Unavailable,
+
+    // The room already holds as many sharers as the relay allows.
+    Limit,
+    Started,
+}
+
+public enum StopShareOutcome
+{
+    UnknownRoom,
+    Stale,
+    NotInVoice,
+    NotSharing,
+    Stopped,
+}
+
+public enum WatchShareOutcome
+{
+    UnknownRoom,
+    Stale,
+    NotInVoice,
+
+    // The target is not in the channel, is not sharing, or is the caller itself.
+    NotSharing,
+    Watching,
+}
+
+public enum UnwatchShareOutcome
+{
+    UnknownRoom,
+    Stale,
+    NotInVoice,
+    Unwatched,
+}
+
 // The connection set and the presence model in one place. Every membership change and every
 // room broadcast runs under _gate, which is what gives PROTOCOL.md its ordering guarantee: a
 // connection cannot see a ChatMessage, MemberJoined or MemberLeft before its own Welcome and
@@ -662,6 +704,194 @@ public sealed class ConnectionRegistry
         return LeaveVoiceOutcome.Left;
     }
 
+    // A share rides an existing voice session: the media travels on the ssrc the caller already
+    // proved, so there is nothing to hand out here and the audience is the text room, which is
+    // what already knows who is in the channel. Repeating StartShare is how a client re-announces
+    // a share it is already running, which is why it neither counts against the room's ceiling
+    // nor restarts anything on the relay.
+    public StartShareOutcome StartShare(ClientConnection connection, long userId, string roomId, bool audio)
+    {
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room))
+            {
+                return StartShareOutcome.UnknownRoom;
+            }
+
+            if (!IsLive(connection, userId))
+            {
+                return StartShareOutcome.Stale;
+            }
+
+            if (!room.Voice.TryGetValue(userId, out var slot))
+            {
+                return StartShareOutcome.NotInVoice;
+            }
+
+            if (!_relay.ShareEnabled)
+            {
+                return StartShareOutcome.Unavailable;
+            }
+
+            if (!slot.Sharing && room.Voice.Values.Count(other => other.Sharing) >= _relay.MaxSharersPerRoom)
+            {
+                return StartShareOutcome.Limit;
+            }
+
+            slot.Sharing = true;
+            slot.ShareAudio = audio;
+
+            // SetSharing takes the relay's own lock and calls nothing back into here.
+            _relay.SetSharing(slot.Session.Ssrc, true, audio);
+
+            BroadcastLocked(
+                room,
+                new ServerFrame { ShareStarted = new ShareStarted { RoomId = room.Id, UserId = userId, Audio = audio } },
+                except: null,
+                ref slow);
+
+            // Watchers of a share that was already running keep their watch, so the count answered
+            // here is the real one rather than zero.
+            Enqueue(connection, ShareWatchersOf(room, userId), ref slow);
+        }
+
+        CloseSlow(slow);
+        return StartShareOutcome.Started;
+    }
+
+    public StopShareOutcome StopShare(ClientConnection connection, long userId, string roomId)
+    {
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room))
+            {
+                return StopShareOutcome.UnknownRoom;
+            }
+
+            if (!IsLive(connection, userId))
+            {
+                return StopShareOutcome.Stale;
+            }
+
+            if (!room.Voice.TryGetValue(userId, out var slot))
+            {
+                return StopShareOutcome.NotInVoice;
+            }
+
+            if (!slot.Sharing)
+            {
+                return StopShareOutcome.NotSharing;
+            }
+
+            StopShareLocked(room, userId, slot, ref slow);
+        }
+
+        CloseSlow(slow);
+        return StopShareOutcome.Stopped;
+    }
+
+    // A viewer watches at most one share at a time, so this is a replacement: the share it leaves
+    // loses a watcher and hears about it, and the share it joins gains one.
+    public WatchShareOutcome WatchShare(ClientConnection connection, long userId, string roomId, long targetUserId)
+    {
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room))
+            {
+                return WatchShareOutcome.UnknownRoom;
+            }
+
+            if (!IsLive(connection, userId))
+            {
+                return WatchShareOutcome.Stale;
+            }
+
+            if (!room.Voice.TryGetValue(userId, out var viewer))
+            {
+                return WatchShareOutcome.NotInVoice;
+            }
+
+            // Watching yourself is refused the same way as watching a stranger: the relay would
+            // only clear the watch, and the client must be told nothing is coming.
+            if (targetUserId == userId
+                || !room.Voice.TryGetValue(targetUserId, out var target)
+                || !target.Sharing)
+            {
+                return WatchShareOutcome.NotSharing;
+            }
+
+            if (viewer.Watching == targetUserId)
+            {
+                // Idempotent: nothing changed, so only the viewer's own answer is repeated and the
+                // sharer is not told its count again.
+                Enqueue(connection, WatchStateOf(room, targetUserId), ref slow);
+            }
+            else
+            {
+                if (viewer.Watching is { } previous)
+                {
+                    // Cleared before the count is read, so the previous sharer hears the figure
+                    // that is true after this viewer left it.
+                    viewer.Watching = null;
+                    if (room.Voice.TryGetValue(previous, out var previousSharer))
+                    {
+                        Enqueue(previousSharer.Connection, ShareWatchersOf(room, previous), ref slow);
+                    }
+                }
+
+                viewer.Watching = targetUserId;
+                _relay.Watch(viewer.Session.Ssrc, target.Session.Ssrc);
+                Enqueue(connection, WatchStateOf(room, targetUserId), ref slow);
+                Enqueue(target.Connection, ShareWatchersOf(room, targetUserId), ref slow);
+            }
+        }
+
+        CloseSlow(slow);
+        return WatchShareOutcome.Watching;
+    }
+
+    public UnwatchShareOutcome UnwatchShare(ClientConnection connection, long userId, string roomId)
+    {
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room))
+            {
+                return UnwatchShareOutcome.UnknownRoom;
+            }
+
+            if (!IsLive(connection, userId))
+            {
+                return UnwatchShareOutcome.Stale;
+            }
+
+            if (!room.Voice.TryGetValue(userId, out var viewer))
+            {
+                return UnwatchShareOutcome.NotInVoice;
+            }
+
+            if (viewer.Watching is { } previous)
+            {
+                viewer.Watching = null;
+                _relay.Watch(viewer.Session.Ssrc, null);
+                if (room.Voice.TryGetValue(previous, out var sharer))
+                {
+                    Enqueue(sharer.Connection, ShareWatchersOf(room, previous), ref slow);
+                }
+            }
+
+            // Answered even when nothing was being watched, so a client that believed otherwise is
+            // corrected either way.
+            Enqueue(connection, WatchStateOf(room, 0), ref slow);
+        }
+
+        CloseSlow(slow);
+        return UnwatchShareOutcome.Unwatched;
+    }
+
     public Task CloseAllAsync(WebSocketCloseStatus status, string reason)
         => Task.WhenAll(_connections.Values.Select(connection => CloseQuietlyAsync(connection, status, reason)));
 
@@ -748,17 +978,59 @@ public sealed class ConnectionRegistry
     // The whole text room hears it, the leaver included. The media session itself is released
     // after the lock, because RemoveSession can raise SpeakingChanged straight back into a
     // broadcast.
-    private static void RemoveVoiceLocked(Room room, long userId, ref List<ClientConnection>? slow, List<uint> removed)
+    private void RemoveVoiceLocked(Room room, long userId, ref List<ClientConnection>? slow, List<uint> removed)
     {
-        if (!room.Voice.Remove(userId, out var slot))
+        if (!room.Voice.TryGetValue(userId, out var slot))
         {
             return;
         }
 
+        // Both sides of the share graph go before the session does: the room hears ShareStopped
+        // ahead of VoiceMemberLeft, and whoever this slot was watching loses a watcher. The slot
+        // is still in the map, so the counts are read after its own watch is cleared.
+        if (slot.Sharing)
+        {
+            StopShareLocked(room, userId, slot, ref slow);
+        }
+
+        if (slot.Watching is { } watched)
+        {
+            slot.Watching = null;
+            if (room.Voice.TryGetValue(watched, out var sharer))
+            {
+                Enqueue(sharer.Connection, ShareWatchersOf(room, watched), ref slow);
+            }
+        }
+
+        room.Voice.Remove(userId);
         removed.Add(slot.Session.Ssrc);
         BroadcastLocked(
             room,
             new ServerFrame { VoiceMemberLeft = new VoiceMemberLeft { RoomId = room.Id, UserId = userId } },
+            except: null,
+            ref slow);
+    }
+
+    // Ends a share and tells everyone it concerns. The relay drops its own watcher list with the
+    // flag, so no viewer has to be detached there one at a time.
+    private void StopShareLocked(Room room, long userId, VoiceSlot slot, ref List<ClientConnection>? slow)
+    {
+        slot.Sharing = false;
+        slot.ShareAudio = false;
+
+        foreach (var (watcherId, watcher) in room.Voice)
+        {
+            if (watcherId != userId && watcher.Watching == userId)
+            {
+                watcher.Watching = null;
+                Enqueue(watcher.Connection, WatchStateOf(room, 0), ref slow);
+            }
+        }
+
+        _relay.SetSharing(slot.Session.Ssrc, false, false);
+        BroadcastLocked(
+            room,
+            new ServerFrame { ShareStopped = new ShareStopped { RoomId = room.Id, UserId = userId } },
             except: null,
             ref slow);
     }
@@ -838,6 +1110,23 @@ public sealed class ConnectionRegistry
             UserId = slot.Session.UserId,
             Username = slot.Connection.Username ?? string.Empty,
             Ssrc = slot.Session.Ssrc,
+            Sharing = slot.Sharing,
+            ShareAudio = slot.ShareAudio,
+        };
+
+    private static ServerFrame WatchStateOf(Room room, long sharerUserId)
+        => new() { WatchState = new WatchState { RoomId = room.Id, UserId = sharerUserId } };
+
+    // The registry's own map is the truth a client is told about: the relay counts the same
+    // watchers, but only for diagnostics, and it lags this map by whatever is in flight.
+    private static ServerFrame ShareWatchersOf(Room room, long sharerUserId)
+        => new()
+        {
+            ShareWatchers = new ShareWatchers
+            {
+                RoomId = room.Id,
+                Count = (uint)room.Voice.Values.Count(slot => slot.Watching == sharerUserId),
+            },
         };
 
     // Only ever enqueued to the joiner: it carries that session's media key.
@@ -904,9 +1193,22 @@ public sealed class ConnectionRegistry
         }
     }
 
-    // The connection is kept alongside the session because VoiceMember carries the username,
-    // which lives on the connection and nowhere else.
-    private readonly record struct VoiceSlot(ClientConnection Connection, VoiceSession Session);
+    // One account's live voice session in one room. The connection is kept alongside the session
+    // because VoiceMember carries the username, which lives on the connection and nowhere else.
+    private sealed class VoiceSlot(ClientConnection connection, VoiceSession session)
+    {
+        public ClientConnection Connection { get; } = connection;
+
+        public VoiceSession Session { get; } = session;
+
+        public bool Sharing { get; set; }
+
+        public bool ShareAudio { get; set; }
+
+        // The sharer this session is watching, if any. A viewer watches at most one share, and
+        // only inside its own room.
+        public long? Watching { get; set; }
+    }
 
     // One mirrored room: its persisted facts, the accounts that belong to it, and the live
     // connections of those of them that are online right now.

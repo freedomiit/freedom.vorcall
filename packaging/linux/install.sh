@@ -37,6 +37,9 @@ case "${1:-}" in
         sed "s|^Exec=.*|Exec=\"$BINARY\"|" "$HERE/vorcall.desktop" > "$ENTRY"
         refresh
         echo "Vorcall installed: look for it in the app launcher, or run $BINARY"
+        if ! ldconfig -p 2>/dev/null | grep -q 'libpipewire-0.3.so.0'; then
+            echo "warning: libpipewire-0.3.so.0 not found; screen sharing needs PipeWire (package \"pipewire\") — Vorcall may not start without it" >&2
+        fi
         ;;
     --uninstall)
         # the updater's leftovers live next to the binary

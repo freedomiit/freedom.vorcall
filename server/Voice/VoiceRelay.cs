@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
@@ -5,18 +6,25 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Threading.Channels;
 
 namespace Vorcall.Server.Voice;
 
 // The media path: one UDP socket, one receive loop, one key per voice session. Every datagram
 // is authenticated before anything is forwarded, and the relay only ever sends to an address
 // that a session's own key has already been proved from, so the socket cannot be used to
-// bounce traffic at a third party.
+// bounce traffic at a third party. Screen share rides the same socket and the same key: its
+// fan-out leaves the receive loop through a per-session queue so a sharer's watchers never cost
+// the room's audio a millisecond.
 public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger) : BackgroundService
 {
-    private const int ReceiveBufferBytes = 1024 * 1024;
+    private const int ReceiveBufferBytes = 8 * 1024 * 1024;
+    private const int SendBufferBytes = 8 * 1024 * 1024;
     private const int DatagramBufferBytes = 2048;
     private const int MaxPlaintextBytes = MediaHeader.MaxDatagram - MediaHeader.MinDatagram;
+
+    // A keyframe request carries the ssrc it is meant for, and nothing else.
+    private const int KeyframeRequestBytes = sizeof(uint);
 
     private static readonly TimeSpan SpeakingTimeout = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan HousekeepingInterval = TimeSpan.FromMilliseconds(100);
@@ -43,6 +51,13 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
     public bool IsAvailable => _socket is not null;
 
+    // Whether a share may be started at all: the kill switch plus a relay that actually came up.
+    public bool ShareEnabled => options.ShareEnabled && IsAvailable;
+
+    // How many sharers a room may hold at once. The relay does not enforce it; the signalling
+    // side does, and reads the ceiling from here.
+    public int MaxSharersPerRoom => options.MaxSharersPerRoom;
+
     public string AdvertisedHost => options.Host;
 
     public int Port => options.Port;
@@ -60,7 +75,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
             while (ssrc == 0 || _sessions.ContainsKey(ssrc));
 
-            session = new VoiceSession(ssrc, userId, roomId, key);
+            session = new VoiceSession(ssrc, userId, roomId, key, options.ShareMaxKbps);
             _sessions[ssrc] = session;
             _rooms[roomId] = _rooms.TryGetValue(roomId, out var members) ? members.Add(session) : [session];
         }
@@ -91,6 +106,15 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                     _rooms[session.RoomId] = remaining;
                 }
             }
+
+            // Both directions of the share graph go with the session: whatever it was watching
+            // loses a watcher, and its own watchers are left watching nothing, which is what
+            // makes their next keyframe request a drop rather than a message to a stranger.
+            StopWatching(session);
+            DetachWatchers(session);
+            session.Sharing = false;
+            session.ShareAudio = false;
+            session.CompleteShareQueue();
         }
 
         if (session.StopSpeaking())
@@ -100,6 +124,84 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
         session.Dispose();
         logger.LogDebug("Voice session {Ssrc} closed for user {UserId} in room {RoomId}", ssrc, session.UserId, session.RoomId);
+    }
+
+    // Marks a session as sharing, or ends its share. Starting is idempotent: a second call only
+    // updates whether the share carries audio. Ending detaches every watcher and stops the
+    // sender worker. Raises no event and takes only the relay's own lock, so the signalling side
+    // may call it while holding its own.
+    public void SetSharing(uint ssrc, bool sharing, bool audio)
+    {
+        ChannelReader<VoiceSession.Outbound>? started = null;
+        VoiceSession? session;
+
+        lock (_gate)
+        {
+            if (!_sessions.TryGetValue(ssrc, out session))
+            {
+                return;
+            }
+
+            if (sharing)
+            {
+                session.ShareAudio = audio;
+                if (!session.Sharing)
+                {
+                    // The queue comes first: a datagram may reach the receive loop the moment the
+                    // flag is up, and it must find the queue this worker is reading.
+                    started = session.RestartShareQueue();
+                    session.Sharing = true;
+                }
+            }
+            else
+            {
+                session.Sharing = false;
+                session.ShareAudio = false;
+                DetachWatchers(session);
+                session.CompleteShareQueue();
+            }
+        }
+
+        if (started is { } queue && session is { } sharer)
+        {
+            _ = Task.Run(() => ShareWorkerAsync(sharer, queue));
+        }
+    }
+
+    // Points a viewer at one sharer, or at nobody. A target that is unknown, not sharing, or the
+    // viewer itself only clears the previous watch.
+    public void Watch(uint viewerSsrc, uint? sharerSsrc)
+    {
+        lock (_gate)
+        {
+            if (!_sessions.TryGetValue(viewerSsrc, out var viewer))
+            {
+                return;
+            }
+
+            StopWatching(viewer);
+
+            if (sharerSsrc is not { } targetSsrc
+                || targetSsrc == viewerSsrc
+                || !_sessions.TryGetValue(targetSsrc, out var target)
+                || !target.Sharing)
+            {
+                return;
+            }
+
+            target.Watchers = target.Watchers.Add(viewer);
+            viewer.Watching = target;
+        }
+    }
+
+    // How many viewers a share is being forwarded to. Zero for a session that is not sharing or
+    // no longer exists.
+    public int WatcherCount(uint ssrc)
+    {
+        lock (_gate)
+        {
+            return _sessions.TryGetValue(ssrc, out var session) ? session.Watchers.Length : 0;
+        }
     }
 
     public override Task StartAsync(CancellationToken cancellationToken)
@@ -122,6 +224,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         try
         {
             socket.ReceiveBufferSize = ReceiveBufferBytes;
+            socket.SendBufferSize = SendBufferBytes;
             socket.Bind(new IPEndPoint(IPAddress.Any, options.Port));
         }
         catch (Exception ex) when (ex is SocketException or ArgumentException)
@@ -133,7 +236,14 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
 
         _socket = socket;
-        logger.LogInformation("Voice relay listening on 0.0.0.0:{Port}", options.Port);
+
+        // The kernel clamps the buffers to its own maximum without saying so, and a screen share
+        // is what finds that ceiling, so the granted sizes are logged rather than the asked ones.
+        logger.LogInformation(
+            "Voice relay listening on 0.0.0.0:{Port} with socket buffers of {ReceiveBuffer} bytes in and {SendBuffer} bytes out",
+            options.Port,
+            socket.ReceiveBufferSize,
+            socket.SendBufferSize);
         return base.StartAsync(cancellationToken);
     }
 
@@ -161,15 +271,35 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         return BinaryPrimitives.ReadUInt32BigEndian(bytes);
     }
 
-    private static bool TrySeal(VoiceSession recipient, byte[] datagram, byte[] plaintext, int plaintextLength)
+    private static bool TrySeal(VoiceSession recipient, byte[] datagram, ReadOnlySpan<byte> plaintext)
     {
         var header = datagram.AsSpan(0, MediaHeader.Length);
         return recipient.TrySeal(
             MediaHeader.NonceOf(header),
-            plaintext.AsSpan(0, plaintextLength),
-            datagram.AsSpan(MediaHeader.Length, plaintextLength),
-            datagram.AsSpan(MediaHeader.Length + plaintextLength, MediaHeader.TagLength),
+            plaintext,
+            datagram.AsSpan(MediaHeader.Length, plaintext.Length),
+            datagram.AsSpan(MediaHeader.Length + plaintext.Length, MediaHeader.TagLength),
             header);
+    }
+
+    // Both callers hold _gate.
+    private static void StopWatching(VoiceSession viewer)
+    {
+        if (viewer.Watching is { } current)
+        {
+            current.Watchers = current.Watchers.Remove(viewer);
+            viewer.Watching = null;
+        }
+    }
+
+    private static void DetachWatchers(VoiceSession sharer)
+    {
+        foreach (var watcher in sharer.Watchers)
+        {
+            watcher.Watching = null;
+        }
+
+        sharer.Watchers = [];
     }
 
     private async Task ReceiveLoopAsync(Socket socket, CancellationToken stoppingToken)
@@ -204,28 +334,44 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 continue;
             }
 
-            if (inbound.Header.Type == MediaHeader.TypeAudio)
+            switch (inbound.Header.Type)
             {
-                if (inbound.Session.MarkAudio(Stopwatch.GetTimestamp()))
-                {
-                    // The session was looked up before RemoveSession could have taken it out, so
-                    // a blind raise here can land after the room already saw VoiceMemberLeft and
-                    // leave a talker nobody ever silences. A removed session simply goes quiet.
-                    if (_sessions.ContainsKey(inbound.Session.Ssrc))
+                case MediaHeader.TypeAudio:
+                    if (inbound.Session.MarkAudio(Stopwatch.GetTimestamp()))
                     {
-                        RaiseSpeakingChanged(inbound.Session, true);
+                        // The session was looked up before RemoveSession could have taken it out,
+                        // so a blind raise here can land after the room already saw
+                        // VoiceMemberLeft and leave a talker nobody ever silences. A removed
+                        // session simply goes quiet.
+                        if (_sessions.ContainsKey(inbound.Session.Ssrc))
+                        {
+                            RaiseSpeakingChanged(inbound.Session, true);
+                        }
+                        else
+                        {
+                            inbound.Session.StopSpeaking();
+                        }
                     }
-                    else
-                    {
-                        inbound.Session.StopSpeaking();
-                    }
-                }
 
-                await ForwardAsync(socket, inbound, buffer, scratch, plaintext, stoppingToken);
-            }
-            else
-            {
-                await PongAsync(socket, inbound, scratch, plaintext, stoppingToken);
+                    await ForwardAsync(socket, inbound, buffer, scratch, plaintext, stoppingToken);
+                    break;
+
+                case MediaHeader.TypePing:
+                    await PongAsync(socket, inbound, scratch, plaintext, stoppingToken);
+                    break;
+
+                case MediaHeader.TypeVideo:
+                case MediaHeader.TypeShareAudio:
+                    EnqueueShare(inbound, buffer, plaintext);
+                    break;
+
+                case MediaHeader.TypeKeyframeRequest:
+                    await RequestKeyframeAsync(socket, inbound, scratch, plaintext, stoppingToken);
+                    break;
+
+                default:
+                    // Unreachable: TryParse admits no other type.
+                    break;
             }
         }
     }
@@ -263,7 +409,11 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
 
         var counters = _counters.GetOrAdd(session.RoomId, static _ => new RoomCounters());
-        if (!session.Bucket.TryTake(Stopwatch.GetTimestamp()))
+
+        // Share media is a hundred packets a second on its own: it answers to a byte budget of
+        // its own further down instead of the packet bucket audio and pings share.
+        var share = header.Type is MediaHeader.TypeVideo or MediaHeader.TypeShareAudio;
+        if (!share && !session.Bucket.TryTake(Stopwatch.GetTimestamp()))
         {
             Interlocked.Increment(ref counters.DropRate);
             return false;
@@ -288,6 +438,23 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         {
             Interlocked.Increment(ref counters.DropReplay);
             return false;
+        }
+
+        // Charged after the AEAD for the same reason the window moves after it: a forgery must
+        // not be able to spend somebody else's budget.
+        if (share)
+        {
+            if (!session.ShareBucket.TryTake(Stopwatch.GetTimestamp(), length))
+            {
+                Interlocked.Increment(ref counters.DropShareRate);
+                return false;
+            }
+
+            if (!session.Sharing || (header.Type == MediaHeader.TypeShareAudio && !session.ShareAudio))
+            {
+                Interlocked.Increment(ref counters.DropNotSharing);
+                return false;
+            }
         }
 
         Interlocked.Increment(ref counters.PacketsIn);
@@ -329,10 +496,160 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
 
             // A false seal means the member was removed while this packet was in flight.
-            if (TrySeal(member, scratch, plaintext, inbound.PlaintextLength))
+            if (TrySeal(member, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
             {
                 await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
             }
+        }
+    }
+
+    // The receive loop's whole part in a share: one pooled copy of the header and its plaintext,
+    // handed to the session's own worker. Everything after this happens off this thread.
+    private void EnqueueShare(Inbound inbound, byte[] buffer, byte[] plaintext)
+    {
+        var counters = inbound.Counters;
+        var length = MediaHeader.Length + inbound.PlaintextLength;
+        var rented = ArrayPool<byte>.Shared.Rent(length);
+        buffer.AsSpan(0, MediaHeader.Length).CopyTo(rented);
+        plaintext.AsSpan(0, inbound.PlaintextLength).CopyTo(rented.AsSpan(MediaHeader.Length));
+
+        // A full queue evicts its oldest frame instead, which the session counts itself; a
+        // refusal here means the share ended while this datagram was in flight.
+        if (!inbound.Session.ShareWriter.TryWrite(new VoiceSession.Outbound(rented, inbound.PlaintextLength)))
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+            Interlocked.Increment(ref counters.DropQueueFull);
+            return;
+        }
+
+        Interlocked.Increment(ref counters.SharePacketsIn);
+        Interlocked.Add(ref counters.ShareBytesIn, length + MediaHeader.TagLength);
+    }
+
+    // One sharer's fan-out, on its own task: the sends are synchronous because a share is a
+    // burst of datagrams and nothing else waits on this thread.
+    private async Task ShareWorkerAsync(VoiceSession session, ChannelReader<VoiceSession.Outbound> queue)
+    {
+        var scratch = new byte[MediaHeader.MaxDatagram];
+        var counters = _counters.GetOrAdd(session.RoomId, static _ => new RoomCounters());
+
+        try
+        {
+            await foreach (var item in queue.ReadAllAsync())
+            {
+                try
+                {
+                    if (!FanOut(session, item, scratch, counters))
+                    {
+                        return;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(item.Buffer);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Voice share worker for user {UserId} in room {RoomId} stopped", session.UserId, session.RoomId);
+        }
+    }
+
+    // False once the socket is gone, which is the worker's cue to leave.
+    private bool FanOut(VoiceSession session, VoiceSession.Outbound item, byte[] scratch, RoomCounters counters)
+    {
+        var socket = _socket;
+        if (socket is null)
+        {
+            return false;
+        }
+
+        var watchers = session.Watchers;
+        if (watchers.IsEmpty)
+        {
+            return true;
+        }
+
+        item.Buffer.AsSpan(0, MediaHeader.Length).CopyTo(scratch);
+        var plaintext = item.Buffer.AsSpan(MediaHeader.Length, item.PlaintextLength);
+        var length = MediaHeader.Length + item.PlaintextLength + MediaHeader.TagLength;
+
+        foreach (var watcher in watchers)
+        {
+            if (watcher.Ssrc == session.Ssrc)
+            {
+                continue;
+            }
+
+            // A watch is only ever set up inside one room; a mismatch would be a bug in the
+            // signalling side, and the frame is dropped rather than leaked to the other room.
+            if (!string.Equals(watcher.RoomId, session.RoomId, StringComparison.Ordinal))
+            {
+                logger.LogDebug(
+                    "Voice share of user {UserId} in room {RoomId} had a watcher from room {WatcherRoomId}",
+                    session.UserId,
+                    session.RoomId,
+                    watcher.RoomId);
+                continue;
+            }
+
+            if (watcher.Address is not { } destination)
+            {
+                Interlocked.Increment(ref counters.DropNoAddress);
+                continue;
+            }
+
+            if (!TrySeal(watcher, scratch, plaintext))
+            {
+                continue;
+            }
+
+            try
+            {
+                var sent = socket.SendTo(scratch, 0, length, SocketFlags.None, destination);
+                Interlocked.Increment(ref counters.SharePacketsOut);
+                Interlocked.Add(ref counters.ShareBytesOut, sent);
+            }
+            catch (SocketException ex)
+            {
+                logger.LogDebug(ex, "Voice share send failed with {SocketError}", ex.SocketErrorCode);
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // A viewer asking the share it is watching for a keyframe. The payload names the target, and
+    // it has to be the one the relay knows this viewer is watching: nobody gets to poke a session
+    // they are not receiving.
+    private async Task RequestKeyframeAsync(Socket socket, Inbound inbound, byte[] scratch, byte[] plaintext, CancellationToken stoppingToken)
+    {
+        var counters = inbound.Counters;
+        if (inbound.PlaintextLength < KeyframeRequestBytes
+            || inbound.Session.Watching is not { } target
+            || target.Ssrc != BinaryPrimitives.ReadUInt32BigEndian(plaintext))
+        {
+            Interlocked.Increment(ref counters.DropNotWatching);
+            return;
+        }
+
+        if (target.Address is not { } destination)
+        {
+            Interlocked.Increment(ref counters.DropNoAddress);
+            return;
+        }
+
+        inbound.Header.Write(scratch);
+        if (TrySeal(target, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
+        {
+            var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
+            await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
+            Interlocked.Increment(ref counters.KeyframeRequests);
         }
     }
 
@@ -353,7 +670,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         };
         header.Write(scratch);
 
-        if (TrySeal(inbound.Session, scratch, plaintext, inbound.PlaintextLength))
+        if (TrySeal(inbound.Session, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
         {
             var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
             await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
@@ -428,21 +745,38 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 continue;
             }
 
+            // Evictions are counted on the session whose queue overflowed, so the room's figure
+            // is its own refusals plus what its sharers threw away.
+            var queueDrops = Interlocked.Read(ref counters.DropQueueFull);
+            foreach (var member in members)
+            {
+                queueDrops += member.QueueDrops;
+            }
+
             logger.LogInformation(
-                "Voice room {RoomId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address",
+                "Voice room {RoomId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; share: {SharePacketsIn} packets in, {SharePacketsOut} out, {ShareBytesIn} bytes in, {ShareBytesOut} out, {KeyframeRequests} keyframe requests; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address, {DropShareRate} share rate, {DropNotSharing} not sharing, {DropNotWatching} not watching, {DropQueueFull} queue full",
                 roomId,
                 members.Length,
                 Interlocked.Read(ref counters.PacketsIn),
                 Interlocked.Read(ref counters.PacketsOut),
                 Interlocked.Read(ref counters.BytesIn),
                 Interlocked.Read(ref counters.BytesOut),
+                Interlocked.Read(ref counters.SharePacketsIn),
+                Interlocked.Read(ref counters.SharePacketsOut),
+                Interlocked.Read(ref counters.ShareBytesIn),
+                Interlocked.Read(ref counters.ShareBytesOut),
+                Interlocked.Read(ref counters.KeyframeRequests),
                 dropSize,
                 dropHeader,
                 dropUnknownSsrc,
                 Interlocked.Read(ref counters.DropRate),
                 Interlocked.Read(ref counters.DropBadTag),
                 Interlocked.Read(ref counters.DropReplay),
-                Interlocked.Read(ref counters.DropNoAddress));
+                Interlocked.Read(ref counters.DropNoAddress),
+                Interlocked.Read(ref counters.DropShareRate),
+                Interlocked.Read(ref counters.DropNotSharing),
+                Interlocked.Read(ref counters.DropNotWatching),
+                queueDrops);
         }
     }
 
@@ -473,9 +807,18 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         public long PacketsOut;
         public long BytesIn;
         public long BytesOut;
+        public long SharePacketsIn;
+        public long SharePacketsOut;
+        public long ShareBytesIn;
+        public long ShareBytesOut;
+        public long KeyframeRequests;
         public long DropRate;
         public long DropBadTag;
         public long DropReplay;
         public long DropNoAddress;
+        public long DropShareRate;
+        public long DropNotSharing;
+        public long DropNotWatching;
+        public long DropQueueFull;
     }
 }

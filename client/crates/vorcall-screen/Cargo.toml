@@ -1,0 +1,37 @@
+[package]
+name = "vorcall-screen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Screen capture backends and the software video codec, without a GUI or an audio device"
+
+[dependencies]
+futures.workspace = true
+openh264.workspace = true
+openh264-sys2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cpal.workspace = true
+wasapi.workspace = true
+windows.workspace = true
+windows-future.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+core-graphics.workspace = true
+dispatch2.workspace = true
+objc2.workspace = true
+objc2-core-audio-types.workspace = true
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+objc2-foundation.workspace = true
+objc2-screen-capture-kit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+libc.workspace = true
+libspa.workspace = true
+pipewire.workspace = true
+tokio.workspace = true

@@ -6,11 +6,11 @@
 //! source is a synthesized sine and the sink is a level meter.
 
 mod report;
+mod share;
 mod update_cmd;
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
@@ -19,14 +19,15 @@ use tokio::time::{MissedTickBehavior, interval, sleep_until, timeout, timeout_at
 use tracing_subscriber::EnvFilter;
 use vorcall_core::connection::GENERAL_ROOM;
 use vorcall_core::{Command, Event, Session};
+use vorcall_screen::preset::FrameRate;
 use vorcall_voice::codec::Encoder;
 use vorcall_voice::tone::{Tone, rms};
 use vorcall_voice::{
     FRAME_MS, FRAME_SAMPLES, FrameSender, GateDecision, Link, MediaConfig, MediaEngine, NoiseGate,
-    Playout,
+    STEREO_FRAME_SAMPLES,
 };
 
-use report::{PeerReport, Report, Rtt, SpeakingEvent};
+use report::{PeerReport, Report, Rtt, ShareReport, SpeakingEvent, WatchReport};
 
 /// Peaks at 0.3, so a clean frame measures ≈0.21 and silence or concealment
 /// stays far below the threshold below.
@@ -41,6 +42,17 @@ const MAX_PACKET: usize = 512;
 
 /// Sign-in, WebSocket, room join and the voice handshake all fit in this.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long the sharer waits for the server to announce its own share.
+const SHARE_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a watcher waits for the sharer to appear and the server to confirm
+/// the watch, measured from the moment voice came up.
+const WATCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Under `--expect-video`: fewer pictures than this is a broken share path
+/// rather than a slow start.
+const MIN_PICTURES: u64 = 5;
 
 const USAGE: &str = "\
 vorcall-probe --username U (--password P | env VORCALL_PROBE_PASSWORD) [options]
@@ -57,8 +69,19 @@ Options:
                          encoding; gated frames are never sent
   --vad-threshold <db>   gate open threshold in dBFS (default: -45), only
                          meaningful with --vad
+  --share-seconds <n>    seconds of synthetic screen share to send; needs
+                         <= --listen-seconds, and excludes --watch
+  --share-audio          send a stereo tone as the share's own audio
+  --share-size <WxH>     share picture size, both even (default: 1280x720)
+  --share-fps <n>        share frame rate: 15, 30 or 60 (default: 30)
+  --encode-threads <n>   H.264 slice threads to ask for (default: 1)
+  --bitrate-kbps <n>     share bitrate (default: the preset table's value for
+                         the size and frame rate)
+  --watch <name>         watch that user's share and decode it
   --expect-peer          exit 1 unless at least 1.00 s of tone was heard
   --expect-silence       exit 1 if any audio frame was sent
+  --expect-video         exit 1 unless at least 5 pictures decoded
+  --expect-share-audio   exit 1 unless at least 1.00 s of share tone was heard
   --help                 print this help
 
 Voice-activation oracle: `--vad --tone-amplitude 0 --expect-silence` must exit
@@ -67,13 +90,22 @@ alongside a second probe must hear the tone. Without --vad, --tone-amplitude 0
 still sends silent frames, so --expect-silence then exits 1 — that is the
 negative control.
 
+Screen-share oracle, two terminals against the same room:
+
+  vorcall-probe --username alice --share-seconds 10 --share-audio \
+                --listen-seconds 14
+  vorcall-probe --username bob --watch alice --expect-video \
+                --expect-share-audio --listen-seconds 14
+
 The server URL and key come from VORCALL_SERVER_URL and VORCALL_SERVER_KEY,
 with the values baked in at build time as fallbacks.
 
 Prints one JSON line on stdout; logs go to stderr.
 
-Exit codes: 0 ran, 1 --expect-silence sent audio or --expect-peer heard
-nothing, 2 usage, sign-in, connection or media failure.
+Exit codes: 0 ran, 1 --expect-silence sent audio, --expect-peer heard nothing,
+--expect-video saw too few pictures, --expect-share-audio heard no share tone,
+or the watch was never confirmed; 2 usage, sign-in, connection or media
+failure.
 
 Update subcommands:
   vorcall-probe check-update --username U [--password P] --platform ID
@@ -98,8 +130,17 @@ struct Args {
     tone_amplitude: f32,
     vad: bool,
     vad_threshold: f32,
+    share_seconds: Option<u64>,
+    share_audio: bool,
+    share_size: (u32, u32),
+    share_fps: FrameRate,
+    encode_threads: u16,
+    bitrate_kbps: Option<u32>,
+    watch: Option<String>,
     expect_peer: bool,
     expect_silence: bool,
+    expect_video: bool,
+    expect_share_audio: bool,
 }
 
 #[tokio::main]
@@ -185,7 +226,16 @@ async fn probe(args: Args) -> i32 {
     ));
 
     let mut names: HashMap<u32, (i64, String)> = HashMap::new();
-    let ready = match wait_for_voice(&mut commands, &mut events, &mut names, &args.room).await {
+    let share_flow = args.share_seconds.is_some() || args.watch.is_some();
+    let ready = match wait_for_voice(
+        &mut commands,
+        &mut events,
+        &mut names,
+        &args.room,
+        share_flow,
+    )
+    .await
+    {
         Ok(ready) => ready,
         Err(reason) => {
             eprintln!("vorcall-probe: {reason}");
@@ -226,15 +276,104 @@ async fn probe(args: Args) -> i32 {
         args.send_seconds * 1000 / FRAME_MS,
     ));
 
+    let mut sharing = None;
+    if let Some(seconds) = args.share_seconds {
+        if let Err(reason) = start_share(
+            &mut commands,
+            &mut events,
+            &mut names,
+            &ready.room_id,
+            self_id,
+            args.share_audio,
+        )
+        .await
+        {
+            eprintln!("vorcall-probe: {reason}");
+            return 2;
+        }
+        let bitrate_kbps = args
+            .bitrate_kbps
+            .unwrap_or_else(|| share::default_bitrate_kbps(args.share_size, args.share_fps));
+        sharing = Some(share::start_share(
+            engine.sender(),
+            share::SharePlan {
+                width: args.share_size.0,
+                height: args.share_size.1,
+                fps: args.share_fps,
+                bitrate_kbps,
+                threads: args.encode_threads,
+                seconds,
+                audio: args.share_audio,
+            },
+        ));
+    }
+
+    let mut watching = args
+        .watch
+        .clone()
+        .map(|user| share::WatchPlan::new(user, ready.room_id.clone(), started + WATCH_TIMEOUT));
+
     let heard = listen(
-        engine.playout(),
+        &engine,
+        &mut commands,
         &mut events,
         &mut names,
+        watching.as_mut(),
         started + Duration::from_secs(args.listen_seconds),
     )
     .await;
 
     let stats = engine.stats();
+
+    let share = sharing.map(|handles| {
+        let outcome = handles.join();
+        ShareReport {
+            frames_encoded: outcome.frames_encoded,
+            keyframes: outcome.keyframes,
+            keyframe_requests: outcome.keyframe_requests,
+            encode_fps: outcome.encode_fps(),
+            kbps: outcome.kbps(),
+            watchers_max: heard.watchers_max,
+            bytes: outcome.bytes,
+            threads: outcome.threads,
+            skipped: outcome.skipped,
+        }
+    });
+    if args.share_seconds.is_some() {
+        let _ = commands
+            .send(Command::StopShare {
+                room_id: ready.room_id.clone(),
+            })
+            .await;
+    }
+
+    let mut watch_confirmed = true;
+    let watch = watching.map(|plan| {
+        watch_confirmed = plan.confirmed();
+        let (user, user_id) = (plan.user.clone(), plan.user_id().unwrap_or_default());
+        let decoded = plan.finish();
+        WatchReport {
+            user,
+            user_id,
+            pictures: decoded.pictures,
+            keyframes: decoded.keyframes,
+            dropped: stats.video.dropped,
+            decode_errors: decoded.decode_errors,
+            first_picture_ms: decoded.first_picture_ms,
+            width: decoded.width,
+            height: decoded.height,
+            decode_fps: decoded.decode_fps(),
+            keyframe_requests_sent: stats.video.keyframe_requests,
+            share_tone_frames: heard.share_tone_frames,
+        }
+    });
+    if watch.is_some() {
+        let _ = commands
+            .send(Command::UnwatchShare {
+                room_id: ready.room_id.clone(),
+            })
+            .await;
+    }
     let sent = sending.await.unwrap_or_default();
     tracing::debug!(
         frames_sent = sent.sent,
@@ -310,6 +449,8 @@ async fn probe(args: Args) -> i32 {
             })
             .collect(),
         speaking_events: heard.speaking,
+        share,
+        watch,
     };
 
     println!("{}", report.render());
@@ -329,7 +470,71 @@ async fn probe(args: Args) -> i32 {
         );
         return 1;
     }
+    if !watch_confirmed {
+        eprintln!(
+            "vorcall-probe: no watch of {} was confirmed within {}s",
+            args.watch.unwrap_or_default(),
+            WATCH_TIMEOUT.as_secs()
+        );
+        return 1;
+    }
+    if args.expect_video && report.pictures() < MIN_PICTURES {
+        tracing::error!(
+            pictures = report.pictures(),
+            "--expect-video but almost no picture was decoded"
+        );
+        return 1;
+    }
+    if args.expect_share_audio && report.share_tone_seconds() < 1.0 {
+        tracing::error!(
+            share_tone_seconds = report.share_tone_seconds(),
+            "--expect-share-audio but no share tone was heard"
+        );
+        return 1;
+    }
     0
+}
+
+/// Announces the local share and waits for the server to echo it back, which is
+/// what makes the room offer it to watchers.
+async fn start_share(
+    commands: &mut mpsc::Sender<Command>,
+    events: &mut mpsc::Receiver<Event>,
+    names: &mut HashMap<u32, (i64, String)>,
+    room_id: &str,
+    self_id: i64,
+    audio: bool,
+) -> Result<(), String> {
+    if commands
+        .send(Command::StartShare {
+            room_id: room_id.to_owned(),
+            audio,
+        })
+        .await
+        .is_err()
+    {
+        return Err("the connection loop is gone".to_owned());
+    }
+
+    let deadline = tokio::time::Instant::now() + SHARE_START_TIMEOUT;
+    loop {
+        match timeout_at(deadline, events.next()).await {
+            Ok(Some(Event::ShareStarted { user_id, .. })) if user_id == self_id => return Ok(()),
+            Ok(Some(Event::ServerError { code, detail, .. })) if matches!(code, 15..=17) => {
+                return Err(format!("the server refused the share ({code}): {detail}"));
+            }
+            Ok(Some(other)) => track_members(names, &other),
+            Ok(None) => {
+                return Err("the connection loop stopped before the share started".to_owned());
+            }
+            Err(_) => {
+                return Err(format!(
+                    "no ShareStarted within {}s",
+                    SHARE_START_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 /// Keeps the command sender alive for the whole run: `run` stops as soon as the
@@ -356,6 +561,7 @@ async fn wait_for_voice(
     events: &mut mpsc::Receiver<Event>,
     names: &mut HashMap<u32, (i64, String)>,
     room: &str,
+    share_flow: bool,
 ) -> Result<VoiceReady, String> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
 
@@ -384,7 +590,11 @@ async fn wait_for_voice(
             Event::Disconnected { reason, retry_in } => {
                 tracing::warn!(%reason, ?retry_in, "disconnected before voice was ready");
             }
-            Event::ServerError { code, detail, .. } if matches!(code, 5..=7) => {
+            // 15..=17 are the share refusals, fatal only to a run that is
+            // about to share or watch.
+            Event::ServerError { code, detail, .. }
+                if matches!(code, 5..=7) || (share_flow && matches!(code, 15..=17)) =>
+            {
                 return Err(format!(
                     "the server refused the voice join ({code}): {detail}"
                 ));
@@ -420,46 +630,92 @@ async fn wait_for_voice(
 struct Heard {
     decoded_frames: u64,
     tone_frames: u64,
+    share_tone_frames: u64,
+    watchers_max: u32,
     speaking: Vec<SpeakingEvent>,
     link_lost: bool,
 }
 
 /// Pulls a frame out of the playout every 20 ms — even while nobody speaks, so
-/// the jitter buffers keep draining — and follows the room in parallel.
+/// the jitter buffers keep draining — and follows the room in parallel. Under
+/// `--watch` it also drives the watch: asks for the sharer's stream once they
+/// are known to be sharing, and starts decoding when the server confirms it.
 async fn listen(
-    playout: Arc<Mutex<Playout>>,
+    engine: &MediaEngine,
+    commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
     names: &mut HashMap<u32, (i64, String)>,
+    mut watch: Option<&mut share::WatchPlan>,
     deadline: Instant,
 ) -> Heard {
+    let playout = engine.playout();
     let mut heard = Heard::default();
     let mut ticker = interval(Duration::from_millis(FRAME_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut frame = [0.0f32; FRAME_SAMPLES];
+    let mut frame = [0.0f32; STEREO_FRAME_SAMPLES];
+    let mut mono = [0.0f32; FRAME_SAMPLES];
     let deadline = tokio::time::Instant::from_std(deadline);
 
     loop {
+        // An unconfirmed watch is given its full timeout even when it outlasts
+        // --listen-seconds: without it there is nothing to measure.
+        let until = match watch.as_deref() {
+            Some(plan) if !plan.confirmed() => {
+                deadline.max(tokio::time::Instant::from_std(plan.confirm_by))
+            }
+            _ => deadline,
+        };
+
         tokio::select! {
-            () = sleep_until(deadline) => break,
+            () = sleep_until(until) => break,
             _ = ticker.tick() => {
                 let speakers = {
                     let mut playout = playout
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    playout.next_frame(&mut frame)
+                    playout.next_stereo_frame(&mut frame)
                 };
+                // A share's audio is mixed in without counting as a speaker, so
+                // it is measured on its own.
+                if share::is_share_tone(&frame) {
+                    heard.share_tone_frames += 1;
+                }
                 if speakers > 0 {
                     heard.decoded_frames += 1;
-                    if rms(&frame) > TONE_RMS {
+                    share::downmix(&frame, &mut mono);
+                    if rms(&mono) > TONE_RMS {
                         heard.tone_frames += 1;
                     }
                 }
             }
             event = events.next() => {
                 let Some(event) = event else { break };
+                if let Some(plan) = watch.as_deref_mut() {
+                    plan.note(&event);
+                }
                 match event {
                     Event::Speaking { user_id, speaking, .. } => {
                         heard.speaking.push(SpeakingEvent { user_id, speaking });
+                    }
+                    Event::ShareWatchers { count, .. } => {
+                        heard.watchers_max = heard.watchers_max.max(count);
+                    }
+                    Event::WatchState { user_id: Some(user_id), .. } => {
+                        if let Some(plan) = watch.as_deref_mut() {
+                            let ssrc = names
+                                .iter()
+                                .find(|(_, (id, _))| *id == user_id)
+                                .map(|(ssrc, _)| *ssrc);
+                            if ssrc.is_none() {
+                                tracing::warn!(user_id, "watching someone with no known ssrc");
+                            }
+                            engine.watch(ssrc);
+                            plan.confirm(user_id, engine.take_access_units());
+                            tracing::info!(user_id, ?ssrc, "the server confirmed the watch");
+                        }
+                    }
+                    Event::ServerError { code, detail, .. } if matches!(code, 15..=17) => {
+                        tracing::error!(code, %detail, "the server refused a share command");
                     }
                     Event::Disconnected { reason, retry_in } => {
                         tracing::warn!(%reason, ?retry_in, "disconnected during the run");
@@ -467,6 +723,14 @@ async fn listen(
                         break;
                     }
                     other => track_members(names, &other),
+                }
+
+                if let Some(plan) = watch.as_deref_mut()
+                    && let Some(user_id) = plan.pending_request(names)
+                {
+                    let room_id = plan.room_id.clone();
+                    tracing::info!(user_id, user = %plan.user, "asking to watch a share");
+                    let _ = commands.send(Command::WatchShare { room_id, user_id }).await;
                 }
             }
         }
@@ -574,8 +838,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
     let mut tone_amplitude = DEFAULT_TONE_AMPLITUDE;
     let mut vad = false;
     let mut vad_threshold = vorcall_voice::gate::DEFAULT_THRESHOLD_DB;
+    let mut share_seconds = None;
+    let mut share_audio = false;
+    let mut share_size = (1280u32, 720u32);
+    let mut share_fps = FrameRate::F30;
+    let mut encode_threads = 1u16;
+    let mut bitrate_kbps = None;
+    let mut watch = None;
     let mut expect_peer = false;
     let mut expect_silence = false;
+    let mut expect_video = false;
+    let mut expect_share_audio = false;
 
     let mut args = args.peekable();
     while let Some(flag) = args.next() {
@@ -583,6 +856,33 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
             "--help" | "-h" => return Ok(None),
             "--expect-peer" => expect_peer = true,
             "--expect-silence" => expect_silence = true,
+            "--expect-video" => expect_video = true,
+            "--expect-share-audio" => expect_share_audio = true,
+            "--share-audio" => share_audio = true,
+            "--share-seconds" => share_seconds = Some(number(&flag, &mut args)?),
+            "--watch" => watch = Some(value(&flag, &mut args)?),
+            "--share-size" => share_size = share::parse_size(&value(&flag, &mut args)?)?,
+            "--share-fps" => {
+                let raw = number(&flag, &mut args)?;
+                share_fps = u32::try_from(raw)
+                    .ok()
+                    .and_then(FrameRate::from_hz)
+                    .ok_or_else(|| format!("--share-fps wants 15, 30 or 60, got {raw}"))?;
+            }
+            "--encode-threads" => {
+                let raw = number(&flag, &mut args)?;
+                encode_threads = u16::try_from(raw)
+                    .ok()
+                    .filter(|threads| *threads >= 1)
+                    .ok_or_else(|| format!("--encode-threads wants 1 or more, got {raw}"))?;
+            }
+            "--bitrate-kbps" => {
+                let raw = number(&flag, &mut args)?;
+                bitrate_kbps =
+                    Some(u32::try_from(raw).map_err(|_| {
+                        format!("--bitrate-kbps wants a smaller number, got {raw}")
+                    })?);
+            }
             "--vad" => vad = true,
             "--username" => username = Some(value(&flag, &mut args)?),
             "--password" => password = Some(value(&flag, &mut args)?),
@@ -625,6 +925,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
     if listen_seconds < send_seconds {
         return Err("--listen-seconds cannot be shorter than --send-seconds".to_owned());
     }
+    if share_seconds.is_some() && watch.is_some() {
+        return Err("--share-seconds and --watch cannot be used together".to_owned());
+    }
+    if share_seconds.is_some_and(|seconds| seconds > listen_seconds) {
+        return Err("--listen-seconds cannot be shorter than --share-seconds".to_owned());
+    }
+    if watch.as_ref().is_some_and(String::is_empty) {
+        return Err("--watch cannot be empty".to_owned());
+    }
 
     Ok(Some(Args {
         username,
@@ -636,8 +945,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
         tone_amplitude,
         vad,
         vad_threshold,
+        share_seconds,
+        share_audio,
+        share_size,
+        share_fps,
+        encode_threads,
+        bitrate_kbps,
+        watch,
         expect_peer,
         expect_silence,
+        expect_video,
+        expect_share_audio,
     }))
 }
 

@@ -8,6 +8,7 @@
 //! - [`jitter`] — one adaptive buffer per remote speaker, reordering and
 //!   absorbing network jitter, reporting losses to the codec so it can conceal.
 //! - [`playout`] — every remote speaker decoded and summed into one frame.
+//! - [`video`] — screen-share access units cut into datagrams and reassembled.
 //! - [`engine`] — the UDP socket, the send path, keepalive pings and statistics.
 //! - [`cleanup`] — on the capture side instead: echo cancellation, noise
 //!   suppression and automatic gain, applied before anything else sees a frame.
@@ -30,8 +31,11 @@ pub mod jitter;
 pub mod packet;
 pub mod playout;
 pub mod tone;
+pub mod video;
 
-pub use cleanup::{CleanupSettings, EchoMetrics, InputCleanup};
+pub use cleanup::{CleanupSettings, EchoMetrics, InputCleanup, ShareCleanup};
+pub use codec::{STEREO_FRAME_SAMPLES, StereoDecoder, StereoEncoder};
 pub use engine::{FrameSender, Link, MediaConfig, MediaEngine, Stats};
 pub use gate::{GateDecision, NoiseGate};
 pub use playout::{PeerStats, Playout};
+pub use video::{AccessUnit, Depacketizer, FragmentHeader, VideoStats};

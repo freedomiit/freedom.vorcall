@@ -13,9 +13,11 @@
 //! Every cut frame first passes through the [`InputCleanup`] chain, so the
 //! gate, the level meter and the encoder all see the cleaned audio.
 //! Playback runs the other way: a single infinite [`VoiceSource`] sits in the
-//! rodio mixer and pulls mixed frames from [`Playout`], which the engine's
-//! receive task keeps fed; that source also keeps what it played, which is the
-//! far-end reference the echo canceller subtracts from the microphone.
+//! rodio mixer and pulls mixed stereo frames from [`Playout`], which the
+//! engine's receive task keeps fed; that source also keeps the mono downmix of
+//! what it played in two rings, the far-end reference the microphone's echo
+//! canceller subtracts here and the one a screen share's own canceller
+//! subtracts on its thread.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -35,7 +37,7 @@ use vorcall_voice::cleanup::FAR_END_MAX_SAMPLES;
 use vorcall_voice::codec::Encoder;
 use vorcall_voice::{
     CleanupSettings, FRAME_SAMPLES, FrameSender, GateDecision, InputCleanup, NoiseGate, Playout,
-    SAMPLE_RATE,
+    SAMPLE_RATE, STEREO_FRAME_SAMPLES,
 };
 
 /// How often the thread wakes up to cut frames when no command arrives. Well
@@ -153,6 +155,7 @@ pub enum AudioEvent {
 #[derive(Clone)]
 pub struct AudioHandle {
     commands: Sender<AudioCommand>,
+    share_far_end: Arc<Mutex<VecDeque<f32>>>,
 }
 
 impl AudioHandle {
@@ -163,6 +166,13 @@ impl AudioHandle {
             tracing::warn!("the audio thread is gone, dropping the command");
         }
     }
+
+    /// The mono downmix of everything the mixer plays, for a screen share's own
+    /// echo canceller. It is the audio thread that fills it, so the ring
+    /// outlives any one share and the share thread only ever drains it.
+    pub fn share_far_end(&self) -> Arc<Mutex<VecDeque<f32>>> {
+        self.share_far_end.clone()
+    }
 }
 
 /// Spawns the dedicated audio thread. The thread exits once every
@@ -170,19 +180,31 @@ impl AudioHandle {
 pub fn spawn_audio_thread() -> (AudioHandle, async_mpsc::UnboundedReceiver<AudioEvent>) {
     let (commands, requests) = std::sync::mpsc::channel();
     let (events, updates) = async_mpsc::unbounded();
+    let share_far_end = Arc::new(Mutex::new(VecDeque::with_capacity(FAR_END_MAX_SAMPLES)));
 
+    let played = share_far_end.clone();
     let spawned = std::thread::Builder::new()
         .name("vorcall-audio".to_string())
-        .spawn(move || run(requests, events));
+        .spawn(move || run(requests, events, played));
     if let Err(error) = spawned {
         tracing::error!(%error, "cannot start the audio thread");
     }
 
-    (AudioHandle { commands }, updates)
+    (
+        AudioHandle {
+            commands,
+            share_far_end,
+        },
+        updates,
+    )
 }
 
-fn run(requests: Receiver<AudioCommand>, events: async_mpsc::UnboundedSender<AudioEvent>) {
-    let mut state = AudioThread::new(events);
+fn run(
+    requests: Receiver<AudioCommand>,
+    events: async_mpsc::UnboundedSender<AudioEvent>,
+    share_far_end: Arc<Mutex<VecDeque<f32>>>,
+) {
+    let mut state = AudioThread::new(events, share_far_end);
     loop {
         match requests.recv_timeout(TICK) {
             Ok(command) => state.handle(command),
@@ -225,6 +247,9 @@ struct AudioThread {
     /// and drained here into the canceller. Bounded like the capture ring: a
     /// stalled thread loses reference audio, never builds up delay.
     far_end: Arc<Mutex<VecDeque<f32>>>,
+    /// The same reference for a screen share's loopback canceller, drained on
+    /// the share thread instead of here: two consumers, two rings.
+    share_far_end: Arc<Mutex<VecDeque<f32>>>,
     far_end_scratch: Vec<f32>,
     /// The frame as captured, restored if the chain fails mid-frame.
     raw_frame: [f32; FRAME_SAMPLES],
@@ -255,7 +280,10 @@ struct Capture {
 }
 
 impl AudioThread {
-    fn new(events: async_mpsc::UnboundedSender<AudioEvent>) -> Self {
+    fn new(
+        events: async_mpsc::UnboundedSender<AudioEvent>,
+        share_far_end: Arc<Mutex<VecDeque<f32>>>,
+    ) -> Self {
         let transmit = TransmitSettings::default();
         Self {
             events,
@@ -276,6 +304,7 @@ impl AudioThread {
             cleanup: None,
             cleanup_failed: false,
             far_end: Arc::new(Mutex::new(VecDeque::with_capacity(FAR_END_MAX_SAMPLES))),
+            share_far_end,
             far_end_scratch: Vec::with_capacity(FAR_END_MAX_SAMPLES),
             raw_frame: [0.0; FRAME_SAMPLES],
             metrics_at: None,
@@ -388,6 +417,7 @@ impl AudioThread {
             playout,
             self.deafened.clone(),
             self.far_end.clone(),
+            self.share_far_end.clone(),
         ));
 
         self.output = Some(sink);
@@ -492,6 +522,8 @@ impl AudioThread {
         self.cleanup_failed = false;
         self.metrics_at = None;
         lock(&self.far_end).clear();
+        // Nothing is playing, so neither canceller has a reference any more.
+        lock(&self.share_far_end).clear();
         self.queue.clear();
         self.last_sent = None;
         self.gate = NoiseGate::new(self.transmit.threshold_db);
@@ -684,15 +716,21 @@ impl AudioThread {
     }
 }
 
-/// One infinite mono source in the rodio mixer; rodio resamples it to whatever
-/// the speakers run at.
+/// One infinite stereo source in the rodio mixer; rodio resamples it to
+/// whatever the speakers run at. Stereo because a watched screen share's audio
+/// keeps its own left and right, while the voices sit in the middle.
 struct VoiceSource {
     playout: Arc<Mutex<Playout>>,
     deafened: Arc<AtomicBool>,
-    /// Every frame handed to the mixer, for the echo canceller on the audio
-    /// thread to subtract from what the microphone hears.
+    /// What the mixer was given, for the echo canceller on the audio thread to
+    /// subtract from what the microphone hears.
     far_end: Arc<Mutex<VecDeque<f32>>>,
-    frame: [f32; FRAME_SAMPLES],
+    /// The same, for the canceller on the share thread: two consumers on two
+    /// threads, so one of them draining must never starve the other.
+    share_far_end: Arc<Mutex<VecDeque<f32>>>,
+    frame: [f32; STEREO_FRAME_SAMPLES],
+    /// `frame` in mono, which is what both cancellers take as a reference.
+    downmix: [f32; FRAME_SAMPLES],
     cursor: usize,
 }
 
@@ -701,14 +739,17 @@ impl VoiceSource {
         playout: Arc<Mutex<Playout>>,
         deafened: Arc<AtomicBool>,
         far_end: Arc<Mutex<VecDeque<f32>>>,
+        share_far_end: Arc<Mutex<VecDeque<f32>>>,
     ) -> Self {
         Self {
             playout,
             deafened,
             far_end,
-            frame: [0.0; FRAME_SAMPLES],
+            share_far_end,
+            frame: [0.0; STEREO_FRAME_SAMPLES],
+            downmix: [0.0; FRAME_SAMPLES],
             // Past the end, so the first sample pulls a frame.
-            cursor: FRAME_SAMPLES,
+            cursor: STEREO_FRAME_SAMPLES,
         }
     }
 }
@@ -717,22 +758,19 @@ impl Iterator for VoiceSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
-        if self.cursor >= FRAME_SAMPLES {
-            lock(&self.playout).next_frame(&mut self.frame);
+        if self.cursor >= STEREO_FRAME_SAMPLES {
+            lock(&self.playout).next_stereo_frame(&mut self.frame);
             self.cursor = 0;
 
-            let deafened = self.deafened.load(Ordering::Relaxed);
-            let mut far_end = lock(&self.far_end);
-            let overflow = (far_end.len() + FRAME_SAMPLES).saturating_sub(FAR_END_MAX_SAMPLES);
-            let dropped = overflow.min(far_end.len());
-            far_end.drain(..dropped);
             // The reference has to be what the speakers are given, and deafened
             // means silence.
-            if deafened {
-                far_end.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES));
+            if self.deafened.load(Ordering::Relaxed) {
+                self.downmix.fill(0.0);
             } else {
-                far_end.extend(self.frame.iter().copied());
+                downmix(&self.frame, &mut self.downmix);
             }
+            push_far_end(&self.far_end, &self.downmix);
+            push_far_end(&self.share_far_end, &self.downmix);
         }
         let sample = self.frame[self.cursor];
         self.cursor += 1;
@@ -754,8 +792,8 @@ impl rodio::Source for VoiceSource {
     }
 
     fn channels(&self) -> rodio::ChannelCount {
-        const MONO: rodio::ChannelCount = NonZero::new(1).unwrap();
-        MONO
+        const STEREO: rodio::ChannelCount = NonZero::new(2).unwrap();
+        STEREO
     }
 
     fn sample_rate(&self) -> rodio::SampleRate {
@@ -766,6 +804,25 @@ impl rodio::Source for VoiceSource {
     fn total_duration(&self) -> Option<Duration> {
         None
     }
+}
+
+/// Folds one played stereo frame into the mono reference both echo cancellers
+/// subtract.
+fn downmix(frame: &[f32; STEREO_FRAME_SAMPLES], out: &mut [f32; FRAME_SAMPLES]) {
+    for (mono, pair) in out.iter_mut().zip(frame.as_chunks::<2>().0) {
+        *mono = (pair[0] + pair[1]) / 2.0;
+    }
+}
+
+/// Appends one played frame to a far-end ring, keeping only the newest
+/// [`FAR_END_MAX_SAMPLES`]: a consumer that stalls loses reference audio rather
+/// than letting the ring grow.
+fn push_far_end(ring: &Mutex<VecDeque<f32>>, samples: &[f32]) {
+    let mut ring = lock(ring);
+    let overflow = (ring.len() + samples.len()).saturating_sub(FAR_END_MAX_SAMPLES);
+    let dropped = overflow.min(ring.len());
+    ring.drain(..dropped);
+    ring.extend(samples.iter().copied());
 }
 
 /// A sinc resampler from the microphone's rate up or down to 48 kHz, fed 20 ms
@@ -839,12 +896,12 @@ impl Resample {
 /// The last time something was logged, so a failure on every frame still only
 /// costs one line a second.
 #[derive(Default)]
-struct Throttle {
+pub struct Throttle {
     last: Option<Instant>,
 }
 
 impl Throttle {
-    fn allow(&mut self, now: Instant) -> bool {
+    pub fn allow(&mut self, now: Instant) -> bool {
         if self
             .last
             .is_none_or(|last| now.saturating_duration_since(last) >= WARN_INTERVAL)
@@ -858,7 +915,7 @@ impl Throttle {
 
 /// A poisoned lock still holds a usable ring or playout, and losing the call
 /// over it would be worse than carrying on.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -959,4 +1016,96 @@ fn chain(error: &dyn Error) -> String {
         source = cause.source();
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rodio::Source as _;
+
+    struct Mixed {
+        source: VoiceSource,
+        deafened: Arc<AtomicBool>,
+        far_end: Arc<Mutex<VecDeque<f32>>>,
+        share_far_end: Arc<Mutex<VecDeque<f32>>>,
+    }
+
+    fn mixed() -> Mixed {
+        let deafened = Arc::new(AtomicBool::new(false));
+        let far_end = Arc::new(Mutex::new(VecDeque::new()));
+        let share_far_end = Arc::new(Mutex::new(VecDeque::new()));
+        Mixed {
+            source: VoiceSource::new(
+                Arc::new(Mutex::new(Playout::new())),
+                deafened.clone(),
+                far_end.clone(),
+                share_far_end.clone(),
+            ),
+            deafened,
+            far_end,
+            share_far_end,
+        }
+    }
+
+    /// One 20 ms frame of playout, as rodio pulls it: two samples per frame.
+    fn pull(source: &mut VoiceSource, frames: usize) -> Vec<f32> {
+        (0..frames * STEREO_FRAME_SAMPLES)
+            .map(|_| source.next().expect("the source is infinite"))
+            .collect()
+    }
+
+    #[test]
+    fn the_mixer_source_is_interleaved_stereo_at_48_khz() {
+        let mixed = mixed();
+        assert_eq!(mixed.source.channels().get(), 2);
+        assert_eq!(mixed.source.sample_rate().get(), SAMPLE_RATE);
+    }
+
+    #[test]
+    fn a_played_frame_is_averaged_into_one_mono_reference() {
+        let mut frame = [0.0f32; STEREO_FRAME_SAMPLES];
+        for (index, pair) in frame.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            // Left and right are deliberately different, and opposite at the
+            // start: a reference that took one channel only would show it.
+            *pair = if index == 0 { [1.0, -1.0] } else { [0.5, 0.25] };
+        }
+
+        let mut mono = [0.0f32; FRAME_SAMPLES];
+        downmix(&frame, &mut mono);
+
+        assert_eq!(mono[0], 0.0);
+        for sample in &mono[1..] {
+            assert_eq!(*sample, 0.375);
+        }
+    }
+
+    #[test]
+    fn every_played_frame_reaches_both_far_end_rings() {
+        let mut mixed = mixed();
+        pull(&mut mixed.source, 2);
+
+        // One mono sample per stereo frame played, in each ring.
+        assert_eq!(lock(&mixed.far_end).len(), 2 * FRAME_SAMPLES);
+        assert_eq!(lock(&mixed.share_far_end).len(), 2 * FRAME_SAMPLES);
+
+        // Past 200 ms both rings hold the newest reference and nothing older,
+        // so neither consumer's backlog can grow without bound.
+        pull(&mut mixed.source, 12);
+        assert_eq!(lock(&mixed.far_end).len(), FAR_END_MAX_SAMPLES);
+        assert_eq!(lock(&mixed.share_far_end).len(), FAR_END_MAX_SAMPLES);
+    }
+
+    #[test]
+    fn a_deafened_listener_hears_zeros_and_the_playout_still_drains() {
+        let mut mixed = mixed();
+        mixed.deafened.store(true, Ordering::Relaxed);
+
+        let played = pull(&mut mixed.source, 2);
+        assert!(played.iter().all(|sample| *sample == 0.0));
+
+        // Pulled all the same, or the jitter buffers would fill up and
+        // undeafening would start with a burst of stale audio.
+        assert_eq!(lock(&mixed.far_end).len(), 2 * FRAME_SAMPLES);
+        assert_eq!(lock(&mixed.share_far_end).len(), 2 * FRAME_SAMPLES);
+    }
 }
