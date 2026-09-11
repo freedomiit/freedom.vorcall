@@ -12,3 +12,5 @@ dist/
 .idea/
 # Local release manifests and assets read by the dev server (Vorcall:ReleasesDir = ../releases); never committed
 /releases/
+# Local attachment storage read by the dev server (Vorcall:AttachmentsDir = ../attachments); never committed
+/attachments/

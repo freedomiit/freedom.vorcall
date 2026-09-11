@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.2.0"
+version = "0.3.0"
 license = "MIT"
 
 # Oldest client version the current release still lets chat. Clients below it
@@ -22,7 +22,14 @@ directories = "6"
 futures = "0.3"
 # Already in the lock through zbus; used directly for key and signature encoding.
 hex = "0.4"
-iced = { version = "0.14", features = ["tokio", "canvas"] }
+iced = { version = "0.14", features = ["tokio", "canvas", "image-without-codecs"] }
+# Attachments are decoded off the UI thread, so iced only ever receives RGBA.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
 notify-rust = "4.18"
 opus-rs = "=0.1.33"
 prost = "0.14"
@@ -33,6 +40,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
     "http2",
 ] }
+# The native file dialog for picking attachments; portal-backed on Linux.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # Already in the lock as the rustls provider; used directly for SHA-256 and Ed25519.
 ring = "0.17"
 rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
@@ -61,7 +70,28 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 webpki-roots = "0.26"
 
+# Global push-to-talk input, one backend per platform. All of these but ashpd
+# already sit in the lock as transitive dependencies of winit, rustix or zbus.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+core-graphics = "0.23"
+core-foundation = "0.9"
+x11rb = { version = "0.13", features = ["xinput"] }
+libc = "0.2"
+# `global_shortcuts` is what carries the portal this crate binds against; the
+# module does not exist without it.
+ashpd = { version = "0.13", default-features = false, features = [
+    "tokio",
+    "global_shortcuts",
+] }
+
 vorcall-core = { path = "crates/vorcall-core" }
+vorcall-hotkey = { path = "crates/vorcall-hotkey" }
 vorcall-proto = { path = "crates/vorcall-proto" }
 vorcall-voice = { path = "crates/vorcall-voice" }
 

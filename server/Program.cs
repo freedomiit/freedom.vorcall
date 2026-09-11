@@ -27,6 +27,10 @@ using (var scope = app.Services.CreateScope())
     db.Database.Migrate();
 }
 
+// Presence is served from an in-memory mirror of the room tables, so it is filled from the
+// migrated schema before the first connection can ask about a room.
+await app.Services.GetRequiredService<ConnectionRegistry>().LoadRoomsAsync();
+
 // nginx is the only thing that can reach this port: docker publishes it on host loopback. That
 // is why the known-proxy list stays empty (which skips the check entirely) and why trusting the
 // immediate hop is enough. ForwardLimit = 1 keeps only the entry nginx appends, so a client that
@@ -47,8 +51,10 @@ app.UseWhen(
     context => context.Request.Path.StartsWithSegments("/ws") || context.Request.Path.StartsWithSegments("/api"),
     keyed => keyed.UseMiddleware<ServerKeyMiddleware>());
 
-app.UseRateLimiter();
 app.UseAuthentication();
+
+// The upload policy partitions on the bearer's user id, so the principal has to exist first.
+app.UseRateLimiter();
 app.UseAuthorization();
 
 app.MapGet("/health", async (IDbContextFactory<AppDbContext> contextFactory, ILogger<Program> logger) =>
@@ -97,6 +103,7 @@ app.MapGet("/api/messages", MessagesEndpoints.GetPageAsync).RequireAuthorization
 UsersEndpoints.Map(app);
 AuthEndpoints.Map(app);
 UpdatesEndpoints.Map(app);
+AttachmentsEndpoints.Map(app);
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {

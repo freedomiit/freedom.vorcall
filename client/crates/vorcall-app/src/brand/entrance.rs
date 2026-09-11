@@ -382,6 +382,112 @@ mod tests {
         assert_eq!(variant_from(Some("bogus"), 0), Some(Variant::Rare));
     }
 
+    /// Whether `point` falls inside the polygon `ring`, shrunk about its centroid by
+    /// `shrink` so pixels straddling the edge stay out of the question.
+    fn inside(ring: &[[f32; 2]], shrink: f32, point: [f32; 2]) -> bool {
+        let n = ring.len() as f32;
+        let cx = ring.iter().map(|p| p[0]).sum::<f32>() / n;
+        let cy = ring.iter().map(|p| p[1]).sum::<f32>() / n;
+        let at = |p: [f32; 2]| [cx + (p[0] - cx) * shrink, cy + (p[1] - cy) * shrink];
+        let mut hit = false;
+        for i in 0..ring.len() {
+            let a = at(ring[i]);
+            let b = at(ring[(i + 1) % ring.len()]);
+            if (a[1] > point[1]) != (b[1] > point[1]) {
+                let x = a[0] + (point[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+                if point[0] < x {
+                    hit = !hit;
+                }
+            }
+        }
+        hit
+    }
+
+    fn skia_subpath(builder: &mut tiny_skia::PathBuilder, points: &[[f32; 2]]) {
+        let Some((first, rest)) = points.split_first() else {
+            return;
+        };
+        builder.move_to(first[0], first[1]);
+        for point in rest {
+            builder.line_to(point[0], point[1]);
+        }
+        builder.close();
+    }
+
+    /// The frame as `draw` fills it (every ring in one nonzero pass) at 1 px per unit,
+    /// without anti-aliasing so a pixel is painted exactly when its centre is inside.
+    fn rasterise(solids: &[[f32; 2]], counts: &[usize], eyes: &[&[[f32; 2]]]) -> tiny_skia::Pixmap {
+        let mut builder = tiny_skia::PathBuilder::new();
+        let mut start = 0;
+        for &count in counts {
+            skia_subpath(&mut builder, &solids[start..start + count]);
+            start += count;
+        }
+        for eye in eyes {
+            skia_subpath(&mut builder, eye);
+        }
+        let path = builder.finish().expect("the frame is a path");
+        let side = data::VIEW as u32;
+        let mut pixmap = tiny_skia::Pixmap::new(side, side).expect("a pixmap");
+        let mut paint = tiny_skia::Paint {
+            anti_alias: false,
+            ..Default::default()
+        };
+        paint.set_color_rgba8(255, 255, 255, 255);
+        pixmap.fill_path(
+            &path,
+            &paint,
+            tiny_skia::FillRule::Winding,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+        pixmap
+    }
+
+    /// The horns' roots and the swept slabs overlap the body; where two solids sit under
+    /// an eye a nonzero fill paints the hole in (it showed at the top of the near eye once
+    /// the creature had turned and the eye popped). The generator keeps the eyes clear;
+    /// this checks the frames it emitted, at every step of both variants.
+    #[test]
+    fn the_eyes_stay_holes_through_the_entrance() {
+        for variant in [Variant::Wink, Variant::Rare] {
+            let tracks = tracks_for(variant);
+            for step in 0..=60 {
+                let p = step as f32 / 60.0;
+                let solids = sample(tracks.solid, p);
+                let eyes = [sample(tracks.eye_far, p), sample(tracks.eye_near, p)];
+                let pixmap = rasterise(&solids, tracks.counts, &[&eyes[0], &eyes[1]]);
+                for (name, eye) in ["far", "near"].iter().zip(&eyes) {
+                    let span = |axis: usize| {
+                        let low = eye.iter().map(|p| p[axis]).fold(f32::MAX, f32::min);
+                        let high = eye.iter().map(|p| p[axis]).fold(f32::MIN, f32::max);
+                        (low.floor().max(0.0) as u32)..(high.ceil() as u32).min(data::VIEW as u32)
+                    };
+                    let mut checked = 0;
+                    for y in span(1) {
+                        for x in span(0) {
+                            let centre = [x as f32 + 0.5, y as f32 + 0.5];
+                            if !inside(eye, 0.9, centre) {
+                                continue;
+                            }
+                            checked += 1;
+                            let pixel = pixmap.pixel(x, y).expect("in range");
+                            assert_eq!(
+                                pixel.alpha(),
+                                0,
+                                "{variant:?} at p={p:.3}: the {name} eye is painted at ({x}, {y})"
+                            );
+                        }
+                    }
+                    assert!(
+                        checked > 50,
+                        "{variant:?} at p={p:.3}: {name} eye too small"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_clock_starts_on_the_first_tick() {
         let start = Instant::now();

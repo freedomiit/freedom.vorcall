@@ -54,8 +54,11 @@ internal static partial class Validation
         return true;
     }
 
+    // 48 rather than the slug's own 32: a DM id is dm-<user id>-<user id>, which two 19-digit
+    // ids stretch to 42 characters.
+    //
     // \A and \z rather than ^ and $: in .NET $ also matches just before a trailing newline,
-    // which would let "general\n" through the documented ^[a-z0-9-]{1,32}$ grammar.
-    [GeneratedRegex(@"\A[a-z0-9-]{1,32}\z")]
+    // which would let "general\n" through the documented ^[a-z0-9-]{1,48}$ grammar.
+    [GeneratedRegex(@"\A[a-z0-9-]{1,48}\z")]
     private static partial Regex RoomIdPattern();
 }

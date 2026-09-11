@@ -1,12 +1,12 @@
 # Vorcall
 
-A private chat for a friend group: one room, native Rust desktop client, .NET backend, protobuf over a WebSocket.
+A private chat for a friend group: rooms and DMs, native Rust desktop client, .NET backend, protobuf over a WebSocket.
 
 ## Status
 
-MVP. Present: invite-only accounts, one room (`general`), a presence sidebar, live messages, older history, notifications, voice rooms with push-to-talk.
+MVP. Present: invite-only accounts, a mandatory `general` room plus public rooms anyone can create or join and two-person DMs, a presence sidebar, live messages with reply/edit/delete and reactions, image attachments, unread and mention counts, older history, notifications, voice channels per room with push-to-talk (global per platform, with a window-focused fallback) or voice activation, plus per-user volume and mute.
 
-Deliberately absent: multiple text rooms, attachments, OAuth/2FA.
+Deliberately absent: private (invite-only) rooms, file attachments beyond images, OAuth/2FA.
 
 ## Repository layout
 
@@ -53,7 +53,7 @@ Since `.github/workflows/release.yml` now builds and signs releases for all thre
 scripts/build-client-linux.sh
 ```
 
-Output: `dist/vorcall-linux-x86_64`.
+Output: `dist/vorcall-linux-x86_64` and `dist/vorcall-linux-x86_64.tar.gz`, the first-install tarball: `scripts/package-client-linux.sh` packs the binary with its executable bit, the launcher entry and icon from `packaging/linux/`, and a per-user `install.sh`.
 
 ### Windows (cross-built from Linux)
 
@@ -61,18 +61,18 @@ Output: `dist/vorcall-linux-x86_64`.
 scripts/build-client-windows.sh
 ```
 
-Output: `dist/vorcall-windows-x86_64.exe`. The binary is unsigned: the first run needs a right-click "Open".
+Output: `dist/vorcall-windows-x86_64.exe`. The binary is unsigned: SmartScreen's "More info" → "Run anyway" on the first run. The per-user installer (`packaging/windows/vorcall.iss`, Inno Setup) is built only by CI on the Windows runner, with the icon `scripts/make-windows-icon.sh` renders on Linux.
 
 ### macOS
 
-CI now produces `vorcall-macos-aarch64` (Apple Silicon only, ad-hoc signed — see [Releases and updates](#releases-and-updates)). Building from source still works:
+CI produces two files for Apple Silicon (ad-hoc signed — see [Releases and updates](#releases-and-updates)): `vorcall-macos-aarch64.dmg`, the `Vorcall.app` bundle a friend installs, and the bare `vorcall-macos-aarch64` the updater fetches. Building from source still works, and `scripts/bundle-client-macos.sh` wraps the result the same way CI does (it needs `brew install librsvg` for the icon):
 
 ```
-cd client
-VORCALL_SERVER_KEY=<key> cargo build --release -p vorcall-app
+cd client && VORCALL_SERVER_KEY=<key> cargo build --release -p vorcall-app && cd ..
+scripts/bundle-client-macos.sh client/target/release/vorcall <version> dist
 ```
 
-Binary: `client/target/release/vorcall`.
+Binary: `client/target/release/vorcall`; bundle: `dist/Vorcall.app` and `dist/vorcall-macos-aarch64.dmg`.
 
 ### Client key and URL
 
@@ -149,9 +149,17 @@ Local:
 
 ## Voice
 
-One voice channel per text room. Join it from the sidebar; talk with push-to-talk (hold Ctrl by default, while the window is focused); mute and deafen are separate switches. The sidebar shows who is in voice and highlights who is speaking. Media rides a direct UDP path to the server host — not Cloudflare, not nginx — encrypted per voice session.
+One voice channel per text room. Join it from the sidebar; talk with push-to-talk (default Ctrl) or switch to voice activation; mute and deafen are separate switches. The sidebar shows who is in voice and highlights who is speaking. Media rides a direct UDP path to the server host — not Cloudflare, not nginx — encrypted per voice session.
 
-**Settings:** the "Settings" button in the header opens a full-screen page with the input device, the output device and the push-to-talk key ("Change", then press a key; Esc cancels). These are stored in `config.toml` as `input_device`, `output_device` and `ptt_key`.
+**Settings:** the "Settings" button in the header opens a full-screen page with the input device, the output device, the transmit mode, and (for push-to-talk) the key or mouse button to bind ("Change", then press a key or click a mouse button; Esc cancels). These are stored in `config.toml` as `input_device`, `output_device`, `transmit_mode` (`"push_to_talk"` or `"voice_activation"`) and `ptt_key` (e.g. `"Control"`, `"F8"`, `"a"`, `"MouseBack"`). A key bound by an earlier version that is not in the bindable list below (Enter or an arrow key, for example) keeps working while the window is focused, but system-wide capture needs one of the listed keys, so re-bind it in Settings.
+
+**Transmit modes:** "Push to talk" (default) sends while the bound key or mouse button is held. "Voice activation" opens a noise gate instead — a threshold slider (−60 to −20 dBFS, default −45) plus a live input level meter showing whether the gate is open; a 20 ms frame opens the gate once its RMS reaches the threshold and closes it 300 ms after dropping 6 dB below threshold, with each reopen starting a new talk spurt. Mute and Deafen work the same in both modes. Bindable inputs: Ctrl, Alt, Shift, Super, Space, Tab, Caps Lock, Insert, Delete, Home, End, Page Up/Down, F1–F24, ASCII letters and digits, and mouse Back, Forward and Middle (character keys assume the US layout on macOS).
+
+**Global capture:** push-to-talk listens system-wide, not only while the window is focused, through a per-platform backend: Windows low-level keyboard/mouse hooks, macOS a listen-only `CGEventTap` gated by the Input Monitoring permission, Linux X11 raw XInput2 events on the root window, and Linux Wayland the `org.freedesktop.portal.GlobalShortcuts` portal (KDE Plasma 5.27+, GNOME 48+, Hyprland — keyboard only, bound in the compositor's own dialog; `WAYLAND_DISPLAY` selects the portal backend over X11). When global capture is unavailable (no portal, permission denied, hook failure) the client silently falls back to window-focused push-to-talk; Settings shows the reason under the push-to-talk row with a Retry button, and the status line shows "PTT: window only".
+
+**macOS caveat:** the app bundle is ad-hoc signed, so the Input Monitoring grant is tied to that specific build and must be re-granted in System Settings → Privacy & Security → Input Monitoring after every update — until then push-to-talk is window-only. Caps Lock cannot be a global push-to-talk key on macOS: it arrives as a modifier-flag change, not a key event. F21–F24 also have no macOS key code, so those bindings stay window-only there too.
+
+**Per-user volume and mute:** click another member in the voice list to expand a volume slider (0–200%) and a Mute button for them. Both are local only — the server never learns about it — persisted in `config.toml` under `[peer_audio.<user id>]` (`volume`, `muted`) and re-applied whenever that user rejoins voice.
 
 **Network:** media goes over UDP 5005 to the server host (`VoiceReady` tells the client the exact host and port). Production needs an ingress rule for UDP 5005 in the OCI VCN security list **and** the host firewall step of `deploy/provision-host.sh`. Server config keys: `Vorcall__VoiceEnabled`, `Vorcall__VoicePort`, `Vorcall__VoiceHost` (all optional, with defaults). Local dev needs nothing extra: the relay binds `0.0.0.0:5005` as soon as the server starts.
 
@@ -170,11 +178,25 @@ VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/deb
 VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username bob --send-seconds 10 --listen-seconds 14 --expect-peer --tone-hz 660
 ```
 
-Each probe prints one JSON line to stdout: `packets_sent`/`packets_received`, `decoded_seconds` and `tone_seconds` (how much of the peer's tone was actually decoded), `gaps`/`late`, `rtt_ms` (min/avg/max/last/samples), `link`, one `peers` entry per remote ssrc (received/lost/late/decoded_frames/decoder_resets), and `speaking_events`. Exit codes: `0` ran, `1` `--expect-peer` heard less than 1 s of tone, `2` usage, sign-in, connection or media failure.
+Each probe prints one JSON line to stdout: `packets_sent`/`packets_received`, `decoded_seconds` and `tone_seconds` (how much of the peer's tone was actually decoded), `gaps`/`late`, `rtt_ms` (min/avg/max/last/samples), `link`, one `peers` entry per remote ssrc (received/lost/late/decoded_frames/decoder_resets), `speaking_events`, `frames_sent` (audio frames actually sent, excluding pings) and `frames_gated` (frames the voice-activation gate held back before encoding). Exit codes: `0` ran, `1` `--expect-peer` heard less than 1 s of tone or `--expect-silence` saw audio go out, `2` usage, sign-in, connection or media failure.
+
+Voice-activation flags: `--vad` runs the tone through the same noise gate the app uses before encoding, `--vad-threshold <db>` sets its threshold (default −45), `--tone-amplitude <0..1>` sets the tone's amplitude (default 0.3; `0` is digital silence), and `--expect-silence` exits 1 if any audio frame went out. Oracle recipe: `--vad --tone-amplitude 0 --expect-silence` exits 0 with `frames_sent: 0` (the gate holds silence back); `--tone-amplitude 0 --expect-silence` without `--vad` exits 1 (negative control — without the gate, silence still goes out); two probes run with `--vad --tone-amplitude 0.3 --expect-peer` hear each other normally.
 
 Against production, run the same two-terminal recipe with the two test accounts kept in the gitignored `client/.env.probe` (`export PROBE_A_USER=… PROBE_A_PASS=… PROBE_B_USER=… PROBE_B_PASS=…`), `VORCALL_SERVER_URL` left at its default, and the real key in `VORCALL_SERVER_KEY`.
 
-**Limits worth knowing:** 20 ms Opus frames at 48 kbps CBR; one voice channel (`general`); no echo cancellation (headsets recommended); no voice activation, only push-to-talk; push-to-talk only fires while the window is focused.
+**Limits worth knowing:** 20 ms Opus frames at 48 kbps CBR; one voice channel per room; no echo cancellation (headsets recommended); mouse-button push-to-talk bindings are window-only on Wayland (the portal is keyboard-only).
+
+## Rooms and messages
+
+`general` is created for every account and cannot be left. Beyond it, rooms are public: anyone can browse the room list and join with `CreateRoom`/`JoinRoom`; a room's id is a slug of its name (`"Team  Chat_2"` → `team-chat-2`), and there is no rename or delete. A DM is a two-person room opened with `OpenDm` (id `dm-<lower user id>-<higher user id>`); it cannot be left either, but the client can hide one from the room list until the next message arrives in it. Each room, DMs included, has its own voice channel.
+
+The room list pane shows a badge per room — grey for unread, red for a mention — kept by a server-persisted read cursor per user and room (`MarkRead`, debounced to one call per second); a room only counts as read while it is in view, at the bottom of the message list, in a focused window. History for a room loads on first view (`GET /api/messages?room=…`).
+
+Messages support a reply (`reply_to_id`, shown as a quoted excerpt of up to 120 characters), edit (author only) and delete (a tombstone: the row stays, its text/attachments/reactions are gone), and reactions from a fixed palette — 👍 ❤️ 😂 😮 😢 🔥 🎉 👀 — toggled per user and grouped by emoji. `VORCALL_TEXT_REACTIONS=1` renders that palette as text labels instead of emoji, for terminals or fonts that cannot draw them. Hovering a message in the app surfaces reply/react/edit/delete actions (delete asks for a second click). `<@id>` mention tokens are rendered as `@username` and autocompleted after typing `@`; a mention or a DM notifies unless that room is already in view in a focused window, and anything else notifies only when the window is unfocused. Message text is capped at 2000 characters; the client keeps at most 2000 messages per room in memory.
+
+Attachments are images only (png, jpeg, gif, webp), up to 8 MiB each and 4 per message, picked with a file dialog (`rfd`) or dragged and dropped, downscaled to 1600 px on the longest side for display and cached under the platform cache directory (`vorcall/attachments`, pruned to 500 MiB at startup by oldest modification time). They upload as a raw body to `POST /api/attachments?room=<id>` ahead of the message that references them (rate limited to 20 uploads per minute per user) and are stored on the server under `Vorcall:AttachmentsDir` (env `Vorcall__AttachmentsDir`, default `/attachments`) up to a total quota `Vorcall:AttachmentsMaxBytes` (env `Vorcall__AttachmentsMaxBytes`, default 2 GiB — uploads are refused with `507` once it would be exceeded). An upload never linked to a message within 1 hour is swept (first sweep 1 minute after boot, then every 10 minutes). Deleting a message removes its attachment files with it.
+
+See [`PROTOCOL.md`](PROTOCOL.md) § Rooms and presence, § Messages and § Attachments for the wire-level rules, and the limits table there for the full set of numbers.
 
 ## Protocol
 
@@ -187,6 +209,7 @@ See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limi
 - Deploy pipeline (`.github/workflows/deploy.yml`): a push to `main` builds an arm64 backend image on GitHub Actions, pushes it to `ghcr.io/freedomiit/vorcall-backend`, then copies `docker-compose.prod.yml` to the host and runs `docker compose pull && up -d` over SSH. The backend applies its own EF Core migrations on boot. A push to `main` deploys production immediately; there is no separate approval step.
 - The pre-shared door key lives only in the host's `.env` (`Vorcall__ServerKey`) and must be baked into client builds as `VORCALL_SERVER_KEY`. Rotating it means: generate a new value, update the host `.env`, restart the backend, and rebuild/redistribute the client with the new key.
 - `Vorcall:JwtSigningKey` (env `Vorcall__JwtSigningKey`) is required — base64 of 32 random bytes; the server refuses to boot without it. `.env.production.example` carries a placeholder and `deploy/provision-host.sh` generates a real value for fresh hosts; on an existing host, append it by hand (`openssl rand -base64 32`). Rotating it signs every client out within 15 minutes (the access token lifetime).
+- Image attachments live on the host under `$APP_DIR/attachments`, bind-mounted read-write into the backend as `/attachments` (`docker-compose.prod.yml`); `deploy/provision-host.sh` creates the directory. nginx has a dedicated `location /api/attachments` (`client_max_body_size 9m`, unbuffered proxying, 300 s timeouts) alongside `location /api/updates/` — both are applied to an existing host by re-running `deploy/provision-host.sh` after copying `deploy/` there.
 
 ## Releases and updates
 
@@ -201,7 +224,7 @@ A check fetches `/api/updates/manifest`, verifies its signature against the keys
 - **Left for the next launch:** a verified download next to the binary that was never applied (the app was closed first) is re-verified from disk and installed at the next start, before the window opens. When the install directory is not writable, the download lands in the user's local data directory instead; that copy is never applied automatically — the UI says where it is and asks to install it by hand.
 - Settings also shows `Version {current} ({platform})` and, when the manifest carries notes, "What's new in {version}".
 
-Platform swap mechanics: Linux and macOS rename the downloaded file over the running binary and re-exec — safe, because the kernel keeps the old inode alive for the process that is still running it. Windows cannot overwrite a running executable, so it moves `vorcall.exe` to `vorcall.exe.old`, moves the new file into its place and relaunches; `.old` is deleted the next time the new binary starts.
+Platform swap mechanics: Linux and macOS rename the downloaded file over the running binary and re-exec — safe, because the kernel keeps the old inode alive for the process that is still running it. On Linux the tarball's install script puts the binary at `~/.local/bin/vorcall`; on macOS it is `Vorcall.app/Contents/MacOS/vorcall`, so the swap happens inside the bundle and leaves the rest of it alone. Windows cannot overwrite a running executable, so it moves `vorcall.exe` to `vorcall.exe.old`, moves the new file into its place and relaunches; `.old` is deleted the next time the new binary starts.
 
 The updater is off entirely for a dev-key build, a debug build, when `VORCALL_NO_UPDATE` is set, or when `client/update-keys.pub` carries no keys — in each case Settings shows why instead of the Check button doing anything.
 
@@ -232,9 +255,9 @@ The workflow refuses to publish when: the tag does not equal the workspace versi
 
 Only the first build on each friend's machine is a manual hand-off — later builds arrive through the in-app updater described above.
 
-- **Linux:** `chmod +x vorcall-linux-x86_64` and run it from a directory the friend can write to (the updater replaces the file in place).
-- **Windows:** SmartScreen shows "Windows protected your PC" on first run — "More info" then "Run anyway". Updates the app downloads itself carry no Mark-of-the-Web, so this prompt does not come back.
-- **macOS (Apple Silicon only):** `xattr -d com.apple.quarantine vorcall-macos-aarch64 && chmod +x vorcall-macos-aarch64`, or right-click → Open once.
+- **Linux:** hand over `vorcall-linux-x86_64.tar.gz`, then `tar xzf vorcall-linux-x86_64.tar.gz && vorcall-linux-x86_64/install.sh`. No root: the binary lands in `~/.local/bin`, the launcher entry and icon under `~/.local/share`, and Vorcall shows up in the app launcher. `install.sh --uninstall` removes the same files. (The bare `vorcall-linux-x86_64` still works after a `chmod +x`, from any directory the friend can write to.)
+- **Windows:** hand over `vorcall-windows-x86_64-setup.exe`. SmartScreen shows "Windows protected your PC" — "More info" then "Run anyway". It installs per user under `%LocalAppData%\Programs\Vorcall` with a Start menu entry, no admin prompt, and the updater keeps replacing `vorcall.exe` there; uninstall from Settings → Apps. Updates the app downloads itself carry no Mark-of-the-Web, so the SmartScreen prompt does not come back. (The bare `vorcall-windows-x86_64.exe` still runs on its own as a portable copy.)
+- **macOS (Apple Silicon only):** hand over `vorcall-macos-aarch64.dmg` from the GitHub Release, not the bare binary (Finder opens that one in TextEdit). Open the image, drag `Vorcall.app` onto the Applications shortcut next to it, eject the image and launch the copy in Applications — the image is read-only, so an app started from it could not update itself. The app is ad-hoc signed, not notarised, so macOS blocks the first launch: on macOS 14 and earlier, right-click → Open, then "Open"; on macOS 15, open it once, dismiss the dialog, then System Settings → Privacy & Security → "Open Anyway". `xattr -dr com.apple.quarantine /Applications/Vorcall.app` in Terminal is the shortcut. The updater replaces the binary inside the bundle, so the app has to live where the account can write (Applications is fine for an administrator account).
 
 ### Update oracle
 
@@ -290,14 +313,25 @@ vorcall-probe apply-update --file PATH
 7. Hand-deliver 0.2.0 to each friend — the last manual install: the clients they are running now predate the updater and cannot pick it up themselves.
 8. The `Hello` frame changed (`client_version`/`client_platform`) — regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run the full smoke suite before pushing.
 
+## Rolling out the rooms release
+
+0.3.0 adds public rooms, DMs, reply/edit/delete, reactions and image attachments on top of `general`. `min_version` stays at 0.2.0: a client from the updates release keeps chatting in `general` without a rebuild, it just never sees the new frames (see [Forward compatibility](PROTOCOL.md#forward-compatibility)).
+
+1. Push `main` — this deploys; the backend applies the `AddRoomsAndRichMessages` migration (the `rooms`, `room_members`, `reactions` and `attachments` tables) on boot, and serves `/api/attachments/*`.
+2. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — creates the `attachments/` directory and installs the nginx `location /api/attachments` (see [Production](#production)).
+3. Verify with a client: create a room or open a DM, send a message with an image attachment, and confirm another member sees it.
+4. The proto changed — regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run the full smoke suite, which now covers rooms, DMs, rich messages (reply/edit/delete/reactions) and attachments, before cutting the release.
+5. `git tag -a v0.3.0 -m "..."` && `git push origin v0.3.0` (see [Cutting a release](#cutting-a-release)); leave `min_version` at 0.2.0 unless friends still on the pre-rooms build must be forced to update.
+6. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
+
 ## Development gates
 
 ```
-cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app
+cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app -p vorcall-hotkey
 ```
 
 ```
 dotnet build server/Vorcall.Server.csproj -warnaserror
 ```
 
-There are no automated tests in the MVP outside `vorcall-voice`, `vorcall-core`, `vorcall-release` and `vorcall-app`'s unit tests. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph.
+There are no automated tests in the MVP outside `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app` and `vorcall-hotkey`'s unit tests. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph.

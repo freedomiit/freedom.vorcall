@@ -16,11 +16,27 @@ public enum MembershipCheck
     Member,
 }
 
+// What an account may do with a room, asked before anything is written: a room the caller
+// cannot see must not cause a database round trip either.
+public enum RoomAccess
+{
+    UnknownRoom,
+    Stale,
+
+    // A DM the caller is not part of, whose existence is not admitted to anyone else.
+    Forbidden,
+    NotAMember,
+    Member,
+}
+
 public enum JoinOutcome
 {
     UnknownRoom,
     Stale,
-    AlreadyMember,
+    Forbidden,
+
+    // Already a persistent member: joining again is the client's resync primitive.
+    Resynced,
     Joined,
 }
 
@@ -28,8 +44,17 @@ public enum LeaveOutcome
 {
     UnknownRoom,
     Stale,
+
+    // general and DMs are permanent.
+    Forbidden,
     NotAMember,
     Left,
+}
+
+public enum CreateRoomOutcome
+{
+    Stale,
+    Created,
 }
 
 public enum JoinVoiceOutcome
@@ -55,6 +80,9 @@ public enum LeaveVoiceOutcome
 // connection cannot see a ChatMessage, MemberJoined or MemberLeft before its own Welcome and
 // initial RoomState, because those are enqueued under the same lock. Voice membership lives
 // under the same lock, so a voice frame can never overtake the RoomState of its own room.
+//
+// Rooms and their memberships are persistent rows; this class holds a mirror of them and never
+// touches the database itself. Every caller writes the row first and then tells the mirror.
 public sealed class ConnectionRegistry
 {
     public const string GeneralRoomId = "general";
@@ -64,15 +92,19 @@ public sealed class ConnectionRegistry
     // Every accepted socket, whether or not it finished its handshake.
     private readonly ConcurrentDictionary<Guid, ClientConnection> _connections = new();
 
-    // One live connection per account; both guarded by _gate.
+    // One live connection per account; all three guarded by _gate. _order holds the same rooms
+    // as _rooms with general first, which is the order PROTOCOL.md sends their RoomState in.
     private readonly Dictionary<long, ClientConnection> _online = [];
-    private readonly Dictionary<string, Room> _rooms = new() { [GeneralRoomId] = new Room(GeneralRoomId) };
+    private readonly Dictionary<string, Room> _rooms = [];
+    private readonly List<Room> _order = [];
 
+    private readonly RoomDirectory _directory;
     private readonly VoiceRelay _relay;
     private readonly ILogger<ConnectionRegistry> _logger;
 
-    public ConnectionRegistry(VoiceRelay relay, ILogger<ConnectionRegistry> logger)
+    public ConnectionRegistry(RoomDirectory directory, VoiceRelay relay, ILogger<ConnectionRegistry> logger)
     {
+        _directory = directory;
         _relay = relay;
         _logger = logger;
         _relay.SpeakingChanged += OnSpeakingChanged;
@@ -84,25 +116,90 @@ public sealed class ConnectionRegistry
 
     public void Remove(ClientConnection connection) => _connections.TryRemove(connection.Id, out _);
 
-    // Publishes the connection as the account's live one and queues its Welcome and RoomState
-    // frames. Returns the connection it replaced, if any: the caller fails that one outside the
-    // lock, because a dead socket must never hold up the account's new session.
-    public ClientConnection? Attach(ClientConnection connection, long userId, string username, long latestMessageId)
+    // Called once at startup, before anything listens: a room that is not in the mirror cannot
+    // be joined, sent to or read, so the mirror has to be complete before the first Hello.
+    public async Task LoadRoomsAsync()
+    {
+        var rooms = await _directory.LoadAllAsync();
+        int count;
+        lock (_gate)
+        {
+            _rooms.Clear();
+            _order.Clear();
+
+            // general sorts nowhere in particular by id, and its RoomState goes out first.
+            var general = rooms.FirstOrDefault(entry => entry.Room.Id == GeneralRoomId);
+            if (general.Room is null)
+            {
+                throw new InvalidOperationException($"Room '{GeneralRoomId}' is missing: the database is not migrated.");
+            }
+
+            MirrorLocked(general.Room, general.MemberIds);
+            foreach (var (record, memberIds) in rooms)
+            {
+                if (record.Id != GeneralRoomId)
+                {
+                    MirrorLocked(record, memberIds);
+                }
+            }
+
+            count = _order.Count;
+        }
+
+        _logger.LogInformation("Mirrored {RoomCount} rooms", count);
+    }
+
+    // Publishes the connection as the account's live one and queues its Welcome, RoomState and
+    // RoomList frames. The entries are the account's own rooms as the database has them, read by
+    // the caller a moment ago. Returns the connection it replaced, if any: the caller fails that
+    // one outside the lock, because a dead socket must never hold up the account's new session.
+    public ClientConnection? Attach(
+        ClientConnection connection,
+        long userId,
+        string username,
+        long latestMessageId,
+        IReadOnlyList<RoomEntryRecord> entries)
     {
         List<ClientConnection>? slow = null;
         List<uint> removed = [];
+        List<Room> joined = [];
         ClientConnection? replaced;
         lock (_gate)
         {
             // Before any membership write: RoomState reads Username straight off the members.
             connection.MarkReady(userId, username);
 
+            // The entries are what teaches the mirror about a membership written outside the
+            // registry, a fresh account's general membership above all. Reconciled both ways
+            // against that read, because a leave whose Leave call came back Stale deleted the row
+            // and then found the session already replaced: nothing else would ever drop it from
+            // the mirror, and a Hello is the next moment the database truth is in hand.
+            foreach (var entry in entries)
+            {
+                if (!_rooms.TryGetValue(entry.Room.Id, out var mirrored))
+                {
+                    mirrored = MirrorLocked(entry.Room, entry.MemberIds);
+                }
+
+                if (entry.MemberIds.Contains(userId))
+                {
+                    mirrored.MemberIds.Add(userId);
+                }
+                else
+                {
+                    // Silent: a room the account is not in has no audience owed a MemberLeft, and
+                    // the leave that dropped the row already had its chance to announce itself.
+                    mirrored.MemberIds.Remove(userId);
+                    mirrored.Members.Remove(userId);
+                }
+            }
+
             _online.TryGetValue(userId, out replaced);
             if (replaced is not null)
             {
                 // The account keeps the rooms it was in and the swap is silent, so nobody else
                 // sees a leave/join pair for what is really one session moving.
-                foreach (var room in _rooms.Values)
+                foreach (var room in _order)
                 {
                     // Voice first, and never transferred: the key and ssrc belong to the socket
                     // that proved its address. Announcing it before the text slot changes hands
@@ -120,13 +217,15 @@ public sealed class ConnectionRegistry
                 }
             }
 
-            // Every connection is a member of general from Hello on, so a session that had left
-            // it joins again here, announced to the room like any other join.
-            var general = _rooms[GeneralRoomId];
-            var joinedGeneral = !Holds(general, connection, userId);
-            if (joinedGeneral)
+            // Membership is persistent and presence is per connection; this is where the two
+            // meet, so every room the account belongs to gets this connection as its live slot.
+            foreach (var room in _order)
             {
-                general.Members[userId] = connection;
+                if (room.MemberIds.Contains(userId) && !Holds(room, connection, userId))
+                {
+                    room.Members[userId] = connection;
+                    joined.Add(room);
+                }
             }
 
             _online[userId] = connection;
@@ -136,16 +235,22 @@ public sealed class ConnectionRegistry
                 new ServerFrame { Welcome = new Welcome { LatestMessageId = latestMessageId, MemberId = userId, Username = username } },
                 ref slow);
 
-            // general first, then whatever else a replaced session handed over.
+            // Every room state before the list that names those rooms, and both before anyone
+            // else hears about the arrival.
             EnqueueRoomStates(connection, userId, ref slow);
+            Enqueue(connection, RoomListOf(entries), ref slow);
 
-            if (joinedGeneral)
+            // A replacement is silent: the account never left, so nobody is told it arrived.
+            if (replaced is null)
             {
-                BroadcastLocked(
-                    general,
-                    new ServerFrame { MemberJoined = new MemberJoined { RoomId = GeneralRoomId, Member = MemberOf(connection, userId) } },
-                    except: userId,
-                    ref slow);
+                foreach (var room in joined)
+                {
+                    BroadcastLocked(
+                        room,
+                        new ServerFrame { MemberJoined = new MemberJoined { RoomId = room.Id, Member = MemberOf(connection, userId) } },
+                        except: userId,
+                        ref slow);
+                }
             }
         }
 
@@ -155,7 +260,8 @@ public sealed class ConnectionRegistry
     }
 
     // Announces the end of a session. A connection that was already replaced is not the
-    // account's live one and leaves nothing behind: its rooms belong to its successor.
+    // account's live one and leaves nothing behind: its rooms belong to its successor. The
+    // memberships themselves are persistent and survive the disconnection.
     public void Detach(ClientConnection connection)
     {
         if (connection.UserId is not { } userId)
@@ -173,7 +279,7 @@ public sealed class ConnectionRegistry
             }
 
             _online.Remove(userId);
-            foreach (var room in _rooms.Values)
+            foreach (var room in _order)
             {
                 if (!Holds(room, connection, userId))
                 {
@@ -220,6 +326,46 @@ public sealed class ConnectionRegistry
         }
     }
 
+    // The persistent membership, which an account keeps while it is offline: the history
+    // endpoint and MarkRead ask about the account, not about a live connection.
+    public bool IsMember(string roomId, long userId)
+    {
+        lock (_gate)
+        {
+            return _rooms.TryGetValue(roomId, out var room) && room.MemberIds.Contains(userId);
+        }
+    }
+
+    public RoomAccess Access(ClientConnection connection, string roomId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return RoomAccess.Stale;
+        }
+
+        lock (_gate)
+        {
+            if (!_rooms.TryGetValue(roomId, out var room))
+            {
+                return RoomAccess.UnknownRoom;
+            }
+
+            if (!IsLive(connection, userId))
+            {
+                return RoomAccess.Stale;
+            }
+
+            if (room.MemberIds.Contains(userId))
+            {
+                return RoomAccess.Member;
+            }
+
+            return room.Kind == Data.RoomKind.Dm ? RoomAccess.Forbidden : RoomAccess.NotAMember;
+        }
+    }
+
+    // The membership row is written before this call, so finding the user already in the mirror
+    // is the normal path of a resync and stays a no-op.
     public JoinOutcome Join(ClientConnection connection, string roomId)
     {
         if (connection.UserId is not { } userId)
@@ -241,14 +387,15 @@ public sealed class ConnectionRegistry
                 return JoinOutcome.Stale;
             }
 
-            if (Holds(room, connection, userId))
+            if (room.Kind == Data.RoomKind.Dm && !room.MemberIds.Contains(userId))
             {
-                outcome = JoinOutcome.AlreadyMember;
+                return JoinOutcome.Forbidden;
             }
-            else
+
+            var joined = room.MemberIds.Add(userId);
+            room.Members[userId] = connection;
+            if (joined)
             {
-                room.Members[userId] = connection;
-                outcome = JoinOutcome.Joined;
                 BroadcastLocked(
                     room,
                     new ServerFrame { MemberJoined = new MemberJoined { RoomId = room.Id, Member = MemberOf(connection, userId) } },
@@ -259,6 +406,14 @@ public sealed class ConnectionRegistry
             // Both outcomes answer with the full membership: joining a room twice is the
             // client's resync primitive.
             EnqueueState(connection, room, ref slow);
+
+            // After the joiner's own RoomState, so the room it names is already described.
+            if (joined)
+            {
+                BroadcastToAllLocked(RoomUpdatedOf(room), ref slow);
+            }
+
+            outcome = joined ? JoinOutcome.Joined : JoinOutcome.Resynced;
         }
 
         CloseSlow(slow);
@@ -286,7 +441,12 @@ public sealed class ConnectionRegistry
                 return LeaveOutcome.Stale;
             }
 
-            if (!Holds(room, connection, userId))
+            if (room.Id == GeneralRoomId || room.Kind == Data.RoomKind.Dm)
+            {
+                return LeaveOutcome.Forbidden;
+            }
+
+            if (!room.MemberIds.Contains(userId))
             {
                 return LeaveOutcome.NotAMember;
             }
@@ -301,11 +461,111 @@ public sealed class ConnectionRegistry
                 except: null,
                 ref slow);
             room.Members.Remove(userId);
+            room.MemberIds.Remove(userId);
+            BroadcastToAllLocked(RoomUpdatedOf(room), ref slow);
         }
 
         CloseSlow(slow);
         ReleaseVoice(removed);
         return LeaveOutcome.Left;
+    }
+
+    // The room and the creator's membership are persisted before this call.
+    public CreateRoomOutcome CreateRoom(ClientConnection connection, RoomRecord record)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return CreateRoomOutcome.Stale;
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId))
+            {
+                return CreateRoomOutcome.Stale;
+            }
+
+            if (!_rooms.TryGetValue(record.Id, out var room))
+            {
+                room = MirrorLocked(record, [userId]);
+            }
+
+            room.MemberIds.Add(userId);
+            room.Members[userId] = connection;
+            EnqueueState(connection, room, ref slow);
+            BroadcastToAllLocked(RoomUpdatedOf(room), ref slow);
+        }
+
+        CloseSlow(slow);
+        return CreateRoomOutcome.Created;
+    }
+
+    // The room and both memberships are persisted before this call. A DM concerns nobody but its
+    // two members, so nothing about it is broadcast further than they are.
+    public void OpenDm(ClientConnection caller, RoomRecord record, long otherId, bool created)
+    {
+        if (caller.UserId is not { } callerId)
+        {
+            return;
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            // A replaced connection gets nothing and, above all, takes no slot: the account's
+            // live session owns those, and it mirrors the DM from its own entries at Hello.
+            if (!IsLive(caller, callerId))
+            {
+                return;
+            }
+
+            if (!_rooms.TryGetValue(record.Id, out var room))
+            {
+                room = MirrorLocked(record, [callerId, otherId]);
+            }
+            else
+            {
+                room.MemberIds.Add(callerId);
+                room.MemberIds.Add(otherId);
+            }
+
+            if (created)
+            {
+                foreach (var memberId in room.MemberIds)
+                {
+                    if (_online.TryGetValue(memberId, out var member))
+                    {
+                        room.Members[memberId] = member;
+                        EnqueueState(member, room, ref slow);
+                    }
+                }
+
+                BroadcastToUsersLocked(room.MemberIds, RoomUpdatedOf(room), ref slow);
+            }
+            else
+            {
+                // The DM was already there, so only the caller asked for anything.
+                room.Members[callerId] = caller;
+                EnqueueState(caller, room, ref slow);
+            }
+        }
+
+        CloseSlow(slow);
+    }
+
+    public void BroadcastToRoom(string roomId, ServerFrame frame)
+    {
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (_rooms.TryGetValue(roomId, out var room))
+            {
+                BroadcastLocked(room, frame, except: null, ref slow);
+            }
+        }
+
+        CloseSlow(slow);
     }
 
     public JoinVoiceOutcome JoinVoice(ClientConnection connection, string roomId)
@@ -402,20 +662,6 @@ public sealed class ConnectionRegistry
         return LeaveVoiceOutcome.Left;
     }
 
-    public void BroadcastToRoom(string roomId, ServerFrame frame)
-    {
-        List<ClientConnection>? slow = null;
-        lock (_gate)
-        {
-            if (_rooms.TryGetValue(roomId, out var room))
-            {
-                BroadcastLocked(room, frame, except: null, ref slow);
-            }
-        }
-
-        CloseSlow(slow);
-    }
-
     public Task CloseAllAsync(WebSocketCloseStatus status, string reason)
         => Task.WhenAll(_connections.Values.Select(connection => CloseQuietlyAsync(connection, status, reason)));
 
@@ -444,19 +690,47 @@ public sealed class ConnectionRegistry
         (slow ??= []).Add(connection);
     }
 
-    // general first, then the rest in insertion order, so the client's primary room is
-    // populated before anything a replaced session handed over.
-    private void EnqueueRoomStates(ClientConnection connection, long userId, ref List<ClientConnection>? slow)
+    // A room list changed, which is not a room event: its audience is every live session rather
+    // than one room's membership.
+    private void BroadcastToAllLocked(ServerFrame frame, ref List<ClientConnection>? slow)
     {
-        var general = _rooms[GeneralRoomId];
-        if (Holds(general, connection, userId))
+        foreach (var connection in _online.Values)
         {
-            EnqueueState(connection, general, ref slow);
+            Enqueue(connection, frame, ref slow);
+        }
+    }
+
+    private void BroadcastToUsersLocked(IEnumerable<long> userIds, ServerFrame frame, ref List<ClientConnection>? slow)
+    {
+        foreach (var userId in userIds)
+        {
+            if (_online.TryGetValue(userId, out var connection))
+            {
+                Enqueue(connection, frame, ref slow);
+            }
+        }
+    }
+
+    private Room MirrorLocked(RoomRecord record, IEnumerable<long> memberIds)
+    {
+        var room = new Room(record.Id, record.Kind, record.Name, record.CreatedBy);
+        foreach (var userId in memberIds)
+        {
+            room.MemberIds.Add(userId);
         }
 
-        foreach (var room in _rooms.Values)
+        _rooms[room.Id] = room;
+        _order.Add(room);
+        return room;
+    }
+
+    // general is first in _order, so one pass is PROTOCOL.md's order: general, then the rest of
+    // the account's rooms in the order the mirror learned them.
+    private void EnqueueRoomStates(ClientConnection connection, long userId, ref List<ClientConnection>? slow)
+    {
+        foreach (var room in _order)
         {
-            if (room.Id != GeneralRoomId && Holds(room, connection, userId))
+            if (Holds(room, connection, userId))
             {
                 EnqueueState(connection, room, ref slow);
             }
@@ -505,6 +779,47 @@ public sealed class ConnectionRegistry
 
     private static Member MemberOf(ClientConnection connection, long userId)
         => new() { UserId = userId, Username = connection.Username ?? string.Empty };
+
+    private static ServerFrame RoomListOf(IReadOnlyList<RoomEntryRecord> entries)
+    {
+        var list = new RoomList();
+        foreach (var entry in entries)
+        {
+            var room = new Protocol.Room
+            {
+                RoomId = entry.Room.Id,
+                Kind = (Protocol.RoomKind)entry.Room.Kind,
+                Name = entry.Room.Name,
+                CreatedBy = entry.Room.CreatedBy ?? 0,
+            };
+
+            room.MemberIds.AddRange(entry.MemberIds);
+            list.Rooms.Add(new RoomEntry
+            {
+                Room = room,
+                Unread = entry.Unread,
+                Mentions = entry.Mentions,
+                LastMessageId = entry.LastMessageId,
+            });
+        }
+
+        return new ServerFrame { RoomList = list };
+    }
+
+    // The room's shared facts only: counters are per reader and never ride a RoomUpdated.
+    private static ServerFrame RoomUpdatedOf(Room room)
+    {
+        var protocol = new Protocol.Room
+        {
+            RoomId = room.Id,
+            Kind = (Protocol.RoomKind)room.Kind,
+            Name = room.Name,
+            CreatedBy = room.CreatedBy ?? 0,
+        };
+
+        protocol.MemberIds.AddRange(room.MemberIds.Order());
+        return new ServerFrame { RoomUpdated = new RoomUpdated { Room = protocol } };
+    }
 
     private static ServerFrame VoiceStateOf(Room room)
     {
@@ -593,9 +908,19 @@ public sealed class ConnectionRegistry
     // which lives on the connection and nowhere else.
     private readonly record struct VoiceSlot(ClientConnection Connection, VoiceSession Session);
 
-    private sealed class Room(string id)
+    // One mirrored room: its persisted facts, the accounts that belong to it, and the live
+    // connections of those of them that are online right now.
+    private sealed class Room(string id, Data.RoomKind kind, string name, long? createdBy)
     {
         public string Id { get; } = id;
+
+        public Data.RoomKind Kind { get; } = kind;
+
+        public string Name { get; } = name;
+
+        public long? CreatedBy { get; } = createdBy;
+
+        public HashSet<long> MemberIds { get; } = [];
 
         public Dictionary<long, ClientConnection> Members { get; } = [];
 

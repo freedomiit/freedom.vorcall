@@ -39,8 +39,9 @@ def arm_right(x_out, x_in, top, bottom, r=11):
             f"A{r} {r} 0 0 1 {x_out - r} {bottom} L{x_in} {bottom} Z")
 
 
-def horn_points(base, ctrl, tip, w0=36, w_tip=14, taper=1.0, n=24, tip_steps=8):
-    """Outline of a tapered horn along a quadratic curve, as a clockwise polygon (round tip sampled)."""
+def horn_points(base, ctrl, tip, w0=36, w_tip=14, taper=1.0, n=24, tip_steps=8, root=0.0):
+    """Outline of a tapered horn along a quadratic curve, as a clockwise polygon (round tip sampled).
+    `root` starts the outline part-way up the curve (0 = at `base`); the width taper is unchanged."""
     def P(t):
         u = 1 - t
         return (u * u * base[0] + 2 * u * t * ctrl[0] + t * t * tip[0],
@@ -53,7 +54,7 @@ def horn_points(base, ctrl, tip, w0=36, w_tip=14, taper=1.0, n=24, tip_steps=8):
 
     left, right = [], []
     for i in range(n + 1):
-        t = i / n
+        t = root + (1 - root) * i / n
         x, y = P(t)
         dx, dy = D(t)
         L = (dx * dx + dy * dy) ** 0.5
@@ -150,10 +151,16 @@ def eye_sub(cx, cy, rx, ry):
             carc(cx, cy, rx, ry, 180, 270), carc(cx, cy, rx, ry, 270, 360)]
 
 
+# The rig's horns stop short of the eye line. The client fills every ring of a frame in one
+# nonzero pass, so wherever two solids sit under an eye the winding is 2 - 1 and the hole
+# fills in; the swept horn base reaches the popped near eye once the creature has turned.
+# Trimmed here, the root still ends well inside the body (the visible horn is unchanged).
+HORN_ROOT = 0.12
+
 RIG = {
     "body": body_sub(),
-    "horn_l": horn_sub(horn_points(*HORN_ARGS, n=16, tip_steps=6)),
-    "horn_r": horn_sub(horn_points(*[mirror(p) for p in HORN_ARGS], n=16, tip_steps=6)),
+    "horn_l": horn_sub(horn_points(*HORN_ARGS, n=16, tip_steps=6, root=HORN_ROOT)),
+    "horn_r": horn_sub(horn_points(*[mirror(p) for p in HORN_ARGS], n=16, tip_steps=6, root=HORN_ROOT)),
     "foot_l": foot_sub(84),
     "foot_r": foot_sub(172),
     "arm_l": arm_left_sub(),

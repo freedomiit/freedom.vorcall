@@ -7,6 +7,7 @@
 mod app;
 mod audio;
 mod brand;
+mod images;
 mod notify;
 mod update_ui;
 mod view;

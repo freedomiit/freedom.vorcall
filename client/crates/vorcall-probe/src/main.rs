@@ -22,14 +22,15 @@ use vorcall_core::{Command, Event, Session};
 use vorcall_voice::codec::Encoder;
 use vorcall_voice::tone::{Tone, rms};
 use vorcall_voice::{
-    FRAME_MS, FRAME_SAMPLES, FrameSender, Link, MediaConfig, MediaEngine, Playout,
+    FRAME_MS, FRAME_SAMPLES, FrameSender, GateDecision, Link, MediaConfig, MediaEngine, NoiseGate,
+    Playout,
 };
 
 use report::{PeerReport, Report, Rtt, SpeakingEvent};
 
 /// Peaks at 0.3, so a clean frame measures ≈0.21 and silence or concealment
 /// stays far below the threshold below.
-const TONE_AMPLITUDE: f32 = 0.3;
+const DEFAULT_TONE_AMPLITUDE: f32 = 0.3;
 
 /// Anything above this is the tone rather than silence or packet loss
 /// concealment fading out.
@@ -51,16 +52,28 @@ Options:
   --send-seconds <n>     seconds of tone to send (default: 10)
   --listen-seconds <n>   seconds to keep receiving, >= --send-seconds (default: 12)
   --tone-hz <hz>         tone frequency (default: 440)
+  --tone-amplitude <a>   tone peak, 0..1 (default: 0.3); 0 is digital silence
+  --vad                  run every frame through the noise gate before
+                         encoding; gated frames are never sent
+  --vad-threshold <db>   gate open threshold in dBFS (default: -45), only
+                         meaningful with --vad
   --expect-peer          exit 1 unless at least 1.00 s of tone was heard
+  --expect-silence       exit 1 if any audio frame was sent
   --help                 print this help
+
+Voice-activation oracle: `--vad --tone-amplitude 0 --expect-silence` must exit
+0 with \"frames_sent\":0, while `--vad --tone-amplitude 0.3 --expect-peer`
+alongside a second probe must hear the tone. Without --vad, --tone-amplitude 0
+still sends silent frames, so --expect-silence then exits 1 — that is the
+negative control.
 
 The server URL and key come from VORCALL_SERVER_URL and VORCALL_SERVER_KEY,
 with the values baked in at build time as fallbacks.
 
 Prints one JSON line on stdout; logs go to stderr.
 
-Exit codes: 0 ran, 1 --expect-peer heard nothing, 2 usage, sign-in,
-connection or media failure.
+Exit codes: 0 ran, 1 --expect-silence sent audio or --expect-peer heard
+nothing, 2 usage, sign-in, connection or media failure.
 
 Update subcommands:
   vorcall-probe check-update --username U [--password P] --platform ID
@@ -82,7 +95,11 @@ struct Args {
     send_seconds: u64,
     listen_seconds: u64,
     tone_hz: f32,
+    tone_amplitude: f32,
+    vad: bool,
+    vad_threshold: f32,
     expect_peer: bool,
+    expect_silence: bool,
 }
 
 #[tokio::main]
@@ -198,9 +215,14 @@ async fn probe(args: Args) -> i32 {
     let started = Instant::now();
     tracing::info!(ssrc = ready.ssrc, room = %ready.room_id, "voice connected");
 
+    let plan = SendPlan {
+        hz: args.tone_hz,
+        amplitude: args.tone_amplitude,
+        gate: args.vad.then(|| NoiseGate::new(args.vad_threshold)),
+    };
     let sending = tokio::task::spawn(send_tone(
         engine.sender(),
-        args.tone_hz,
+        plan,
         args.send_seconds * 1000 / FRAME_MS,
     ));
 
@@ -213,8 +235,13 @@ async fn probe(args: Args) -> i32 {
     .await;
 
     let stats = engine.stats();
-    let (packets_sent_ok, send_failures) = sending.await.unwrap_or_default();
-    tracing::debug!(packets_sent_ok, send_failures, "sender finished");
+    let sent = sending.await.unwrap_or_default();
+    tracing::debug!(
+        frames_sent = sent.sent,
+        send_failures = sent.failures,
+        frames_gated = sent.gated,
+        "sender finished"
+    );
 
     let _ = commands
         .send(Command::LeaveVoice {
@@ -252,7 +279,9 @@ async fn probe(args: Args) -> i32 {
         bytes_sent: stats.bytes_sent,
         bytes_received: stats.bytes_received,
         rejected: stats.rejected,
-        send_failures,
+        send_failures: sent.failures,
+        frames_sent: sent.sent,
+        frames_gated: sent.gated,
         decoded_frames: heard.decoded_frames,
         tone_frames: heard.tone_frames,
         rtt: Rtt {
@@ -286,7 +315,18 @@ async fn probe(args: Args) -> i32 {
     println!("{}", report.render());
     let _ = std::io::stdout().flush();
 
+    if args.expect_silence && report.frames_sent > 0 {
+        tracing::error!(
+            frames_sent = report.frames_sent,
+            "--expect-silence but audio frames went out"
+        );
+        return 1;
+    }
     if args.expect_peer && report.tone_seconds() < 1.0 {
+        tracing::error!(
+            tone_seconds = report.tone_seconds(),
+            "--expect-peer but no peer tone was heard"
+        );
         return 1;
     }
     0
@@ -452,43 +492,75 @@ fn track_members(names: &mut HashMap<u32, (i64, String)>, event: &Event) {
     }
 }
 
-/// Returns how many frames reached the socket and how many were lost to an
-/// encode or send failure.
-async fn send_tone(sender: FrameSender, hz: f32, frames: u64) -> (u64, u64) {
+struct SendPlan {
+    hz: f32,
+    amplitude: f32,
+    /// `Some` under `--vad`: the frames it closes on never reach the encoder.
+    gate: Option<NoiseGate>,
+}
+
+#[derive(Default)]
+struct SendOutcome {
+    sent: u64,
+    failures: u64,
+    gated: u64,
+}
+
+/// Returns how many audio frames reached the socket, how many were lost to an
+/// encode or send failure, and how many the gate held back.
+async fn send_tone(sender: FrameSender, plan: SendPlan, frames: u64) -> SendOutcome {
+    let SendPlan {
+        hz,
+        amplitude,
+        mut gate,
+    } = plan;
+    let mut outcome = SendOutcome::default();
     let mut encoder = match Encoder::new() {
         Ok(encoder) => encoder,
         Err(error) => {
             tracing::error!(%error, "no Opus encoder; sending nothing");
-            return (0, frames);
+            outcome.failures = frames;
+            return outcome;
         }
     };
     let mut ticker = interval(Duration::from_millis(FRAME_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut tone = Tone::new(hz, TONE_AMPLITUDE);
+    let mut tone = Tone::new(hz, amplitude);
     let mut pcm = [0.0f32; FRAME_SAMPLES];
     let mut packet = [0u8; MAX_PACKET];
-    let (mut sent, mut failures) = (0, 0);
 
     for index in 0..frames {
-        ticker.tick().await;
+        let now = ticker.tick().await;
         tone.fill(&mut pcm);
+        let marker = match gate.as_mut() {
+            Some(gate) => match gate.process(&pcm, now.into_std()) {
+                GateDecision::Closed => {
+                    outcome.gated += 1;
+                    continue;
+                }
+                GateDecision::Opened => true,
+                GateDecision::Open => false,
+            },
+            // Without a gate a talk spurt starts on the first frame and never
+            // stops afterwards.
+            None => index == 0,
+        };
         match encoder.encode(&pcm, &mut packet) {
-            // A talk spurt starts on the first frame and never stops afterwards.
-            Ok(written) => match sender.send_audio(&packet[..written], index == 0) {
-                Ok(()) => sent += 1,
+            Ok(written) => match sender.send_audio(&packet[..written], marker) {
+                Ok(()) => outcome.sent += 1,
                 Err(error) => {
                     tracing::debug!(%error, "dropping a frame the socket refused");
-                    failures += 1;
+                    outcome.failures += 1;
                 }
             },
             Err(error) => {
                 tracing::debug!(%error, "dropping a frame the encoder refused");
-                failures += 1;
+                outcome.failures += 1;
             }
         }
     }
 
-    (sent, failures)
+    outcome
 }
 
 /// `Ok(None)` means `--help` was asked for.
@@ -499,13 +571,19 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
     let mut send_seconds = 10u64;
     let mut listen_seconds = 12u64;
     let mut tone_hz = 440.0f32;
+    let mut tone_amplitude = DEFAULT_TONE_AMPLITUDE;
+    let mut vad = false;
+    let mut vad_threshold = vorcall_voice::gate::DEFAULT_THRESHOLD_DB;
     let mut expect_peer = false;
+    let mut expect_silence = false;
 
     let mut args = args.peekable();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--help" | "-h" => return Ok(None),
             "--expect-peer" => expect_peer = true,
+            "--expect-silence" => expect_silence = true,
+            "--vad" => vad = true,
             "--username" => username = Some(value(&flag, &mut args)?),
             "--password" => password = Some(value(&flag, &mut args)?),
             "--room" => room = value(&flag, &mut args)?,
@@ -516,6 +594,21 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
                 tone_hz = raw
                     .parse()
                     .map_err(|_| format!("--tone-hz wants a number, got {raw}"))?;
+            }
+            "--tone-amplitude" => {
+                let raw = value(&flag, &mut args)?;
+                tone_amplitude = raw
+                    .parse()
+                    .map_err(|_| format!("--tone-amplitude wants a number, got {raw}"))?;
+                if !(0.0..=1.0).contains(&tone_amplitude) {
+                    return Err(format!("--tone-amplitude wants 0..1, got {raw}"));
+                }
+            }
+            "--vad-threshold" => {
+                let raw = value(&flag, &mut args)?;
+                vad_threshold = raw
+                    .parse()
+                    .map_err(|_| format!("--vad-threshold wants a number, got {raw}"))?;
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -540,7 +633,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
         send_seconds,
         listen_seconds,
         tone_hz,
+        tone_amplitude,
+        vad,
+        vad_threshold,
         expect_peer,
+        expect_silence,
     }))
 }
 

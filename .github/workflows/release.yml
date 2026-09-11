@@ -12,6 +12,11 @@ name: release
 #   2. job "build"     — builds vorcall on ubuntu-22.04 / windows-latest /
 #      macos-latest with the production server key baked in, checks the binary
 #      reports the expected version, and uploads binary + .sha256 per platform.
+#      Each platform also gets its first-install package: a Linux tarball
+#      with a launcher entry and install script, a per-user Inno Setup
+#      installer on Windows (icon rendered by job "icons"), Vorcall.app inside
+#      a DMG on macOS. The updater keeps fetching the bare binaries and swaps
+#      them in place inside whatever the package installed.
 #   3. job "publish"   — assembles manifest.json from the built assets, signs
 #      it (Ed25519) and verifies the signature against client/update-keys.pub.
 #      When publishing, it copies everything to the host, swaps the manifest
@@ -149,8 +154,30 @@ jobs:
           path: notes.md
           retention-days: 7
 
+  icons:
+    # The Windows icon, rendered from assets/brand/icon.svg where an SVG
+    # renderer is an apt package away, and handed to the Windows build for
+    # the installer and its shortcuts.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Render vorcall.ico
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends librsvg2-bin python3-pil
+          scripts/make-windows-icon.sh icons/vorcall.ico
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: icons
+          path: icons/vorcall.ico
+          retention-days: 7
+          if-no-files-found: error
+
   build:
-    needs: preflight
+    needs: [preflight, icons]
     strategy:
       fail-fast: true
       matrix:
@@ -178,9 +205,9 @@ jobs:
           workspaces: client
           key: release-${{ matrix.platform }}
 
-      - name: ALSA headers (rodio/cpal)
+      - name: ALSA headers (rodio/cpal), desktop-file-utils (tarball check)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libasound2-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libasound2-dev desktop-file-utils
 
       - name: Check the server key secret
         # client/.cargo/config.toml defaults the key to "dev"; a release built
@@ -219,17 +246,57 @@ jobs:
           out=$("../dist/vorcall-${PLATFORM}" --version)
           [ "$out" = "vorcall ${VERSION} ${PLATFORM}" ] || { echo "binary reports '$out'"; exit 1; }
 
+      - name: Linux tarball
+        if: runner.os == 'Linux'
+        # the binary with its executable bit, the launcher entry, the icon and a
+        # per-user install script (packaging/linux/)
+        run: ../scripts/package-client-linux.sh "../dist/vorcall-${PLATFORM}" "$VERSION" ../dist
+
+      - uses: actions/download-artifact@v8
+        if: runner.os == 'Windows'
+        with:
+          name: icons
+          path: icons
+
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        # packaging/windows/vorcall.iss: per-user (Start menu entry, icon,
+        # uninstaller) into the account's local programs folder, which the
+        # updater can write to. pwsh keeps MSYS from rewriting the /D switches.
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          & $iscc "/DAppVersion=$env:VERSION" "/DSourceDir=$dist" "/DOutputDir=$dist" "/DIconFile=$env:GITHUB_WORKSPACE\icons\vorcall.ico" "$env:GITHUB_WORKSPACE\packaging\windows\vorcall.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: App bundle
+        if: runner.os == 'macOS'
+        # Vorcall.app in a DMG is what a friend installs; scripts/bundle-client-macos.sh
+        # renders the icon (rsvg-convert), writes Info.plist, signs ad-hoc and builds
+        # the drag-to-Applications image with hdiutil.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          brew install --quiet librsvg
+          ../scripts/bundle-client-macos.sh "../dist/vorcall-${PLATFORM}" "$VERSION" ../dist
+
       - name: Checksum
         # run inside dist/ so the file holds "<hash>  <name>" with no path
         run: |
           set -euo pipefail
           cd ../dist
-          sha256sum "vorcall-${PLATFORM}${EXT}" > "vorcall-${PLATFORM}${EXT}.sha256"
+          for f in "vorcall-${PLATFORM}${EXT}" "vorcall-${PLATFORM}.tar.gz" "vorcall-${PLATFORM}-setup.exe" "vorcall-${PLATFORM}.dmg"; do
+            if [ -f "$f" ]; then sha256sum "$f" > "$f.sha256"; fi
+          done
 
       - uses: actions/upload-artifact@v7
         with:
           name: vorcall-${{ matrix.platform }}
-          path: dist/vorcall-${{ matrix.platform }}${{ matrix.ext }}*
+          path: dist/vorcall-${{ matrix.platform }}*
           retention-days: 7
           if-no-files-found: error
 
@@ -305,7 +372,13 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$SERVER" "mkdir -p '$APP_DIR/releases/$VERSION'"
-          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes dist/vorcall-* "$SERVER:$APP_DIR/releases/$VERSION/"
+          # the host gets only what the manifest lists, the bare binaries: the tarball, the
+          # installer and the DMG are first-install downloads served by the GitHub Release
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
+            dist/vorcall-linux-x86_64 dist/vorcall-linux-x86_64.sha256 \
+            dist/vorcall-windows-x86_64.exe dist/vorcall-windows-x86_64.exe.sha256 \
+            dist/vorcall-macos-aarch64 dist/vorcall-macos-aarch64.sha256 \
+            "$SERVER:$APP_DIR/releases/$VERSION/"
           scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes dist/manifest.json "$SERVER:$APP_DIR/releases/manifest.json.tmp"
           scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes dist/manifest.sig "$SERVER:$APP_DIR/releases/manifest.sig.tmp"
 

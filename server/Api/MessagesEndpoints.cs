@@ -1,4 +1,5 @@
 using System.Globalization;
+using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
 
 namespace Vorcall.Server.Api;
@@ -10,11 +11,30 @@ public static class MessagesEndpoints
     private const int MaxLimit = 100;
 
     // GET /api/messages?room=&limit=&before= -> MessagePage as application/x-protobuf.
-    public static async Task<IResult> GetPageAsync(string? room, string? limit, string? before, MessageService messages)
+    public static async Task<IResult> GetPageAsync(
+        string? room,
+        string? limit,
+        string? before,
+        HttpContext context,
+        ConnectionRegistry registry,
+        MessageService messages)
     {
         if (!Validation.TryNormalizeRoomId(room, out var roomId))
         {
             return Results.BadRequest();
+        }
+
+        // The token validated, so a missing claim is this server's own bug.
+        if (!BearerIdentity.TryGetUserId(context.User, out var userId))
+        {
+            return ProtobufBody.Fail(StatusCodes.Status401Unauthorized, "invalid bearer");
+        }
+
+        // A room the caller is not in and a room that does not exist answer alike: the reader
+        // learns nothing about rooms it was never told about.
+        if (!registry.IsMember(roomId, userId))
+        {
+            return ProtobufBody.Fail(StatusCodes.Status403Forbidden, "not a member");
         }
 
         var pageSize = DefaultLimit;

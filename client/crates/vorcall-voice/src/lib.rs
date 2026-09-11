@@ -10,6 +10,7 @@
 //! - [`playout`] — every remote speaker decoded and summed into one frame.
 //! - [`engine`] — the UDP socket, the send path, keepalive pings and statistics.
 //!
+//! [`gate`] sits on the capture side, deciding which frames are worth sending;
 //! [`tone`] is a test/diagnostic source; nothing here touches an audio device,
 //! a window, or the network beyond the single UDP socket the engine owns.
 
@@ -21,10 +22,12 @@ pub const FRAME_MS: u64 = 20;
 pub mod codec;
 pub mod crypto;
 pub mod engine;
+pub mod gate;
 pub mod jitter;
 pub mod packet;
 pub mod playout;
 pub mod tone;
 
 pub use engine::{FrameSender, Link, MediaConfig, MediaEngine, Stats};
+pub use gate::{GateDecision, NoiseGate};
 pub use playout::{PeerStats, Playout};

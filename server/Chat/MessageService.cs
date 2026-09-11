@@ -1,14 +1,128 @@
+using System.Text;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using Vorcall.Server.Attachments;
 using Vorcall.Server.Data;
 using Vorcall.Server.Protocol;
 
 namespace Vorcall.Server.Chat;
 
+// Message is set only when Status is Appended.
+public sealed record AppendOutcome(AppendOutcome.Kind Status, ChatMessage? Message)
+{
+    public enum Kind
+    {
+        Appended,
+        UnknownReply,
+        InvalidAttachment,
+    }
+
+    public static AppendOutcome UnknownReply { get; } = new(Kind.UnknownReply, null);
+
+    public static AppendOutcome InvalidAttachment { get; } = new(Kind.InvalidAttachment, null);
+
+    public static AppendOutcome Appended(ChatMessage message) => new(Kind.Appended, message);
+}
+
+// RoomId is empty only when Status is Unknown; Message is set only when Status is Edited.
+public sealed record EditOutcome(EditOutcome.Kind Status, string RoomId, ChatMessage? Message)
+{
+    public enum Kind
+    {
+        Edited,
+        Unknown,
+        Forbidden,
+    }
+
+    public static EditOutcome Unknown { get; } = new(Kind.Unknown, string.Empty, null);
+
+    public static EditOutcome Forbidden(string roomId) => new(Kind.Forbidden, roomId, null);
+
+    public static EditOutcome Edited(string roomId, ChatMessage message) => new(Kind.Edited, roomId, message);
+}
+
+// Attachments are the rows the delete removed, so the caller can delete their files.
+public sealed record DeleteOutcome(DeleteOutcome.Kind Status, string RoomId, IReadOnlyList<(long Id, string ContentType)> Attachments)
+{
+    public enum Kind
+    {
+        Deleted,
+        Unknown,
+        Forbidden,
+    }
+
+    public static DeleteOutcome Unknown { get; } = new(Kind.Unknown, string.Empty, []);
+
+    public static DeleteOutcome Forbidden(string roomId) => new(Kind.Forbidden, roomId, []);
+
+    public static DeleteOutcome Deleted(string roomId, IReadOnlyList<(long Id, string ContentType)> attachments)
+        => new(Kind.Deleted, roomId, attachments);
+}
+
+// Reactions is the full grouped set for the message, which the broadcast carries as-is.
+public sealed record ReactOutcome(ReactOutcome.Kind Status, string RoomId, IReadOnlyList<Protocol.Reaction> Reactions)
+{
+    public enum Kind
+    {
+        Changed,
+        Unknown,
+    }
+
+    public static ReactOutcome Unknown { get; } = new(Kind.Unknown, string.Empty, []);
+
+    public static ReactOutcome Changed(string roomId, IReadOnlyList<Protocol.Reaction> reactions)
+        => new(Kind.Changed, roomId, reactions);
+}
+
 public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactory)
 {
+    private const int ExcerptMaxScalars = 120;
+
+    // The plain-text path, kept while the socket handler still calls it: without a reply and
+    // without attachments there is nothing an append can be rejected for.
     public async Task<ChatMessage> AppendAsync(long userId, string author, string roomId, string text)
     {
+        var outcome = await AppendAsync(userId, author, roomId, text, 0, []);
+        return outcome.Message!;
+    }
+
+    public async Task<AppendOutcome> AppendAsync(
+        long userId,
+        string author,
+        string roomId,
+        string text,
+        long replyToId,
+        IReadOnlyList<long> attachmentIds)
+    {
+        // The handler checks both before it gets here; a service that trusts its caller is a
+        // service that writes a message with someone else's file attached.
+        if (attachmentIds.Count > AttachmentsOptions.MaxPerMessage
+            || attachmentIds.Distinct().Count() != attachmentIds.Count)
+        {
+            return AppendOutcome.InvalidAttachment;
+        }
+
         await using var db = await contextFactory.CreateDbContextAsync();
+
+        // The message and the links to its attachments land together: an attachment linked to a
+        // message that was never written would be swept as unlinked and lose its file.
+        await using var transaction = await db.Database.BeginTransactionAsync();
+
+        ReplyTarget? replyTarget = null;
+        if (replyToId != 0)
+        {
+            // A tombstone is a legal target: it keeps its id and author precisely so replies
+            // still resolve.
+            replyTarget = await db.Messages
+                .AsNoTracking()
+                .Where(m => m.Id == replyToId && m.RoomId == roomId)
+                .Select(m => new ReplyTarget(m.Id, m.Author, m.Text, m.DeletedAt != null))
+                .FirstOrDefaultAsync();
+            if (replyTarget is null)
+            {
+                return AppendOutcome.UnknownReply;
+            }
+        }
 
         // Author is stored next to the id: the message keeps the name it was sent under even
         // if the account is renamed or deleted.
@@ -19,11 +133,160 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             RoomId = roomId,
             Text = text,
             SentAt = DateTime.UtcNow,
+            ReplyToId = replyToId == 0 ? null : replyToId,
+            MentionIds = await Mentions.ResolveAsync(db, text),
         };
 
         db.Messages.Add(message);
         await db.SaveChangesAsync();
-        return ToProtocol(message);
+
+        var attachments = new List<Data.Attachment>();
+        if (attachmentIds.Count > 0)
+        {
+            var ids = attachmentIds.ToList();
+
+            // One guarded update rather than a read and then a write: MessageId == null inside
+            // the predicate is what makes the claim atomic, so a second SendMessage naming the
+            // same upload, or the sweeper deleting it, loses instead of racing. It also keeps a
+            // row that vanished under us out of the change tracker, where it would surface as a
+            // DbUpdateConcurrencyException and take the socket down with it.
+            var linked = await db.Attachments
+                .Where(a => ids.Contains(a.Id) && a.MessageId == null && a.UploaderId == userId && a.RoomId == roomId)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(a => a.MessageId, message.Id));
+            if (linked != attachmentIds.Count)
+            {
+                // The message row goes with them: an append that cannot carry its attachments is
+                // not a message the sender asked to send.
+                await transaction.RollbackAsync();
+                return AppendOutcome.InvalidAttachment;
+            }
+
+            attachments = await db.Attachments
+                .AsNoTracking()
+                .Where(a => ids.Contains(a.Id))
+                .ToListAsync();
+        }
+
+        await transaction.CommitAsync();
+
+        // The client's order, not the database's: the sender chose it.
+        var ordered = attachmentIds
+            .Select(id => ToProtocol(attachments.First(a => a.Id == id)))
+            .ToList();
+        return AppendOutcome.Appended(ToProtocol(message, [], ordered, replyTarget));
+    }
+
+    public async Task<EditOutcome> EditAsync(long id, long userId, string text)
+    {
+        await using var db = await contextFactory.CreateDbContextAsync();
+        var message = await db.Messages.FirstOrDefaultAsync(m => m.Id == id);
+        if (message is null || message.DeletedAt is not null)
+        {
+            return EditOutcome.Unknown;
+        }
+
+        if (message.UserId != userId)
+        {
+            return EditOutcome.Forbidden(message.RoomId);
+        }
+
+        message.Text = text;
+        message.EditedAt = DateTime.UtcNow;
+        message.MentionIds = await Mentions.ResolveAsync(db, text);
+        await db.SaveChangesAsync();
+
+        var reactions = await LoadReactionsAsync(db, [id]);
+        var attachments = await LoadAttachmentsAsync(db, [id]);
+        var replyTargets = await LoadReplyTargetsAsync(db, ReplyTargetIds([message]));
+        return EditOutcome.Edited(
+            message.RoomId,
+            ToProtocol(
+                message,
+                reactions.GetValueOrDefault(id, []),
+                attachments.GetValueOrDefault(id, []),
+                ReplyTargetOf(message, replyTargets)));
+    }
+
+    public async Task<DeleteOutcome> DeleteAsync(long id, long userId)
+    {
+        await using var db = await contextFactory.CreateDbContextAsync();
+        await using var transaction = await db.Database.BeginTransactionAsync();
+
+        var message = await db.Messages.FirstOrDefaultAsync(m => m.Id == id);
+        if (message is null || message.DeletedAt is not null)
+        {
+            return DeleteOutcome.Unknown;
+        }
+
+        if (message.UserId != userId)
+        {
+            return DeleteOutcome.Forbidden(message.RoomId);
+        }
+
+        var attachments = await db.Attachments
+            .AsNoTracking()
+            .Where(a => a.MessageId == id)
+            .OrderBy(a => a.Id)
+            .Select(a => new { a.Id, a.ContentType })
+            .ToListAsync();
+
+        // The row survives as a tombstone: its id, author and room are what a reply to it still
+        // resolves against. ReplyToId is kept for the same reason, from the other side.
+        message.DeletedAt = DateTime.UtcNow;
+        message.Text = string.Empty;
+        message.MentionIds = [];
+        await db.SaveChangesAsync();
+        await db.Reactions.Where(r => r.MessageId == id).ExecuteDeleteAsync();
+        await db.Attachments.Where(a => a.MessageId == id).ExecuteDeleteAsync();
+        await transaction.CommitAsync();
+
+        return DeleteOutcome.Deleted(
+            message.RoomId,
+            attachments.Select(a => (a.Id, a.ContentType)).ToList());
+    }
+
+    public async Task<ReactOutcome> ReactAsync(long messageId, long userId, string emoji, bool remove)
+    {
+        await using var db = await contextFactory.CreateDbContextAsync();
+        var message = await db.Messages
+            .AsNoTracking()
+            .Where(m => m.Id == messageId)
+            .Select(m => new { m.RoomId, m.DeletedAt })
+            .FirstOrDefaultAsync();
+        if (message is null || message.DeletedAt is not null)
+        {
+            return ReactOutcome.Unknown;
+        }
+
+        if (remove)
+        {
+            await db.Reactions
+                .Where(r => r.MessageId == messageId && r.UserId == userId && r.Emoji == emoji)
+                .ExecuteDeleteAsync();
+        }
+        else if (!await db.Reactions.AnyAsync(r => r.MessageId == messageId && r.UserId == userId && r.Emoji == emoji))
+        {
+            db.Reactions.Add(new Data.Reaction
+            {
+                MessageId = messageId,
+                UserId = userId,
+                Emoji = emoji,
+                CreatedAt = DateTime.UtcNow,
+            });
+
+            try
+            {
+                await db.SaveChangesAsync();
+            }
+            catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
+            {
+                // The same reaction raced in from another connection of this account; adding one
+                // that is already there is the documented no-op either way.
+            }
+        }
+
+        var reactions = await LoadReactionsAsync(db, [messageId]);
+        return ReactOutcome.Changed(message.RoomId, reactions.GetValueOrDefault(messageId, []));
     }
 
     // Ids are global, not per room: the latest id is what a client compares its history against.
@@ -33,9 +296,22 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         return await db.Messages.MaxAsync(m => (long?)m.Id) ?? 0;
     }
 
+    // Null when the id names no message, which every caller answers as an unknown message.
+    public async Task<string?> RoomOfAsync(long messageId)
+    {
+        await using var db = await contextFactory.CreateDbContextAsync();
+        return await db.Messages
+            .AsNoTracking()
+            .Where(m => m.Id == messageId)
+            .Select(m => m.RoomId)
+            .FirstOrDefaultAsync();
+    }
+
     public async Task<MessagePage> GetPageAsync(string roomId, int limit, long? before)
     {
         await using var db = await contextFactory.CreateDbContextAsync();
+
+        // Tombstones stay in the page: a history with holes would renumber what the client sees.
         var query = db.Messages.AsNoTracking().Where(m => m.RoomId == roomId);
         if (before is { } exclusiveUpperBound)
         {
@@ -55,19 +331,168 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         }
 
         rows.Reverse();
-        page.Messages.AddRange(rows.Select(ToProtocol));
+
+        var ids = rows.Select(m => m.Id).ToList();
+        var reactions = await LoadReactionsAsync(db, ids);
+        var attachments = await LoadAttachmentsAsync(db, ids);
+        var replyTargets = await LoadReplyTargetsAsync(db, ReplyTargetIds(rows));
+
+        page.Messages.AddRange(rows.Select(m => ToProtocol(
+            m,
+            reactions.GetValueOrDefault(m.Id, []),
+            attachments.GetValueOrDefault(m.Id, []),
+            ReplyTargetOf(m, replyTargets))));
         return page;
     }
 
-    private static ChatMessage ToProtocol(Data.Message message) => new()
-    {
-        Id = message.Id,
-        Author = message.Author,
-        Text = message.Text,
-        SentAtUnixMs = new DateTimeOffset(message.SentAt).ToUnixTimeMilliseconds(),
-        RoomId = message.RoomId,
+    private static List<long> ReplyTargetIds(IReadOnlyList<Data.Message> messages)
+        => messages.Select(m => m.ReplyToId).OfType<long>().Distinct().ToList();
 
-        // 0 for the messages that predate accounts, as PROTOCOL.md promises.
-        AuthorId = message.UserId ?? 0,
+    private static ReplyTarget? ReplyTargetOf(Data.Message message, IReadOnlyDictionary<long, ReplyTarget> targets)
+        => message.ReplyToId is { } replyToId ? targets.GetValueOrDefault(replyToId) : null;
+
+    private static async Task<Dictionary<long, ReplyTarget>> LoadReplyTargetsAsync(AppDbContext db, IReadOnlyList<long> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return [];
+        }
+
+        return await db.Messages
+            .AsNoTracking()
+            .Where(m => ids.Contains(m.Id))
+            .Select(m => new ReplyTarget(m.Id, m.Author, m.Text, m.DeletedAt != null))
+            .ToDictionaryAsync(target => target.Id);
+    }
+
+    private static async Task<Dictionary<long, IReadOnlyList<Protocol.Reaction>>> LoadReactionsAsync(
+        AppDbContext db,
+        IReadOnlyList<long> messageIds)
+    {
+        if (messageIds.Count == 0)
+        {
+            return [];
+        }
+
+        // Ordered by when each row was written, so grouping in memory yields the emoji in the
+        // order they were first used on the message.
+        var rows = await db.Reactions
+            .AsNoTracking()
+            .Where(r => messageIds.Contains(r.MessageId))
+            .OrderBy(r => r.CreatedAt)
+            .ThenBy(r => r.UserId)
+            .Select(r => new { r.MessageId, r.Emoji, r.UserId })
+            .ToListAsync();
+
+        return rows
+            .GroupBy(r => r.MessageId)
+            .ToDictionary(
+                byMessage => byMessage.Key,
+                byMessage => (IReadOnlyList<Protocol.Reaction>)byMessage
+                    .GroupBy(r => r.Emoji)
+                    .Select(byEmoji =>
+                    {
+                        var reaction = new Protocol.Reaction { Emoji = byEmoji.Key };
+                        reaction.UserIds.AddRange(byEmoji.Select(r => r.UserId).OrderBy(id => id));
+                        return reaction;
+                    })
+                    .ToList());
+    }
+
+    private static async Task<Dictionary<long, IReadOnlyList<Protocol.Attachment>>> LoadAttachmentsAsync(
+        AppDbContext db,
+        IReadOnlyList<long> messageIds)
+    {
+        if (messageIds.Count == 0)
+        {
+            return [];
+        }
+
+        var linked = messageIds.Select(id => (long?)id).ToList();
+        var rows = await db.Attachments
+            .AsNoTracking()
+            .Where(a => linked.Contains(a.MessageId))
+            .OrderBy(a => a.Id)
+            .ToListAsync();
+
+        return rows
+            .GroupBy(a => a.MessageId!.Value)
+            .ToDictionary(
+                byMessage => byMessage.Key,
+                byMessage => (IReadOnlyList<Protocol.Attachment>)byMessage.Select(ToProtocol).ToList());
+    }
+
+    private static Protocol.Attachment ToProtocol(Data.Attachment attachment) => new()
+    {
+        Id = attachment.Id,
+        FileName = attachment.FileName,
+        ContentType = attachment.ContentType,
+        Size = attachment.Size,
     };
+
+    private static ChatMessage ToProtocol(
+        Data.Message message,
+        IReadOnlyList<Protocol.Reaction> reactions,
+        IReadOnlyList<Protocol.Attachment> attachments,
+        ReplyTarget? replyTarget)
+    {
+        var chatMessage = new ChatMessage
+        {
+            Id = message.Id,
+            Author = message.Author,
+            Text = message.Text,
+            SentAtUnixMs = new DateTimeOffset(message.SentAt).ToUnixTimeMilliseconds(),
+            RoomId = message.RoomId,
+
+            // 0 for the messages that predate accounts, as PROTOCOL.md promises.
+            AuthorId = message.UserId ?? 0,
+            EditedAtUnixMs = message.EditedAt is { } editedAt
+                ? new DateTimeOffset(editedAt).ToUnixTimeMilliseconds()
+                : 0,
+            Deleted = message.DeletedAt is not null,
+        };
+
+        chatMessage.MentionIds.AddRange(message.MentionIds);
+        chatMessage.Reactions.AddRange(reactions);
+        chatMessage.Attachments.AddRange(attachments);
+
+        if (message.ReplyToId is { } replyToId)
+        {
+            // A target that no longer exists cannot happen — deleting tombstones rather than
+            // removes — but the reference has to render as something, so it renders as deleted.
+            chatMessage.ReplyTo = replyTarget is null
+                ? new ReplyRef { Id = replyToId, Author = string.Empty, Deleted = true }
+                : new ReplyRef
+                {
+                    Id = replyTarget.Id,
+                    Author = replyTarget.Author,
+                    Excerpt = Excerpt(replyTarget.Text),
+                    Deleted = replyTarget.Deleted,
+                };
+        }
+
+        return chatMessage;
+    }
+
+    private static string Excerpt(string text)
+    {
+        var scalars = 0;
+        var length = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (scalars == ExcerptMaxScalars)
+            {
+                return text[..length];
+            }
+
+            scalars++;
+            length += rune.Utf16SequenceLength;
+        }
+
+        return text;
+    }
+
+    // The state a ReplyRef is rendered from: the target's current text and tombstone flag, read
+    // when the reply is read rather than frozen when it was written.
+    private sealed record ReplyTarget(long Id, string Author, string Text, bool Deleted);
 }

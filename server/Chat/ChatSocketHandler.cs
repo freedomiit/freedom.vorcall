@@ -1,6 +1,7 @@
 using System.Net.WebSockets;
 using Google.Protobuf;
 using Microsoft.EntityFrameworkCore;
+using Vorcall.Server.Attachments;
 using Vorcall.Server.Data;
 using Vorcall.Server.Protocol;
 
@@ -11,6 +12,8 @@ namespace Vorcall.Server.Chat;
 public sealed class ChatSocketHandler(
     ConnectionRegistry registry,
     MessageService messages,
+    RoomDirectory rooms,
+    AttachmentStore attachments,
     IDbContextFactory<AppDbContext> contextFactory,
     IHostApplicationLifetime lifetime,
     ILogger<ChatSocketHandler> logger)
@@ -27,7 +30,16 @@ public sealed class ChatSocketHandler(
     // Shared with Program's shutdown hook so both close paths report the same reason.
     public const string ShutdownReason = "server shutting down";
 
-    private const string InvalidRoomIdDetail = "room id must match ^[a-z0-9-]{1,32}$";
+    private const string InvalidRoomIdDetail = "room id must match ^[a-z0-9-]{1,48}$";
+    private const string InvalidTextDetail = "text must be 1..2000 characters after trimming";
+    private const string InvalidAttachmentDetail = "attachment is unknown, not yours, not in this room or already used";
+    private const string UnknownMessageDetail = "unknown or deleted message";
+    private const string NotAMemberDetail = "not a member of that room";
+    private const string UnleavableRoomDetail = "this room cannot be left";
+
+    // The eight of PROTOCOL.md, compared as exact strings: the heart carries its variation
+    // selector, so a client that drops it is not sending one of these.
+    private static readonly string[] AcceptedReactions = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "👀"];
 
     private static readonly TimeSpan HelloDeadline = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan IdleDeadline = TimeSpan.FromSeconds(120);
@@ -117,10 +129,11 @@ public sealed class ChatSocketHandler(
         }
 
         var latestMessageId = await messages.GetLatestIdAsync();
+        var entries = await rooms.EntriesForAsync(userId);
 
-        // Attach queues Welcome and the initial RoomState frames under the registry lock, so no
-        // room broadcast can overtake them.
-        var replaced = registry.Attach(connection, userId, username, latestMessageId);
+        // Attach queues Welcome, the initial RoomState frames and the room list under the
+        // registry lock, so no room broadcast can overtake them.
+        var replaced = registry.Attach(connection, userId, username, latestMessageId, entries);
         if (replaced is not null)
         {
             // Detached and never awaited: the replaced socket may be dead, and this account's
@@ -227,7 +240,7 @@ public sealed class ChatSocketHandler(
                     break;
 
                 case ClientFrame.PayloadOneofCase.JoinRoom:
-                    if (!HandleJoin(connection, frame.JoinRoom))
+                    if (!await HandleJoinAsync(connection, frame.JoinRoom))
                     {
                         await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
                         return;
@@ -236,7 +249,7 @@ public sealed class ChatSocketHandler(
                     break;
 
                 case ClientFrame.PayloadOneofCase.LeaveRoom:
-                    if (!HandleLeave(connection, frame.LeaveRoom))
+                    if (!await HandleLeaveAsync(connection, frame.LeaveRoom))
                     {
                         await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
                         return;
@@ -255,6 +268,60 @@ public sealed class ChatSocketHandler(
 
                 case ClientFrame.PayloadOneofCase.LeaveVoice:
                     if (!HandleLeaveVoice(connection, frame.LeaveVoice))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.CreateRoom:
+                    if (!await HandleCreateRoomAsync(connection, frame.CreateRoom))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.OpenDm:
+                    if (!await HandleOpenDmAsync(connection, frame.OpenDm))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.MarkRead:
+                    if (!await HandleMarkReadAsync(connection, frame.MarkRead))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.EditMessage:
+                    if (!await HandleEditAsync(connection, frame.EditMessage))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.DeleteMessage:
+                    if (!await HandleDeleteAsync(connection, frame.DeleteMessage))
+                    {
+                        await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                        return;
+                    }
+
+                    break;
+
+                case ClientFrame.PayloadOneofCase.React:
+                    if (!await HandleReactAsync(connection, frame.React))
                     {
                         await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
                         return;
@@ -312,63 +379,351 @@ public sealed class ChatSocketHandler(
                 return true;
         }
 
-        if (!Validation.TryNormalizeText(send.Text, out var text))
+        // The count and the duplicates are decided here so a frame that can never be accepted
+        // never opens a transaction; whose the files are is the append's own business.
+        var attachmentIds = send.AttachmentIds.ToList();
+        if (attachmentIds.Count > AttachmentsOptions.MaxPerMessage
+            || attachmentIds.Distinct().Count() != attachmentIds.Count)
+        {
+            return NonFatal(connection, ErrorCode.InvalidAttachment, InvalidAttachmentDetail);
+        }
+
+        // Text may be empty, and only then, when the message carries an image instead.
+        if (!Validation.TryNormalizeText(send.Text, out var text)
+            && !(attachmentIds.Count > 0 && string.IsNullOrWhiteSpace(send.Text)))
         {
             logger.LogWarning("Connection {ConnectionId} ({Username}) sent invalid text", connection.Id, username);
-            return NonFatal(connection, ErrorCode.InvalidMessage, "text must be 1..2000 characters after trimming");
+            return NonFatal(connection, ErrorCode.InvalidMessage, InvalidTextDetail);
         }
 
         // Persist first: an id only exists once the row is committed, and the broadcast
         // carries that id.
-        var chatMessage = await messages.AppendAsync(userId, username, roomId, text);
-        registry.BroadcastToRoom(roomId, new ServerFrame { Message = chatMessage });
+        var outcome = await messages.AppendAsync(userId, username, roomId, text, send.ReplyToId, attachmentIds);
+        switch (outcome.Status)
+        {
+            case AppendOutcome.Kind.UnknownReply:
+                return NonFatal(connection, ErrorCode.UnknownMessage, "reply target is not in this room");
+
+            case AppendOutcome.Kind.InvalidAttachment:
+                return NonFatal(connection, ErrorCode.InvalidAttachment, InvalidAttachmentDetail);
+        }
+
+        registry.BroadcastToRoom(roomId, new ServerFrame { Message = outcome.Message! });
         return true;
     }
 
-    private bool HandleJoin(ClientConnection connection, JoinRoom join)
+    private async Task<bool> HandleJoinAsync(ClientConnection connection, JoinRoom join)
     {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
         if (!Validation.TryNormalizeRoomId(join.RoomId, out var roomId))
         {
             return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
         }
 
+        // Asked before the write: a room the caller cannot see must not cost a transaction.
+        switch (registry.Access(connection, roomId))
+        {
+            case RoomAccess.UnknownRoom:
+                return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+
+            case RoomAccess.Forbidden:
+                return NonFatal(connection, ErrorCode.Forbidden, "not a member of this DM");
+
+            case RoomAccess.Stale:
+                logger.LogDebug(
+                    "Connection {ConnectionId} (user {UserId}) joined room {RoomId} after being replaced; dropping",
+                    connection.Id,
+                    userId,
+                    roomId);
+                return true;
+
+            // A member asking again is asking for a resync, which writes no row.
+            case RoomAccess.NotAMember:
+                await rooms.JoinAsync(roomId, userId);
+                break;
+        }
+
+        // The membership exists now; the registry publishes the presence that follows from it.
         switch (registry.Join(connection, roomId))
         {
             case JoinOutcome.UnknownRoom:
                 return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
 
+            case JoinOutcome.Forbidden:
+                return NonFatal(connection, ErrorCode.Forbidden, "not a member of this DM");
+
             case JoinOutcome.Stale:
-                logger.LogDebug("Connection {ConnectionId} joined a room after being replaced; dropping", connection.Id);
+                logger.LogDebug("Connection {ConnectionId} joined room {RoomId} after being replaced; dropping", connection.Id, roomId);
                 return true;
 
-            // Joined and AlreadyMember: the registry has already queued the RoomState.
+            // Joined and Resynced: the registry has already queued the RoomState.
             default:
                 return true;
         }
     }
 
-    private bool HandleLeave(ClientConnection connection, LeaveRoom leave)
+    private async Task<bool> HandleLeaveAsync(ClientConnection connection, LeaveRoom leave)
     {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
         if (!Validation.TryNormalizeRoomId(leave.RoomId, out var roomId))
         {
             return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
         }
 
+        var access = registry.Access(connection, roomId);
+        if (access is RoomAccess.UnknownRoom)
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
+        }
+
+        if (access is RoomAccess.Stale)
+        {
+            logger.LogDebug(
+                "Connection {ConnectionId} (user {UserId}) left room {RoomId} after being replaced; dropping",
+                connection.Id,
+                userId,
+                roomId);
+            return true;
+        }
+
+        // general and DMs are permanent. Forbidden here is a DM the caller is not part of, which
+        // is answered the same way rather than admitting that the DM exists at all.
+        if (access is RoomAccess.Forbidden || roomId == ConnectionRegistry.GeneralRoomId || RoomNames.IsDm(roomId))
+        {
+            return NonFatal(connection, ErrorCode.Forbidden, UnleavableRoomDetail);
+        }
+
+        if (access is RoomAccess.NotAMember)
+        {
+            return NonFatal(connection, ErrorCode.NotAMember, NotAMemberDetail);
+        }
+
+        await rooms.LeaveAsync(roomId, userId);
         switch (registry.Leave(connection, roomId))
         {
             case LeaveOutcome.UnknownRoom:
                 return NonFatal(connection, ErrorCode.UnknownRoom, "unknown room");
 
+            case LeaveOutcome.Forbidden:
+                return NonFatal(connection, ErrorCode.Forbidden, UnleavableRoomDetail);
+
             case LeaveOutcome.NotAMember:
-                return NonFatal(connection, ErrorCode.NotAMember, "not a member of that room");
+                return NonFatal(connection, ErrorCode.NotAMember, NotAMemberDetail);
 
             case LeaveOutcome.Stale:
-                logger.LogDebug("Connection {ConnectionId} left a room after being replaced; dropping", connection.Id);
+                logger.LogDebug("Connection {ConnectionId} left room {RoomId} after being replaced; dropping", connection.Id, roomId);
                 return true;
 
             default:
                 return true;
         }
+    }
+
+    private async Task<bool> HandleCreateRoomAsync(ClientConnection connection, CreateRoom create)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        var outcome = await rooms.CreateAsync(create.Name, userId);
+        switch (outcome.Status)
+        {
+            case CreateOutcome.Kind.InvalidName:
+                return NonFatal(
+                    connection,
+                    ErrorCode.InvalidRoomName,
+                    "room name must be 1..32 characters and yield a usable id");
+
+            case CreateOutcome.Kind.Exists:
+                return NonFatal(connection, ErrorCode.RoomExists, "a room with that id already exists");
+        }
+
+        if (registry.CreateRoom(connection, outcome.Room!) is CreateRoomOutcome.Stale)
+        {
+            logger.LogDebug(
+                "Connection {ConnectionId} created room {RoomId} after being replaced; dropping",
+                connection.Id,
+                outcome.Room!.Id);
+        }
+
+        return true;
+    }
+
+    private async Task<bool> HandleOpenDmAsync(ClientConnection connection, OpenDm open)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        var outcome = await rooms.OpenDmAsync(userId, open.UserId);
+
+        // One answer for both: which of the two it was is not the caller's business.
+        if (outcome.Status is DmOutcome.Kind.Self or DmOutcome.Kind.UnknownUser)
+        {
+            return NonFatal(connection, ErrorCode.Forbidden, "cannot open a direct message with that user");
+        }
+
+        registry.OpenDm(connection, outcome.Room!, open.UserId, created: outcome.Status is DmOutcome.Kind.Opened);
+        return true;
+    }
+
+    private async Task<bool> HandleMarkReadAsync(ClientConnection connection, MarkRead mark)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (!Validation.TryNormalizeRoomId(mark.RoomId, out var roomId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownRoom, InvalidRoomIdDetail);
+        }
+
+        if (!registry.IsMember(roomId, userId))
+        {
+            return NonFatal(connection, ErrorCode.NotAMember, NotAMemberDetail);
+        }
+
+        // The cursor only ever moves forward, and the frame has no answer.
+        await rooms.MarkReadAsync(roomId, userId, mark.MessageId);
+        return true;
+    }
+
+    private async Task<bool> HandleEditAsync(ClientConnection connection, EditMessage edit)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (!Validation.TryNormalizeText(edit.Text, out var text))
+        {
+            return NonFatal(connection, ErrorCode.InvalidMessage, InvalidTextDetail);
+        }
+
+        // The room is read first: whether the caller may touch the message at all is decided
+        // before anything is written.
+        if (await messages.RoomOfAsync(edit.Id) is not { } roomId)
+        {
+            return NonFatal(connection, ErrorCode.UnknownMessage, UnknownMessageDetail);
+        }
+
+        if (!registry.IsMember(roomId, userId))
+        {
+            return NonFatal(connection, ErrorCode.NotAMember, NotAMemberDetail);
+        }
+
+        var outcome = await messages.EditAsync(edit.Id, userId, text);
+        switch (outcome.Status)
+        {
+            case EditOutcome.Kind.Unknown:
+                return NonFatal(connection, ErrorCode.UnknownMessage, UnknownMessageDetail);
+
+            case EditOutcome.Kind.Forbidden:
+                return NonFatal(connection, ErrorCode.Forbidden, "only the author can edit a message");
+        }
+
+        registry.BroadcastToRoom(
+            outcome.RoomId,
+            new ServerFrame { MessageEdited = new MessageEdited { Message = outcome.Message! } });
+        return true;
+    }
+
+    private async Task<bool> HandleDeleteAsync(ClientConnection connection, DeleteMessage delete)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (await messages.RoomOfAsync(delete.Id) is not { } roomId)
+        {
+            return NonFatal(connection, ErrorCode.UnknownMessage, UnknownMessageDetail);
+        }
+
+        if (!registry.IsMember(roomId, userId))
+        {
+            return NonFatal(connection, ErrorCode.NotAMember, NotAMemberDetail);
+        }
+
+        var outcome = await messages.DeleteAsync(delete.Id, userId);
+        switch (outcome.Status)
+        {
+            case DeleteOutcome.Kind.Unknown:
+                return NonFatal(connection, ErrorCode.UnknownMessage, UnknownMessageDetail);
+
+            case DeleteOutcome.Kind.Forbidden:
+                return NonFatal(connection, ErrorCode.Forbidden, "only the author can delete a message");
+        }
+
+        // The rows are already gone; the files follow them.
+        attachments.DeleteFiles(outcome.Attachments);
+        logger.LogInformation("User {UserId} deleted message {MessageId} in room {RoomId}", userId, delete.Id, outcome.RoomId);
+        registry.BroadcastToRoom(
+            outcome.RoomId,
+            new ServerFrame { MessageDeleted = new MessageDeleted { RoomId = outcome.RoomId, Id = delete.Id } });
+        return true;
+    }
+
+    private async Task<bool> HandleReactAsync(ClientConnection connection, React react)
+    {
+        if (!TryIdentify(connection, out var userId))
+        {
+            return true;
+        }
+
+        if (!AcceptedReactions.Contains(react.Emoji))
+        {
+            return NonFatal(connection, ErrorCode.InvalidReaction, "emoji is not one of the accepted reactions");
+        }
+
+        if (await messages.RoomOfAsync(react.MessageId) is not { } roomId)
+        {
+            return NonFatal(connection, ErrorCode.UnknownMessage, UnknownMessageDetail);
+        }
+
+        if (!registry.IsMember(roomId, userId))
+        {
+            return NonFatal(connection, ErrorCode.NotAMember, NotAMemberDetail);
+        }
+
+        var outcome = await messages.ReactAsync(react.MessageId, userId, react.Emoji, react.Remove);
+        if (outcome.Status is ReactOutcome.Kind.Unknown)
+        {
+            return NonFatal(connection, ErrorCode.UnknownMessage, UnknownMessageDetail);
+        }
+
+        // The full grouped set, so the broadcast replaces what every client knew.
+        var changed = new ReactionsChanged { RoomId = outcome.RoomId, MessageId = react.MessageId };
+        changed.Reactions.AddRange(outcome.Reactions);
+        registry.BroadcastToRoom(outcome.RoomId, new ServerFrame { ReactionsChanged = changed });
+        return true;
+    }
+
+    // A latched close must never persist or broadcast anything, however the frame was read: the
+    // close wins even if it landed mid-receive. MarkReady sets the identity before IsReady, so a
+    // ready connection always has one.
+    private bool TryIdentify(ClientConnection connection, out long userId)
+    {
+        if (connection.IsReady && connection.UserId is { } identified)
+        {
+            userId = identified;
+            return true;
+        }
+
+        logger.LogDebug("Connection {ConnectionId} acted after close was latched; dropping", connection.Id);
+        userId = 0;
+        return false;
     }
 
     private bool HandleJoinVoice(ClientConnection connection, JoinVoice join)

@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
 using Vorcall.Server.Protocol;
 
@@ -54,6 +55,7 @@ public sealed class AccountService(
     IPasswordHasher<User> hasher,
     TokenService tokens,
     LoginThrottle throttle,
+    RoomDirectory rooms,
     ILogger<AccountService> logger)
 {
     private static readonly User HashingSubject = new();
@@ -111,6 +113,10 @@ public sealed class AccountService(
             // Two registrations for the same name raced past the existence check.
             return RegisterOutcome.Rejected(RegisterStatus.UsernameTaken);
         }
+
+        // Inside the same transaction as the user row: an account that exists is always a member
+        // of general, which is the one room nobody may leave.
+        await rooms.EnsureGeneralMembershipAsync(db, user.Id);
 
         // Conditional claim rather than a write on the row we read: another registration may
         // have consumed the invite between the two statements.

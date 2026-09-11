@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Vorcall
+Comment=Private chat and voice for the group
+Exec=vorcall
+Icon=vorcall
+Terminal=false
+Categories=Network;Chat;
+Keywords=chat;voice;
+StartupNotify=false
+StartupWMClass=vorcall

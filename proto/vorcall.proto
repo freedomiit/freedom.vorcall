@@ -10,8 +10,61 @@ message ChatMessage {
   string author = 2;              // username at the time of sending
   string text = 3;
   int64 sent_at_unix_ms = 4;
-  string room_id = 5;             // "general" today
+  string room_id = 5;             // the room the message belongs to
   int64 author_id = 6;            // user id; 0 for messages that predate accounts
+  int64 edited_at_unix_ms = 7;    // 0 = never edited
+  bool deleted = 8;               // tombstone: text is empty, no attachments, no reactions
+  ReplyRef reply_to = 9;          // absent when not a reply; filled by the server at read time
+  repeated int64 mention_ids = 10;      // users named by <@id> tokens in text, validated by the server
+  repeated Reaction reactions = 11;     // grouped by emoji, user ids ascending
+  repeated Attachment attachments = 12;
+}
+
+// A snapshot of the message a reply points at, resolved when the reply is read.
+message ReplyRef {
+  int64 id = 1;
+  string author = 2;
+  string excerpt = 3;             // first 120 scalars of the target's current text
+  bool deleted = 4;               // the target is a tombstone
+}
+
+// One emoji and everyone who reacted with it.
+message Reaction {
+  string emoji = 1;
+  repeated int64 user_ids = 2;    // ascending
+}
+
+// An image attached to a message.
+// REST: POST /api/attachments?room=<id> -> Attachment
+// REST: GET /api/attachments/{id} -> the bytes
+message Attachment {
+  int64 id = 1;
+  string file_name = 2;
+  string content_type = 3;
+  int64 size = 4;                 // bytes
+}
+
+enum RoomKind {
+  ROOM_KIND_UNSPECIFIED = 0;
+  ROOM_KIND_PUBLIC = 1;           // any account may see and join
+  ROOM_KIND_DM = 2;               // exactly two permanent members
+}
+
+// The shared facts about a room; counters are per reader and live in RoomEntry.
+message Room {
+  string room_id = 1;
+  RoomKind kind = 2;
+  string name = 3;                // display name; empty for DMs
+  repeated int64 member_ids = 4;  // persistent membership; "joined" is this list containing me
+  int64 created_by = 5;
+}
+
+// One room as it appears in RoomList, with the reader's own counters.
+message RoomEntry {
+  Room room = 1;
+  int64 unread = 2;
+  int64 mentions = 3;
+  int64 last_message_id = 4;
 }
 
 // Client -> server. One ClientFrame per binary WebSocket message.
@@ -24,6 +77,12 @@ message ClientFrame {
     LeaveRoom leave_room = 5;
     JoinVoice join_voice = 6;
     LeaveVoice leave_voice = 7;
+    CreateRoom create_room = 8;
+    OpenDm open_dm = 9;
+    MarkRead mark_read = 10;
+    EditMessage edit_message = 11;
+    DeleteMessage delete_message = 12;
+    React react = 13;
   }
 }
 
@@ -36,8 +95,10 @@ message Hello {
 }
 
 message SendMessage {
-  string text = 1;                // trimmed, 1..2000 chars
+  string text = 1;                // trimmed, 1..2000 chars; may be empty only with attachments
   string room_id = 2;             // empty means "general"
+  int64 reply_to_id = 3;          // 0 = not a reply; otherwise a message of the same room
+  repeated int64 attachment_ids = 4; // at most 4, uploaded by the sender to this room, not yet linked
 }
 
 message Ping {
@@ -50,6 +111,34 @@ message JoinRoom {
 
 message LeaveRoom {
   string room_id = 1;
+}
+
+message CreateRoom {
+  string name = 1;                // trimmed, 1..32 scalars; its slug becomes the room id
+}
+
+message OpenDm {
+  int64 user_id = 1;              // the other party; the DM is created on first use
+}
+
+message MarkRead {
+  string room_id = 1;
+  int64 message_id = 2;           // the newest message the reader has seen
+}
+
+message EditMessage {
+  int64 id = 1;
+  string text = 2;                // same rules as SendMessage.text, never empty
+}
+
+message DeleteMessage {
+  int64 id = 1;
+}
+
+message React {
+  int64 message_id = 1;
+  string emoji = 2;               // one of the eight reactions the server accepts
+  bool remove = 3;                // true removes the reader's reaction instead of adding it
 }
 
 message JoinVoice {
@@ -75,6 +164,11 @@ message ServerFrame {
     VoiceMemberJoined voice_member_joined = 10;
     VoiceMemberLeft voice_member_left = 11;
     Speaking speaking = 12;
+    RoomList room_list = 13;
+    RoomUpdated room_updated = 14;
+    MessageEdited message_edited = 15;
+    MessageDeleted message_deleted = 16;
+    ReactionsChanged reactions_changed = 17;
   }
 }
 
@@ -149,6 +243,32 @@ message Speaking {
   bool speaking = 3;
 }
 
+// Every room the account can see: every public room plus its own DMs.
+message RoomList {
+  repeated RoomEntry rooms = 1;
+}
+
+// Replaces what the client knows about that room's shared facts; never carries counters.
+message RoomUpdated {
+  Room room = 1;
+}
+
+message MessageEdited {
+  ChatMessage message = 1;
+}
+
+message MessageDeleted {
+  string room_id = 1;
+  int64 id = 2;
+}
+
+// The full grouped reaction set of one message after a change.
+message ReactionsChanged {
+  string room_id = 1;
+  int64 message_id = 2;
+  repeated Reaction reactions = 3;
+}
+
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   ERROR_CODE_PROTOCOL = 1;         // malformed frame, wrong first frame, unsupported version, text frame
@@ -159,6 +279,12 @@ enum ErrorCode {
   ERROR_CODE_NOT_A_MEMBER = 6;     // non-fatal: the connection is not in that room
   ERROR_CODE_VOICE_UNAVAILABLE = 7; // non-fatal: the media relay is disabled or not running
   ERROR_CODE_NOT_IN_VOICE = 8;      // non-fatal: LeaveVoice while not in that room's voice channel
+  ERROR_CODE_FORBIDDEN = 9;         // non-fatal: not allowed on that room or message
+  ERROR_CODE_ROOM_EXISTS = 10;      // non-fatal: the room name slugs to an id already taken
+  ERROR_CODE_UNKNOWN_MESSAGE = 11;  // non-fatal: message id unknown, or a tombstone
+  ERROR_CODE_INVALID_ATTACHMENT = 12; // non-fatal: attachment unknown, foreign, wrong room or already linked
+  ERROR_CODE_INVALID_ROOM_NAME = 13; // non-fatal: the name is empty, too long or slugs to nothing usable
+  ERROR_CODE_INVALID_REACTION = 14;  // non-fatal: emoji outside the accepted set
 }
 
 message Error {

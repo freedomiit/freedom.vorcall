@@ -39,6 +39,10 @@ pub struct Report {
     pub bytes_received: u64,
     pub rejected: u64,
     pub send_failures: u64,
+    /// Audio frames handed to the socket; `packets_sent` also counts keepalive
+    /// pings, which is why this exists.
+    pub frames_sent: u64,
+    pub frames_gated: u64,
     pub decoded_frames: u64,
     pub tone_frames: u64,
     pub rtt: Rtt,
@@ -89,7 +93,7 @@ impl Report {
 
         format!(
             "{{\"user\":{},\"user_id\":{},\"room\":{},\"ssrc\":{},\
-\"packets_sent\":{},\"packets_received\":{},\"bytes_sent\":{},\"bytes_received\":{},\"rejected\":{},\"send_failures\":{},\
+\"packets_sent\":{},\"packets_received\":{},\"bytes_sent\":{},\"bytes_received\":{},\"rejected\":{},\"send_failures\":{},\"frames_sent\":{},\"frames_gated\":{},\
 \"decoded_seconds\":{:.2},\"tone_seconds\":{:.2},\"gaps\":{},\"late\":{},\
 \"rtt_ms\":{{\"min\":{},\"avg\":{},\"max\":{},\"last\":{},\"samples\":{}}},\
 \"link\":{},\"peers\":[{}],\"speaking_events\":[{}]}}",
@@ -103,6 +107,8 @@ impl Report {
             self.bytes_received,
             self.rejected,
             self.send_failures,
+            self.frames_sent,
+            self.frames_gated,
             seconds(self.decoded_frames),
             self.tone_seconds(),
             gaps,

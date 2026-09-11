@@ -8,7 +8,8 @@
 #   export VORCALL_SERVER_KEY=<the Vorcall__ServerKey from the host .env>
 #   export VORCALL_SERVER_URL=https://vorcall.example.com   # optional
 #
-# Output: dist/vorcall-linux-x86_64
+# Output: dist/vorcall-linux-x86_64 and the first-install tarball
+#         dist/vorcall-linux-x86_64.tar.gz (scripts/package-client-linux.sh)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,3 +47,6 @@ OUT="dist/vorcall-linux-x86_64"
 cp client/target/release/vorcall "$OUT"
 
 echo "built $OUT ($(du -h "$OUT" | cut -f1))"
+
+VERSION="$("$OUT" --version | cut -d' ' -f2)"
+scripts/package-client-linux.sh "$OUT" "$VERSION" dist

@@ -7,6 +7,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Vorcall.Server.Api;
+using Vorcall.Server.Attachments;
 using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
@@ -22,6 +23,7 @@ public static class ServiceSetup
 {
     private const int PasswordHashIterations = 210_000;
     private const int AuthRequestsPerWindow = 10;
+    private const int UploadRequestsPerWindow = 20;
 
     public static void Configure(WebApplicationBuilder builder)
     {
@@ -46,17 +48,25 @@ public static class ServiceSetup
 
         var updates = UpdatesOptions.FromConfiguration(builder.Configuration);
 
+        // Same again for the attachment quota: a typo must fail the boot, not silently fall
+        // back to a default that fills the disk.
+        var attachments = AttachmentsOptions.FromConfiguration(builder.Configuration);
+
         builder.Services.AddDbContextFactory<AppDbContext>(o => o.UseNpgsql(connectionString));
         builder.Services.AddSingleton(new ServerKeyValidator(serverKey));
         builder.Services.AddSingleton(jwt);
         builder.Services.AddSingleton(voice);
         builder.Services.AddSingleton(updates);
+        builder.Services.AddSingleton(attachments);
         builder.Services.AddSingleton<UpdateManifestStore>();
+        builder.Services.AddSingleton<AttachmentStore>();
+        builder.Services.AddHostedService<AttachmentSweeper>();
 
         // One instance in both roles: the registry signals over the very relay the host runs.
         builder.Services.AddSingleton<VoiceRelay>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<VoiceRelay>());
         builder.Services.AddSingleton<ConnectionRegistry>();
+        builder.Services.AddSingleton<RoomDirectory>();
         builder.Services.AddSingleton<MessageService>();
         builder.Services.AddSingleton<ChatSocketHandler>();
         builder.Services.AddSingleton<IPasswordHasher<User>>(
@@ -108,6 +118,20 @@ public static class ServiceSetup
                     _ => new SlidingWindowRateLimiterOptions
                     {
                         PermitLimit = AuthRequestsPerWindow,
+                        Window = TimeSpan.FromMinutes(1),
+                        SegmentsPerWindow = 6,
+                        QueueLimit = 0,
+                    }));
+
+            // Partitioned by the bearer's user id, per PROTOCOL.md.
+            options.AddPolicy(AttachmentsEndpoints.RateLimitPolicy, context =>
+                RateLimitPartition.GetSlidingWindowLimiter(
+                    BearerIdentity.TryGetUserId(context.User, out var userId)
+                        ? $"user:{userId}"
+                        : $"ip:{context.Connection.RemoteIpAddress?.ToString() ?? "unknown"}",
+                    _ => new SlidingWindowRateLimiterOptions
+                    {
+                        PermitLimit = UploadRequestsPerWindow,
                         Window = TimeSpan.FromMinutes(1),
                         SegmentsPerWindow = 6,
                         QueueLimit = 0,

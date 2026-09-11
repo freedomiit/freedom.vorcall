@@ -8,9 +8,11 @@
 //! Capture runs one way: the cpal callback appends interleaved samples to a
 //! ring, the thread downmixes them to mono, resamples to 48 kHz when the device
 //! runs at another rate, cuts 20 ms frames, and hands the Opus packets to the
-//! media engine while push-to-talk is held. Playback runs the other way: a
-//! single infinite [`VoiceSource`] sits in the rodio mixer and pulls mixed
-//! frames from [`Playout`], which the engine's receive task keeps fed.
+//! media engine while the frame is allowed out: in push-to-talk mode while the
+//! key is held, in voice-activation mode while the noise gate stands open.
+//! Playback runs the other way: a single infinite [`VoiceSource`] sits in the
+//! rodio mixer and pulls mixed frames from [`Playout`], which the engine's
+//! receive task keeps fed.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -24,8 +26,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use futures::channel::mpsc as async_mpsc;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Async, FixedAsync, Resampler as _, SincInterpolationParameters};
+use vorcall_core::config::{TransmitMode, VAD_DEFAULT_DB};
 use vorcall_voice::codec::Encoder;
-use vorcall_voice::{FRAME_SAMPLES, FrameSender, Playout, SAMPLE_RATE};
+use vorcall_voice::{FRAME_SAMPLES, FrameSender, GateDecision, NoiseGate, Playout, SAMPLE_RATE};
 
 /// How often the thread wakes up to cut frames when no command arrives. Well
 /// under the 20 ms a frame lasts, so the capture ring never runs long.
@@ -38,6 +41,10 @@ const MAX_QUEUED_MS: usize = 200;
 /// A silence at least this long ends a talk spurt, so the next frame sent is
 /// marked as the start of a new one.
 const SPURT_GAP: Duration = Duration::from_millis(200);
+
+/// Frames between two input-level events: five 20 ms frames make the 10 Hz the
+/// settings meter is drawn at.
+const LEVEL_EVERY_FRAMES: u8 = 5;
 
 /// Opus at 48 kbit/s over 20 ms frames never comes near this.
 const MAX_PACKET: usize = 512;
@@ -75,6 +82,22 @@ pub struct AudioSettings {
     pub output: Option<String>,
 }
 
+/// How the thread decides that a frame leaves the machine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransmitSettings {
+    pub mode: TransmitMode,
+    pub threshold_db: f32,
+}
+
+impl Default for TransmitSettings {
+    fn default() -> Self {
+        Self {
+            mode: TransmitMode::PushToTalk,
+            threshold_db: VAD_DEFAULT_DB,
+        }
+    }
+}
+
 pub enum AudioCommand {
     Open {
         settings: AudioSettings,
@@ -83,6 +106,8 @@ pub enum AudioCommand {
     },
     /// Reopens both streams, unless nothing changed.
     SetDevices(AudioSettings),
+    /// Mode and gate threshold; takes effect on the next frame.
+    SetTransmit(TransmitSettings),
     SetPtt(bool),
     SetMuted(bool),
     SetDeafened(bool),
@@ -100,6 +125,14 @@ pub enum AudioEvent {
     },
     Failed(String),
     Closed,
+    /// Every 100 ms while a microphone is open: the last frame's level in dBFS
+    /// and whether the gate is open.
+    InputLevel {
+        dbfs: f32,
+        gate_open: bool,
+    },
+    /// On every change of the effective "audio is leaving this machine" state.
+    Transmitting(bool),
 }
 
 #[derive(Clone)]
@@ -156,6 +189,12 @@ struct AudioThread {
     capture: Option<Capture>,
     encoder: Option<Encoder>,
 
+    transmit: TransmitSettings,
+    gate: NoiseGate,
+    /// The last [`AudioEvent::Transmitting`] sent.
+    transmitting: bool,
+    frames_since_level: u8,
+
     ptt: bool,
     muted: bool,
     /// Shared with the [`VoiceSource`] in the mixer, which keeps pulling frames
@@ -187,6 +226,7 @@ struct Capture {
 
 impl AudioThread {
     fn new(events: async_mpsc::UnboundedSender<AudioEvent>) -> Self {
+        let transmit = TransmitSettings::default();
         Self {
             events,
             settings: AudioSettings::default(),
@@ -195,6 +235,10 @@ impl AudioThread {
             output: None,
             capture: None,
             encoder: None,
+            gate: NoiseGate::new(transmit.threshold_db),
+            transmit,
+            transmitting: false,
+            frames_since_level: 0,
             ptt: false,
             muted: false,
             deafened: Arc::new(AtomicBool::new(false)),
@@ -230,6 +274,10 @@ impl AudioThread {
                     self.close_streams();
                     self.start();
                 }
+            }
+            AudioCommand::SetTransmit(transmit) => {
+                self.transmit = transmit;
+                self.gate.set_threshold(transmit.threshold_db);
             }
             AudioCommand::SetPtt(held) => self.ptt = held,
             AudioCommand::SetMuted(muted) => self.muted = muted,
@@ -366,6 +414,9 @@ impl AudioThread {
         self.encoder = None;
         self.queue.clear();
         self.last_sent = None;
+        self.gate = NoiseGate::new(self.transmit.threshold_db);
+        self.frames_since_level = 0;
+        self.set_transmitting(false);
     }
 
     /// Moves everything the microphone captured since the last tick through the
@@ -410,13 +461,33 @@ impl AudioThread {
 
     fn send_frames(&mut self) {
         let now = Instant::now();
-        let transmitting = self.ptt && !self.muted && !self.deafened.load(Ordering::Relaxed);
 
         let mut frame = [0.0f32; FRAME_SAMPLES];
         while self.queue.len() >= FRAME_SAMPLES {
             for (slot, sample) in frame.iter_mut().zip(self.queue.drain(..FRAME_SAMPLES)) {
                 *slot = sample;
             }
+
+            // Advanced in both modes and while muted, so the meter stays live
+            // and a mode switch never starts from a stale gate.
+            let decision = self.gate.process(&frame, now);
+
+            self.frames_since_level += 1;
+            if self.frames_since_level >= LEVEL_EVERY_FRAMES {
+                self.frames_since_level = 0;
+                self.emit(AudioEvent::InputLevel {
+                    dbfs: NoiseGate::level(&frame),
+                    gate_open: self.gate.is_open(),
+                });
+            }
+
+            let wants = match self.transmit.mode {
+                TransmitMode::PushToTalk => self.ptt,
+                TransmitMode::VoiceActivation => decision != GateDecision::Closed,
+            };
+            let transmitting = wants && !self.muted && !self.deafened.load(Ordering::Relaxed);
+            self.set_transmitting(transmitting);
+
             if !transmitting {
                 continue;
             }
@@ -435,9 +506,15 @@ impl AudioThread {
                 }
             };
 
-            let marker = self
+            let idle = self
                 .last_sent
                 .is_none_or(|last| now.saturating_duration_since(last) >= SPURT_GAP);
+            // Only voice activation lets the gate start a spurt: under
+            // push-to-talk the key decides, and a gate that opens mid-sentence
+            // would restart the receiver's spurt for nothing.
+            let marker = idle
+                || (self.transmit.mode == TransmitMode::VoiceActivation
+                    && decision == GateDecision::Opened);
             match sender.send_audio(&self.packet[..encoded], marker) {
                 Ok(()) => self.last_sent = Some(now),
                 Err(error) => {
@@ -447,6 +524,14 @@ impl AudioThread {
                 }
             }
         }
+    }
+
+    fn set_transmitting(&mut self, transmitting: bool) {
+        if transmitting == self.transmitting {
+            return;
+        }
+        self.transmitting = transmitting;
+        self.emit(AudioEvent::Transmitting(transmitting));
     }
 
     fn emit(&self, event: AudioEvent) {

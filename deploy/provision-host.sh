@@ -155,6 +155,8 @@ step "production .env"
 mkdir -p "$APP_DIR"
 # Bind-mounted read-only into the backend; the release workflow scps manifests and binaries here.
 mkdir -p "$APP_DIR/releases"
+# Bind-mounted read-write into the backend; holds uploaded image attachments.
+mkdir -p "$APP_DIR/attachments"
 if [ -f "$APP_DIR/.env" ]; then
     echo "$APP_DIR/.env already exists, left untouched"
 elif [ ! -f "$APP_DIR/.env.production.example" ]; then

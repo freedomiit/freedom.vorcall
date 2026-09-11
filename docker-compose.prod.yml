@@ -43,6 +43,9 @@ services:
       # (releases/<version>/…, releases/manifest.json, releases/manifest.sig); served
       # by /api/updates/*. Read-only: the workflow writes, the backend only reads.
       - ./releases:/releases:ro
+      # image attachments uploaded through /api/attachments; written by the
+      # backend, so not read-only. Quota is Vorcall__AttachmentsMaxBytes.
+      - ./attachments:/attachments
     depends_on:
       db:
         condition: service_healthy
