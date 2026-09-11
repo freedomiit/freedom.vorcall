@@ -9,6 +9,8 @@
 //!   absorbing network jitter, reporting losses to the codec so it can conceal.
 //! - [`playout`] — every remote speaker decoded and summed into one frame.
 //! - [`engine`] — the UDP socket, the send path, keepalive pings and statistics.
+//! - [`cleanup`] — on the capture side instead: echo cancellation, noise
+//!   suppression and automatic gain, applied before anything else sees a frame.
 //!
 //! [`gate`] sits on the capture side, deciding which frames are worth sending;
 //! [`tone`] is a test/diagnostic source; nothing here touches an audio device,
@@ -19,6 +21,7 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_SAMPLES: usize = 960;
 pub const FRAME_MS: u64 = 20;
 
+pub mod cleanup;
 pub mod codec;
 pub mod crypto;
 pub mod engine;
@@ -28,6 +31,7 @@ pub mod packet;
 pub mod playout;
 pub mod tone;
 
+pub use cleanup::{CleanupSettings, EchoMetrics, InputCleanup};
 pub use engine::{FrameSender, Link, MediaConfig, MediaEngine, Stats};
 pub use gate::{GateDecision, NoiseGate};
 pub use playout::{PeerStats, Playout};

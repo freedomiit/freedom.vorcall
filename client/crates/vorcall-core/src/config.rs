@@ -71,6 +71,15 @@ pub struct Config {
     /// VAD_MIN_DB..=VAD_MAX_DB on load.
     #[serde(default = "default_vad_threshold_db")]
     pub vad_threshold_db: f32,
+    /// The settings screen's "Input cleanup" switches: noise suppression and
+    /// echo cancellation default on, automatic gain off. Applied live by the
+    /// audio thread.
+    #[serde(default = "default_true")]
+    pub noise_suppression: bool,
+    #[serde(default = "default_true")]
+    pub echo_cancellation: bool,
+    #[serde(default)]
+    pub auto_gain: bool,
     /// Keyed by the peer's user id in decimal — TOML table keys are strings.
     #[serde(default)]
     pub peer_audio: BTreeMap<String, PeerAudio>,
@@ -87,6 +96,9 @@ impl Default for Config {
             ptt_key: DEFAULT_PTT_KEY.to_owned(),
             transmit_mode: TransmitMode::default(),
             vad_threshold_db: VAD_DEFAULT_DB,
+            noise_suppression: true,
+            echo_cancellation: true,
+            auto_gain: false,
             peer_audio: BTreeMap::new(),
         }
     }
@@ -199,6 +211,9 @@ mod tests {
         assert_eq!(config.transmit_mode, TransmitMode::PushToTalk);
         assert_eq!(config.vad_threshold_db, VAD_DEFAULT_DB);
         assert!(config.peer_audio.is_empty());
+        assert!(config.noise_suppression);
+        assert!(config.echo_cancellation);
+        assert!(!config.auto_gain);
     }
 
     #[test]
@@ -214,6 +229,9 @@ mod tests {
         assert_eq!(config.transmit_mode, TransmitMode::PushToTalk);
         assert_eq!(config.vad_threshold_db, VAD_DEFAULT_DB);
         assert!(config.peer_audio.is_empty());
+        assert!(config.noise_suppression);
+        assert!(config.echo_cancellation);
+        assert!(!config.auto_gain);
     }
 
     #[test]
@@ -221,6 +239,8 @@ mod tests {
         let mut config = Config {
             transmit_mode: TransmitMode::VoiceActivation,
             vad_threshold_db: -30.0,
+            echo_cancellation: false,
+            auto_gain: true,
             ..Default::default()
         };
         config.set_peer_audio(
@@ -317,5 +337,13 @@ mod tests {
         };
         let raw = toml::to_string(&config).expect("serializes");
         assert!(raw.contains(r#"transmit_mode = "voice_activation""#));
+    }
+
+    #[test]
+    fn cleanup_keys_serialize_snake_case() {
+        let raw = toml::to_string(&Config::default()).expect("serializes");
+        assert!(raw.contains("noise_suppression = true"));
+        assert!(raw.contains("echo_cancellation = true"));
+        assert!(raw.contains("auto_gain = false"));
     }
 }

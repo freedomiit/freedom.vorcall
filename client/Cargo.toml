@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "0.3.1"
 license = "MIT"
 
 # Oldest client version the current release still lets chat. Clients below it
@@ -13,6 +13,10 @@ license = "MIT"
 min_version = "0.2.0"
 
 [workspace.dependencies]
+# Pure-Rust port of WebRTC's AEC3, noise suppressor and AGC2. Young and its API
+# is declared unstable, so it is pinned like opus-rs and lives behind
+# vorcall-voice::cleanup.
+aec3 = { version = "=0.3.2", default-features = false }
 anyhow = "1"
 chacha20poly1305 = "=0.11.0"
 chrono = "0.4"
@@ -101,10 +105,16 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# Debug builds must not underrun: the codec and the resampler are pure Rust and
-# run at -O0 otherwise.
+# Debug builds must not underrun: the codec, the resampler and the echo
+# canceller's FFTs are pure Rust and run at -O0 otherwise.
+[profile.dev.package.aec3]
+opt-level = 3
+
 [profile.dev.package.opus-rs]
 opt-level = 3
 
 [profile.dev.package.rubato]
+opt-level = 3
+
+[profile.dev.package.rustfft]
 opt-level = 3

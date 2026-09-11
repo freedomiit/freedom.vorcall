@@ -535,6 +535,24 @@ fn settings<'a>(
         .spacing(12)
         .align_y(Vertical::Center),
         input_meter(voice),
+        text("Input cleanup"),
+        row![
+            toggler(config.noise_suppression)
+                .label("Noise suppression")
+                .on_toggle(Message::SetNoiseSuppression),
+            toggler(config.echo_cancellation)
+                .label("Echo cancellation")
+                .on_toggle(Message::SetEchoCancellation),
+            toggler(config.auto_gain)
+                .label("Automatic gain")
+                .on_toggle(Message::SetAutoGain),
+        ]
+        .spacing(16)
+        .align_y(Vertical::Center),
+        text(
+            "Runs before the meter and the threshold. Echo cancellation removes what Vorcall plays from the voice channel; other apps' audio still comes through."
+        )
+        .color(MUTED),
         row![
             text(format!("Push-to-talk key: {}", key_label(&config.ptt_key))),
             ptt,

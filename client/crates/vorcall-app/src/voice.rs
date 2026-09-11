@@ -10,13 +10,17 @@
 //! runs at another rate, cuts 20 ms frames, and hands the Opus packets to the
 //! media engine while the frame is allowed out: in push-to-talk mode while the
 //! key is held, in voice-activation mode while the noise gate stands open.
+//! Every cut frame first passes through the [`InputCleanup`] chain, so the
+//! gate, the level meter and the encoder all see the cleaned audio.
 //! Playback runs the other way: a single infinite [`VoiceSource`] sits in the
 //! rodio mixer and pulls mixed frames from [`Playout`], which the engine's
-//! receive task keeps fed.
+//! receive task keeps fed; that source also keeps what it played, which is the
+//! far-end reference the echo canceller subtracts from the microphone.
 
 use std::collections::VecDeque;
 use std::error::Error;
 use std::num::NonZero;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -27,8 +31,12 @@ use futures::channel::mpsc as async_mpsc;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Async, FixedAsync, Resampler as _, SincInterpolationParameters};
 use vorcall_core::config::{TransmitMode, VAD_DEFAULT_DB};
+use vorcall_voice::cleanup::FAR_END_MAX_SAMPLES;
 use vorcall_voice::codec::Encoder;
-use vorcall_voice::{FRAME_SAMPLES, FrameSender, GateDecision, NoiseGate, Playout, SAMPLE_RATE};
+use vorcall_voice::{
+    CleanupSettings, FRAME_SAMPLES, FrameSender, GateDecision, InputCleanup, NoiseGate, Playout,
+    SAMPLE_RATE,
+};
 
 /// How often the thread wakes up to cut frames when no command arrives. Well
 /// under the 20 ms a frame lasts, so the capture ring never runs long.
@@ -52,6 +60,10 @@ const MAX_PACKET: usize = 512;
 /// A device that fails does so on every frame; the log must not become the
 /// problem.
 const WARN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the canceller's delay and return-loss figures go to the debug log
+/// while echo cancellation runs.
+const METRICS_EVERY: Duration = Duration::from_secs(10);
 
 /// 200 ms of 48 kHz mono.
 const MONO_QUEUE_MAX: usize = SAMPLE_RATE as usize * MAX_QUEUED_MS / 1000;
@@ -108,6 +120,9 @@ pub enum AudioCommand {
     SetDevices(AudioSettings),
     /// Mode and gate threshold; takes effect on the next frame.
     SetTransmit(TransmitSettings),
+    /// Which cleanup stages run; rebuilds the chain, so the canceller starts
+    /// from scratch.
+    SetCleanup(CleanupSettings),
     SetPtt(bool),
     SetMuted(bool),
     SetDeafened(bool),
@@ -201,6 +216,21 @@ struct AudioThread {
     /// while deafened so the jitter buffers do not back up.
     deafened: Arc<AtomicBool>,
 
+    cleanup_settings: CleanupSettings,
+    cleanup: Option<InputCleanup>,
+    /// Set once the chain failed to build or crashed; cleared by the next
+    /// `SetCleanup` or `Close`, so a broken chain is not rebuilt on every frame.
+    cleanup_failed: bool,
+    /// What the mixer played, pushed by the [`VoiceSource`] on rodio's thread
+    /// and drained here into the canceller. Bounded like the capture ring: a
+    /// stalled thread loses reference audio, never builds up delay.
+    far_end: Arc<Mutex<VecDeque<f32>>>,
+    far_end_scratch: Vec<f32>,
+    /// The frame as captured, restored if the chain fails mid-frame.
+    raw_frame: [f32; FRAME_SAMPLES],
+    /// When the canceller's metrics last went to the log.
+    metrics_at: Option<Instant>,
+
     /// Interleaved samples taken from the capture ring, then their downmix.
     raw: Vec<f32>,
     mono: Vec<f32>,
@@ -242,6 +272,13 @@ impl AudioThread {
             ptt: false,
             muted: false,
             deafened: Arc::new(AtomicBool::new(false)),
+            cleanup_settings: CleanupSettings::default(),
+            cleanup: None,
+            cleanup_failed: false,
+            far_end: Arc::new(Mutex::new(VecDeque::with_capacity(FAR_END_MAX_SAMPLES))),
+            far_end_scratch: Vec::with_capacity(FAR_END_MAX_SAMPLES),
+            raw_frame: [0.0; FRAME_SAMPLES],
+            metrics_at: None,
             raw: Vec::new(),
             mono: Vec::new(),
             queue: VecDeque::with_capacity(MONO_QUEUE_MAX),
@@ -278,6 +315,16 @@ impl AudioThread {
             AudioCommand::SetTransmit(transmit) => {
                 self.transmit = transmit;
                 self.gate.set_threshold(transmit.threshold_db);
+            }
+            AudioCommand::SetCleanup(settings) => {
+                if settings == self.cleanup_settings {
+                    return;
+                }
+                self.cleanup_settings = settings;
+                self.cleanup_failed = false;
+                if self.capture.is_some() {
+                    self.build_cleanup();
+                }
             }
             AudioCommand::SetPtt(held) => self.ptt = held,
             AudioCommand::SetMuted(muted) => self.muted = muted,
@@ -337,8 +384,11 @@ impl AudioThread {
             .map_err(|error| format!("Cannot open the speakers \"{name}\": {}", chain(&error)))?;
         // Left on, rodio prints to stderr when the sink is dropped.
         sink.log_on_drop(false);
-        sink.mixer()
-            .add(VoiceSource::new(playout, self.deafened.clone()));
+        sink.mixer().add(VoiceSource::new(
+            playout,
+            self.deafened.clone(),
+            self.far_end.clone(),
+        ));
 
         self.output = Some(sink);
         Ok(name)
@@ -405,13 +455,43 @@ impl AudioThread {
             channels,
             resampler,
         });
+        // Never fails the open: a microphone with no cleanup still works. It
+        // also drops the reference the output has been pushing since it opened,
+        // so the canceller starts aligned with this capture.
+        self.build_cleanup();
         Ok(name)
+    }
+
+    /// Replaces the chain with one for the current settings. A chain that has
+    /// already failed stays gone until the user changes a setting or rejoins.
+    fn build_cleanup(&mut self) {
+        self.cleanup = None;
+        lock(&self.far_end).clear();
+        self.metrics_at = None;
+        if !self.cleanup_settings.any() || self.cleanup_failed {
+            return;
+        }
+
+        match InputCleanup::new(self.cleanup_settings) {
+            Ok(cleanup) => self.cleanup = Some(cleanup),
+            Err(error) => {
+                tracing::warn!(%error, "input cleanup unavailable, capturing raw");
+                self.cleanup_failed = true;
+                self.emit(AudioEvent::Failed(format!(
+                    "Input cleanup is unavailable: {error}"
+                )));
+            }
+        }
     }
 
     fn close_streams(&mut self) {
         self.capture = None;
         self.output = None;
         self.encoder = None;
+        self.cleanup = None;
+        self.cleanup_failed = false;
+        self.metrics_at = None;
+        lock(&self.far_end).clear();
         self.queue.clear();
         self.last_sent = None;
         self.gate = NoiseGate::new(self.transmit.threshold_db);
@@ -433,6 +513,17 @@ impl AudioThread {
             self.raw.reserve(ring.len());
             self.raw.extend(ring.drain(..));
         }
+
+        // Drained whether or not a chain exists, so it never holds stale audio.
+        {
+            let mut far_end = lock(&self.far_end);
+            self.far_end_scratch.clear();
+            self.far_end_scratch.extend(far_end.drain(..));
+        }
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.push_far_end(&self.far_end_scratch);
+        }
+
         if self.raw.is_empty() {
             return;
         }
@@ -467,6 +558,11 @@ impl AudioThread {
             for (slot, sample) in frame.iter_mut().zip(self.queue.drain(..FRAME_SAMPLES)) {
                 *slot = sample;
             }
+
+            // Ahead of the gate, the meter and the encoder: they all work on
+            // what actually leaves the machine, so voice activation triggers on
+            // speech rather than on the fan.
+            self.clean(&mut frame, now);
 
             // Advanced in both modes and while muted, so the meter stays live
             // and a mode switch never starts from a stale gate.
@@ -526,6 +622,53 @@ impl AudioThread {
         }
     }
 
+    /// Runs one frame through the chain, in place. Guarded like the codec: a
+    /// panic on the audio thread would take the whole process down, and the raw
+    /// microphone is better than no call at all.
+    fn clean(&mut self, frame: &mut [f32; FRAME_SAMPLES], now: Instant) {
+        let Some(cleanup) = self.cleanup.as_mut() else {
+            return;
+        };
+
+        self.raw_frame.copy_from_slice(frame);
+        let outcome = catch_unwind(AssertUnwindSafe(|| cleanup.process(frame)));
+        let reason = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("the chain panicked".to_string()),
+        };
+        if let Some(reason) = reason {
+            frame.copy_from_slice(&self.raw_frame);
+            self.disable_cleanup(&reason);
+            return;
+        }
+
+        if self.cleanup_settings.echo_cancellation
+            && self
+                .metrics_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= METRICS_EVERY)
+        {
+            self.metrics_at = Some(now);
+            if let Some(metrics) = self.cleanup.as_ref().and_then(InputCleanup::metrics) {
+                tracing::debug!(
+                    delay_ms = metrics.delay_ms,
+                    erl_db = metrics.echo_return_loss_db,
+                    erle_db = metrics.echo_return_loss_enhancement_db,
+                    "echo canceller"
+                );
+            }
+        }
+    }
+
+    fn disable_cleanup(&mut self, reason: &str) {
+        self.cleanup = None;
+        self.cleanup_failed = true;
+        tracing::warn!(reason, "input cleanup stopped, sending the raw microphone");
+        self.emit(AudioEvent::Failed(format!(
+            "Input cleanup stopped ({reason}); the raw microphone is sent until the next join."
+        )));
+    }
+
     fn set_transmitting(&mut self, transmitting: bool) {
         if transmitting == self.transmitting {
             return;
@@ -546,15 +689,23 @@ impl AudioThread {
 struct VoiceSource {
     playout: Arc<Mutex<Playout>>,
     deafened: Arc<AtomicBool>,
+    /// Every frame handed to the mixer, for the echo canceller on the audio
+    /// thread to subtract from what the microphone hears.
+    far_end: Arc<Mutex<VecDeque<f32>>>,
     frame: [f32; FRAME_SAMPLES],
     cursor: usize,
 }
 
 impl VoiceSource {
-    fn new(playout: Arc<Mutex<Playout>>, deafened: Arc<AtomicBool>) -> Self {
+    fn new(
+        playout: Arc<Mutex<Playout>>,
+        deafened: Arc<AtomicBool>,
+        far_end: Arc<Mutex<VecDeque<f32>>>,
+    ) -> Self {
         Self {
             playout,
             deafened,
+            far_end,
             frame: [0.0; FRAME_SAMPLES],
             // Past the end, so the first sample pulls a frame.
             cursor: FRAME_SAMPLES,
@@ -569,6 +720,19 @@ impl Iterator for VoiceSource {
         if self.cursor >= FRAME_SAMPLES {
             lock(&self.playout).next_frame(&mut self.frame);
             self.cursor = 0;
+
+            let deafened = self.deafened.load(Ordering::Relaxed);
+            let mut far_end = lock(&self.far_end);
+            let overflow = (far_end.len() + FRAME_SAMPLES).saturating_sub(FAR_END_MAX_SAMPLES);
+            let dropped = overflow.min(far_end.len());
+            far_end.drain(..dropped);
+            // The reference has to be what the speakers are given, and deafened
+            // means silence.
+            if deafened {
+                far_end.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES));
+            } else {
+                far_end.extend(self.frame.iter().copied());
+            }
         }
         let sample = self.frame[self.cursor];
         self.cursor += 1;

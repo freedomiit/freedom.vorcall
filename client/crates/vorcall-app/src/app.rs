@@ -28,7 +28,7 @@ use vorcall_core::{
     RoomKind, Session, VoiceMember, attachments, auth, config, mentions, session,
 };
 use vorcall_hotkey::{Backend, Binding, Edge, Listener, MouseButton, Unavailable};
-use vorcall_voice::{MediaConfig, MediaEngine, Playout, Stats};
+use vorcall_voice::{CleanupSettings, MediaConfig, MediaEngine, Playout, Stats};
 
 use crate::view;
 use crate::voice::{self, AudioCommand, AudioEvent, AudioHandle, AudioSettings, TransmitSettings};
@@ -577,6 +577,11 @@ pub enum Message {
     SetVadThreshold(f32),
     /// The end of a drag, which is what writes the threshold to disk.
     VadThresholdReleased,
+    /// The input cleanup switches; each one saves and reaches the audio thread
+    /// at once.
+    SetNoiseSuppression(bool),
+    SetEchoCancellation(bool),
+    SetAutoGain(bool),
     ToggleMemberPanel(i64),
     SetPeerVolume(i64, f32),
     PeerVolumeReleased(i64),
@@ -1093,6 +1098,24 @@ impl App {
             }
             Message::VadThresholdReleased => {
                 self.save_config();
+                Task::none()
+            }
+            Message::SetNoiseSuppression(value) => {
+                self.config.noise_suppression = value;
+                self.save_config();
+                self.push_cleanup();
+                Task::none()
+            }
+            Message::SetEchoCancellation(value) => {
+                self.config.echo_cancellation = value;
+                self.save_config();
+                self.push_cleanup();
+                Task::none()
+            }
+            Message::SetAutoGain(value) => {
+                self.config.auto_gain = value;
+                self.save_config();
+                self.push_cleanup();
                 Task::none()
             }
             Message::ToggleMemberPanel(user_id) => {
@@ -1871,6 +1894,7 @@ impl App {
     fn media_connected(&mut self, handoff: EngineHandoff) -> Task<Message> {
         let settings = self.audio_settings();
         let transmit = self.transmit_settings();
+        let cleanup = self.cleanup_settings();
         let peer_audio = self.peer_audio_map();
         // A duplicate of a message already handled carries an empty handoff.
         let Some(engine) = handoff.take() else {
@@ -1901,6 +1925,9 @@ impl App {
         let closing = chat.voice.close_session();
 
         let (audio, events) = voice::spawn_audio_thread();
+        // Before `Open`, so the input opens straight into the user's chain
+        // instead of building the default one first.
+        audio.send(AudioCommand::SetCleanup(cleanup));
         audio.send(AudioCommand::Open {
             settings,
             sender: engine.sender(),
@@ -2264,6 +2291,23 @@ impl App {
             && let Some(session) = &chat.voice.session
         {
             session.audio.send(AudioCommand::SetTransmit(transmit));
+        }
+    }
+
+    fn cleanup_settings(&self) -> CleanupSettings {
+        CleanupSettings {
+            noise_suppression: self.config.noise_suppression,
+            echo_cancellation: self.config.echo_cancellation,
+            auto_gain: self.config.auto_gain,
+        }
+    }
+
+    fn push_cleanup(&self) {
+        let cleanup = self.cleanup_settings();
+        if let Screen::Chat(chat) = &self.screen
+            && let Some(session) = &chat.voice.session
+        {
+            session.audio.send(AudioCommand::SetCleanup(cleanup));
         }
     }
 

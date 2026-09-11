@@ -10,11 +10,22 @@ DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 BIN_DIR="$HOME/.local/bin"
 BINARY="$BIN_DIR/vorcall"
 ENTRY="$DATA/applications/vorcall.desktop"
-ICON="$DATA/icons/hicolor/scalable/apps/vorcall.svg"
+THEME="$DATA/icons/hicolor"
+ICON="$THEME/scalable/apps/vorcall.svg"
 
 refresh() {
-    # launchers notice the files on their own; this only makes it quicker
+    # The entry is noticed on its own; the icon is not. GNOME re-reads a theme
+    # only when the theme directory's own mtime changes (a file added two
+    # levels down does not change it), and it trusts an icon-theme.cache over
+    # the directory whenever the cache is at least as new, so a cache left
+    # there by another app hides the icon until it is rebuilt. Only an
+    # existing cache is rebuilt: creating one would lay the same trap for the
+    # next installer that skips this step.
     update-desktop-database "$DATA/applications" 2>/dev/null || true
+    touch -c "$THEME" 2>/dev/null || true
+    if [ -f "$THEME/icon-theme.cache" ]; then
+        gtk-update-icon-cache -q -t -f "$THEME" 2>/dev/null || true
+    fi
 }
 
 case "${1:-}" in
