@@ -62,6 +62,10 @@ public static class AuthEndpoints
             registry.MemberRegistered(member);
         }
 
+        // A fresh install is seeded before anyone exists, so it has no owner: whoever redeems the
+        // first invite takes it. A no-op on every server that already has one.
+        await registry.ClaimOwnershipIfUnownedAsync(tokens.UserId, context.RequestAborted);
+
         return ProtobufBody.Proto(tokens, StatusCodes.Status201Created);
     }
 

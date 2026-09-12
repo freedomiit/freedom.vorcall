@@ -1,511 +1,148 @@
+<div align="center">
+
+<img src="assets/brand/mark.svg" alt="" width="88">
+
 # Vorcall
 
-A private chat for a friend group: channels, roles and DMs, native Rust desktop client, .NET backend, protobuf over a WebSocket.
+**A small, self-hosted voice and text chat for people who already know each other.**
 
-## Status
+Text and voice channels, screen sharing, DMs, roles and permissions — on a server you run,
+for a group you invite by hand.
 
-MVP, 0.5.0. Present: invite-only accounts; one server whose text and voice channels sit under categories, plus two-person DMs; roles with colours, icons and a hierarchy, carrying 21 granular permissions that can be overridden per channel and per member; profiles with avatars, banners, nicknames, descriptions and accent colours; kick and ban; invites and bans managed from inside the app; live messages with reply/edit/delete and reactions; image attachments; unread and mention counts with `@everyone`/`@here`; older history; notifications; a voice session in every voice channel and DM with push-to-talk (global per platform, with a window-focused fallback) or voice activation, input cleanup (echo cancellation, noise suppression and an optional automatic gain), per-user volume and mute, server mute/deafen, move and priority speaker; screen sharing (a monitor or a window, with its audio, watched by other voice members through an H.264 stage rendered in the app); and a rewritten client — themable (two presets plus custom JSON themes), with a quick switcher, context menus, rebindable keybinds and drag-and-drop server settings. On the operations side: structured server logs, a `/metrics` endpoint, a nightly database backup, an admin CLI that can kick or disable an account, invite revocation, a per-account write rate limit, a client-side log with crash reports and a "Report a problem" button that uploads them, and an integration test suite for the server.
+[![ci](https://github.com/freedomiit/freedom.vorcall/actions/workflows/ci.yml/badge.svg)](https://github.com/freedomiit/freedom.vorcall/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![release](https://img.shields.io/github/v/release/freedomiit/freedom.vorcall)](https://github.com/freedomiit/freedom.vorcall/releases/latest)
 
-Deliberately absent: more than one server, private DMs beyond two people, role mentions, pins, message search, threads, custom status, file attachments beyond images, OAuth/2FA, a web UI for the operational data (logs, metrics and problem reports are read on the host).
+**English** · [Português (BR)](README.pt-BR.md)
 
-## Repository layout
+</div>
 
-```
-proto/vorcall.proto        shared schema; generated into both server and client at build time
-PROTOCOL.md                wire framing, state machines, permission resolution, limits
-server/                    ASP.NET Core (.NET 10) backend, Vorcall.Server.csproj (server/Permissions/ is the pure
-                            permission engine, server/Chat/ the in-memory server model and the directories behind it,
-                            server/Voice/ the voice UDP relay, server/Updates/ + server/Api/UpdatesEndpoints.cs
-                            serve /api/updates/*, server/Logging/ -> Serilog console + daily JSON files,
-                            server/Metrics/ + Api/MetricsEndpoints.cs -> GET /metrics, server/Diagnostics/ +
-                            Api/DiagnosticsEndpoints.cs -> problem reports, server/Admin/ + Api/AdminEndpoints.cs
-                            -> the CLI's kick/disable path, Api/PrivateSource.cs -> who may reach the operational
-                            endpoints)
-tests/                     Vorcall.Server.Tests, xunit: the permission matrix, names and validation plus the
-                            integration suite (WebApplicationFactory + the compose Postgres; Infrastructure/ is its
-                            harness); outside server/ so the SDK's compile glob does not swallow it
-client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall-core -> incl. permissions.rs, the
-                            mirror of the server engine, the `update` module, diagnostics.rs (the client log + crash
-                            reports) and report.rs (their upload),
-                            crates/vorcall-voice -> media engine, incl. video.rs (fragmentation/reassembly)
-                            and stereo share audio, crates/vorcall-screen -> screen capture backends
-                            (Windows/macOS/Linux) + the OpenH264 codec, no GUI or audio device,
-                            crates/vorcall-hotkey -> system-wide listener for several bindings at once,
-                            crates/vorcall-probe -> headless voice probe binary, also carries the
-                            check-update/apply-update oracle subcommands and the share/watch oracle,
-                            crates/vorcall-release -> release-side signing tool, binary `vorcall-release`,
-                            crates/vorcall-app -> binary `vorcall`: app/ (state and update), theme/ (tokens and
-                            presets), view/ (incl. channels.rs, settings/, server_settings/, stage.rs -> the wgpu
-                            shader widget), workers/ (voice, share, images, notify, audio))
-assets/icons/              the UI icon set, generated by assets/brand/gen.py icons
-client/update-keys.pub     Ed25519 public keys the client trusts for release manifests; empty disables the updater
-deploy/                    nginx site configs, the host provisioning script and backup-db.sh (the nightly pg_dump + restore recipe)
-scripts/                   client release build scripts (Linux, Windows cross-build), push-client.sh (build + push both to the host) and update-oracle.sh
-releases/                  gitignored; local dir the dev server serves under /api/updates/*; production's is the host's
-attachments/ logs/ diagnostics/  gitignored; the dev server's uploads, JSON logs and problem reports (../ from server/);
-                            production's are the host's bind mounts, plus backups/ for the nightly dumps
-docker-compose.yml         local dev: Postgres only
-docker-compose.prod.yml    production stack: Postgres + backend, pulled from GHCR
-.env.production.example    template for the production .env (never commit the real one)
-.github/workflows/         ci.yml (format/lint/build, cargo test, dotnet test against a Postgres service),
-                            deploy.yml (build + deploy on push to main), release.yml (build, sign and publish a client release;
-                            also uploads a macOS vorcall-probe as a workflow artifact)
-```
+---
 
-## Prerequisites
+## What it is
 
-- **Linux (build client + server, run local dev):** Rust via rustup (stable, 1.89+ — MSRV set by notify-rust), .NET SDK 10.0.x, Docker (for the local Postgres), a C++ compiler (`g++` or `clang++`, for OpenH264), ALSA headers for rodio/cpal: Fedora `sudo dnf install -y alsa-lib-devel`, Debian/Ubuntu `libasound2-dev` (CI installs it), PipeWire headers and libclang for the screen-share capture bindings: Fedora `sudo dnf install -y pipewire-devel clang-devel`, Debian/Ubuntu `libpipewire-0.3-dev libclang-dev` (CI installs these too).
-- **Cross-build for Windows (from Linux/Fedora):** the above, plus `sudo dnf install -y clang lld llvm`, `rustup target add x86_64-pc-windows-msvc`, `cargo install cargo-xwin`.
-- **macOS (build client from source only):** Xcode command-line tools (a C++ compiler for OpenH264), rustup. macOS 13 or newer to run the built client: screen sharing needs ScreenCaptureKit, and the app bundle's `LSMinimumSystemVersion` is 13.0.
+Vorcall is a chat server and a desktop client for a group of friends — a gaming group, a
+study group, a small team. One server, invite-only, no directory to browse and no
+community to discover. You run the server; nobody else can read what happens on it.
 
-Voice adds no build prerequisite beyond the above: `opus-rs` is a pure-Rust codec (no cmake, no system libopus). Screen share adds the C++ compiler (OpenH264 is built from vendored C++ by the `cc` crate, no cmake, no nasm) and, on Linux, the PipeWire/libclang packages above; at runtime the Linux binary links `libpipewire-0.3.so.0` (any desktop since 2022 has it — `install.sh` warns if it is missing after a first install). ALSA headers remain a separate Linux-specific requirement, needed for cpal (capture/playback) as well as rodio.
+It is deliberately small. There is no federation, no plugin system, no bot API, no mobile
+app. What there is:
 
-`dotnet` may not be on `PATH`; it can live at `~/.dotnet/dotnet`. The `dotnet-ef` global tool needs `DOTNET_ROOT=~/.dotnet` and `dotnet` on `PATH` (e.g. `PATH=~/.dotnet:$PATH`).
+- **Text channels and voice channels**, grouped under categories, plus two-person DMs.
+- **Voice** in every voice channel and DM: push-to-talk or voice activation, echo
+  cancellation, noise suppression, per-person volume, priority speaker.
+- **Screen sharing** — a monitor or a single window, with its audio, watched by everyone
+  else in the channel.
+- **Roles and permissions**: 21 of them, with colours, icons and a hierarchy, overridable
+  per channel and per member.
+- **Messages** with replies, edits, reactions and image attachments; unread and mention
+  counts; `@everyone` and `@here`.
+- **Profiles**: avatar, banner, nickname, description, accent colour.
+- **Moderation**: kick, ban, server mute and deafen, move, invite revocation.
+- **A native desktop client** for Linux, Windows and macOS — Rust and `iced`, not a browser
+  in a box. Themable, with a quick switcher and rebindable keys.
 
-## Build the client
+Deliberately absent: more than one server per deployment, group DMs, threads, message
+search, pins, custom status, non-image attachments, OAuth or 2FA, and any web UI.
 
-The server key and server URL are baked in at compile time (see [Client key and URL](#client-key-and-url) below); they can also be overridden at runtime by environment variables of the same names. `vorcall --version` prints `vorcall <version> <platform>` and exits, useful to check what a build reports.
+## Install the client
 
-The Linux and Windows release binaries are built here, on the owner's machine: `.github/workflows/release.yml` builds only macOS and fetches the other two from the host (see [Cutting a release](#cutting-a-release)). `scripts/push-client.sh` runs both scripts below and pushes their output; running either on its own is for a one-off build that is not a release.
+Download the latest build for your platform from
+[**Releases**](https://github.com/freedomiit/freedom.vorcall/releases/latest):
 
-### Linux
+| Platform | File | Notes |
+| --- | --- | --- |
+| Linux (x86_64) | `vorcall-linux-x86_64.tar.gz` | `tar xzf …` then `vorcall-linux-x86_64/install.sh` — installs into `~/.local`, no root. Needs PipeWire. |
+| Windows (x86_64) | `vorcall-windows-x86_64-setup.exe` | Installs per user, no admin prompt. SmartScreen: "More info" → "Run anyway". |
+| macOS (Apple Silicon) | `vorcall-macos-aarch64.dmg` | Drag to Applications. Ad-hoc signed, so the first launch needs right-click → Open. macOS 13+. |
 
-```
-scripts/build-client-linux.sh
+The client updates itself from whichever server it is connected to, so this download is a
+one-time step for people on a server that publishes releases. See
+[Client updates](docs/self-hosting.md#client-updates) for what that means when you host
+your own.
+
+Prefer to build it yourself? See [docs/development.md](docs/development.md).
+
+## Run your own server
+
+You need a machine with Docker and about 1 GB of free memory. Then:
+
+```bash
+git clone https://github.com/freedomiit/freedom.vorcall.git
+cd freedom.vorcall
+docker compose up -d
 ```
 
-Output: `dist/vorcall-linux-x86_64` and `dist/vorcall-linux-x86_64.tar.gz`, the first-install tarball: `scripts/package-client-linux.sh` packs the binary with its executable bit, the launcher entry and icon from `packaging/linux/`, and a per-user `install.sh`.
+That is the whole install. It builds the backend from source, starts PostgreSQL beside it,
+applies the migrations and generates the two secrets that have no safe default.
 
-### Windows (cross-built from Linux)
+**Read the door key it generated** — every client needs it to reach your server:
 
-```
-scripts/build-client-windows.sh
-```
-
-Output: `dist/vorcall-windows-x86_64.exe`. The binary is unsigned: SmartScreen's "More info" → "Run anyway" on the first run. The per-user installer (`packaging/windows/vorcall.iss`, Inno Setup) is built only by CI on the Windows runner, around this exact exe after `scripts/push-client.sh` has pushed it, with the icon `scripts/make-windows-icon.sh` renders on Linux.
-
-### macOS
-
-macOS is the one platform CI builds. It produces two files for Apple Silicon (ad-hoc signed — see [Releases and updates](#releases-and-updates)): `vorcall-macos-aarch64.dmg`, the `Vorcall.app` bundle a friend installs, and the bare `vorcall-macos-aarch64` the updater fetches. Building from source still works, and `scripts/bundle-client-macos.sh` wraps the result the same way CI does (it needs `brew install librsvg` for the icon):
-
-```
-cd client && VORCALL_SERVER_KEY=<key> cargo build --release -p vorcall-app && cd ..
-scripts/bundle-client-macos.sh client/target/release/vorcall <version> dist
+```bash
+docker compose logs backend | grep "Server key"
 ```
 
-Binary: `client/target/release/vorcall`; bundle: `dist/Vorcall.app` and `dist/vorcall-macos-aarch64.dmg`.
+**Make the first invite.** Accounts are invite-only, and the first account to register
+becomes the server owner:
 
-### Client key and URL
-
-- `VORCALL_SERVER_KEY` is required at compile time. `client/.cargo/config.toml` supplies the placeholder `dev` so a plain `cargo build` from inside `client/` succeeds; it only applies when the working directory is inside `client/`.
-- `VORCALL_SERVER_URL` defaults to `https://vorcall.example.com` when unset.
-- Both `scripts/build-client-*.sh` scripts source `client/.env.release` if present (gitignored, format `export VORCALL_SERVER_KEY=...` / `export VORCALL_SERVER_URL=...`) and refuse to build if the key is unset or still `dev`.
-- Rotating the key means rebuilding and redistributing the client, because the key is compiled in.
-
-## Run locally
-
-Database:
-
-```
-docker compose up -d db
+```bash
+docker compose exec backend dotnet Vorcall.Server.dll invites new
 ```
 
-Server (from the repository root; listens on `http://localhost:5000`, `Development` environment, key `dev`, connection string from `server/appsettings.Development.json`):
+**Connect.** In the client's sign-in screen, open the **Server** section, put in your
+address and the door key, then create an account with the invite code.
+
+By default the server listens on `127.0.0.1:5000` and is only reachable from that machine —
+which is what you want behind a reverse proxy. To put it on the internet with a domain and
+TLS, and for backups, upgrades and every configuration knob, read:
+
+### 📘 [**docs/self-hosting.md**](docs/self-hosting.md) · [em português](docs/self-hosting.pt-BR.md)
+
+## How it fits together
 
 ```
-~/.dotnet/dotnet run --project server/Vorcall.Server.csproj
+┌──────────────────┐        WebSocket (protobuf frames)       ┌──────────────────┐
+│  Desktop client  │ ───────────────────────────────────────▶ │                  │
+│                  │        REST (auth, uploads, history)     │   ASP.NET Core   │
+│   Rust + iced    │ ───────────────────────────────────────▶ │     backend      │
+│                  │                                          │                  │
+│  voice · screen  │        UDP media relay (encrypted)       │   .NET 10        │
+│      share       │ ◀──────────────────────────────────────▶ │                  │
+└──────────────────┘                                          └────────┬─────────┘
+                                                                       │
+                                                              ┌────────▼─────────┐
+                                                              │    PostgreSQL    │
+                                                              └──────────────────┘
 ```
 
-Client (from `client/`, so `client/.cargo/config.toml` supplies the placeholder key):
-
-```
-cd client
-VORCALL_SERVER_URL=http://localhost:5000 cargo run -p vorcall-app
-```
-
-The client always writes a debug-level log to `vorcall.log` next to `config.toml` (see [Diagnostics](#diagnostics)); `RUST_LOG=vorcall_core=debug` raises what reaches stderr as well, and `RUST_LOG_FILE` overrides the file's filter the same way.
-
-The server logs to the console and to `logs/vorcall-YYYYMMDD.json` at the repository root (`Vorcall:LogsDir` = `../logs` in `appsettings.Development.json`); problem reports uploaded through the app land in `diagnostics/` the same way. Levels live under `Serilog:MinimumLevel` in `appsettings*.json` (`Vorcall` is `Debug` in Development). `curl -s localhost:5000/metrics` prints the Prometheus exposition, and `appsettings.Development.json` sets `Vorcall:AdminKey` to `dev-admin` so `users kick`/`users disable` work against the local server.
-
-Client config on disk: `~/.config/vorcall/config.toml` on Linux (via `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`). Besides `username`, `notifications` (default on) and `sound` (default off) it holds the voice and share settings, and the 0.5.0 additions: `theme` (`"vorcall-dark"`, `"vorcall-light"` or `"custom:<slug>"`), `density`, `font_scale`, `entrance`, `text_reactions`, `keybinds` (action id → binding), `muted_channels`, `suppress_everyone`, `collapsed_categories`, `show_members`, `sidebar_width`, `members_width`, `last_channel` and `hidden_dms`. `VORCALL_ENTRANCE` and `VORCALL_TEXT_REACTIONS` still override their config keys when set. Custom themes live beside it as `themes/<slug>.json`. Session tokens are stored separately, next to it, in `session.toml` — see [Accounts](#accounts).
-
-## Accounts
-
-Registration is invite-only. The "Create account" screen in the app takes a username, password, confirmation and invite code, and signs the new account in. Username: 1..32 Unicode scalars, unique case-insensitively. Password: 8..128 chars. The pre-shared door key (`X-Vorcall-Key`, compiled into the client — see [Client key and URL](#client-key-and-url)) still gates every request; accounts add identity on top of it, they don't replace it.
-
-Sessions: a JWT access token (15 min) plus a rotating refresh token (30 days sliding), stored by the client in `session.toml` next to `config.toml`:
-
-- Linux: `~/.config/vorcall/session.toml`, mode `0600`.
-- Windows: `%APPDATA%\freedomit\vorcall\config\session.toml`.
-- macOS: `~/Library/Application Support/br.com.freedomit.vorcall/session.toml`.
-
-(Windows and macOS paths are the platform config dir of the same `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`.)
-
-Logout revokes the refresh token and deletes `session.toml`. Changing the password (from the header) revokes every other session of the account. Only one connection per account is live at a time: signing in on a second device disconnects the first, which returns to the sign-in screen ("connected from another device").
-
-### Admin CLI
-
-Invites and account maintenance run through the server binary's own subcommands. The subcommand is the first argument; it runs pending migrations first and never starts the web server:
-
-```
-invites new [--days N]           # prints a one-time invite code, default 7-day expiry
-invites list                     # shows used / revoked / expired
-invites revoke <id>              # marks an unused code revoked, for good; the row stays
-users list                       # includes  client <version> <platform>  seen <ts>, and  disabled <ts>
-users outdated [--min X.Y.Z]     # accounts below the floor; reads the manifest when --min is absent
-users kick <username>            # closes the live connection (close code 4001 "kicked by admin")
-users disable <username>         # locks the account out, revokes its sessions, closes with 4003 "account disabled"
-users enable <username>          # lets a disabled account sign in again
-users revoke-sessions <username>
-users set-password <username>   # prompts for the new password
-server set-owner <username>      # hands the server to that account
-server show                      # the server's name, owner and general channel id
-```
-
-`server set-owner` is how the real owner is picked after the first deploy of the channels release: the migration and the fresh-database seed both set `owner_id` to the lowest user id, which is rarely who should hold it. The owner bypasses every permission check, so there is exactly one; a banned account is refused. `server show` prints what is currently stored. `invites new`, `invites list` and `invites revoke` go through the same service the in-app invites page uses, so the two agree on what an invite is and on what revoking means: it marks the row revoked and never deletes it, so a revoked invite stays in both listings and can never register again, while a used invite is not revocable at all — that row is the audit trail of the account it admitted. Invites created by `invites new` are listed in the app too, with no creator attached.
-
-`users list` shows each account's last-reported client version, platform and connection time (from the `Hello` frame — see [`PROTOCOL.md`](PROTOCOL.md#server-session-state-machine-per-connection)) and marks a disabled account with `disabled <date>`. `users outdated` lists accounts below `--min`, or below the version published in the current release manifest when `--min` is omitted (`Vorcall:ReleasesDir`, mounted read-only in the CLI container too); with neither a manifest nor `--min` it fails and says so.
-
-`users kick`, `users disable` and `users enable` are the only subcommands that talk to the running server: the CLI is a second process against the same database, so closing a live socket goes through `POST /api/admin/kick` (and `refresh-account`) with the key `Vorcall__AdminKey` at `Vorcall__AdminUrl` (`http://backend:5000` in production, where `docker compose run --rm backend …` is a sibling container; default `http://localhost:5000`). Without `Vorcall__AdminKey` the endpoints are not mapped and the CLI says "admin endpoints are off" — the database half of a disable still holds: login and refresh answer 403 "account disabled", a still-valid access token is refused within 30 s, and an open socket is closed with 4003 "account disabled" at its next write frame (the same 30 s cache); only the immediate kick is lost. A kicked client returns to sign-in with "A moderator removed you from the server." and may sign in again; a disabled one with "This account is disabled." and a banned one with "You are banned from this server.". `users enable` does not restore the sessions the disable revoked.
-
-A **disable is not a ban.** `users disable` is an account lock: sign-in refused, sessions revoked, socket closed. A ban is moderation, issued from inside the app by a member holding `BAN_MEMBERS` — it writes a `bans` row, tombstones every message the account ever sent, drops its channel overrides and removes it from the server (see [Channels and roles](#channels-and-roles)); the banned account is refused at login, at refresh and at the `/ws` upgrade. Bans are listed and lifted on the server settings pages, or read over `GET /api/bans`; disables only through the CLI.
-
-Production:
-
-```
-cd /opt/vorcall && docker compose -f docker-compose.prod.yml run --rm backend invites new
-```
-
-Local:
-
-```
-~/.dotnet/dotnet run --project server/Vorcall.Server.csproj -- invites new
-```
-
-## Voice
-
-Voice lives in voice channels and in DMs; a text channel has none. Click a voice channel in the sidebar to join it (`CONNECT` is the permission; without `SPEAK` the session joins muted), talk with push-to-talk (default Ctrl) or switch to voice activation; mute and deafen are separate switches. The sidebar lists the occupants under the channel, rings whoever is speaking, and shows their muted, deafened and sharing badges. Media rides a direct UDP path to the server host — not Cloudflare, not nginx — encrypted per voice session.
-
-**Settings:** the gear in the user bar opens Settings, whose Voice tab holds the input device, the output device, the transmit mode and the three input-cleanup switches; the push-to-talk, mute and deafen keys live in the Keybinds tab (click an action, press the combination; Esc cancels, and a conflict is flagged on both rows). These are stored in `config.toml` as `input_device`, `output_device`, `transmit_mode` (`"push_to_talk"` or `"voice_activation"`), the input-cleanup switches `noise_suppression`, `echo_cancellation` (both default `true`) and `auto_gain` (default `false`), and `keybinds` (`push_to_talk` defaults to `Control`, `toggle_mute` to `Ctrl+Shift+M`, `toggle_deafen` to `Ctrl+Shift+D` — those three are the system-wide ones; the rest are in-window). A `ptt_key` written by an earlier version is migrated into `keybinds["push_to_talk"]` at load time. A key that is not in the bindable list below (Enter or an arrow key, for example) keeps working while the window is focused, but system-wide capture needs one of the listed keys, so re-bind it in Settings.
-
-**Transmit modes:** "Push to talk" (default) sends while the bound key or mouse button is held. "Voice activation" opens a noise gate instead — a threshold slider (−60 to −20 dBFS, default −45) plus a live input level meter showing whether the gate is open; a 20 ms frame opens the gate once its RMS reaches the threshold and closes it 300 ms after dropping 6 dB below threshold, with each reopen starting a new talk spurt. Mute and Deafen work the same in both modes. Bindable inputs: Ctrl, Alt, Shift, Super, Space, Tab, Caps Lock, Insert, Delete, Home, End, Page Up/Down, F1–F24, ASCII letters and digits, and mouse Back, Forward and Middle (character keys assume the US layout on macOS).
-
-**Input cleanup:** three switches in Settings run WebRTC's voice chain (through the pure-Rust `aec3` crate) on the microphone before the level meter, the threshold and the encoder ever see a frame, in both transmit modes and while muted, so the canceller stays converged between sentences. *Echo cancellation* (default on) subtracts what Vorcall plays from the voice channel through the speakers (the notification chime is not part of the reference), learning the delay by itself whatever the devices, so a laptop or desk speakers no longer feed the room back; audio from other applications is not part of the reference and still comes through. *Noise suppression* (default on) takes the fan, hum and hiss out — about 9 dB on steady noise, less on keyboard clicks. *Automatic gain* (default off) lifts a quiet talker towards a normal level and leaves a loud one alone. All three together cost about 2 % of one core while in voice. If the chain fails to build or crashes, the client falls back to the raw microphone for that session and says so in the notice line; toggling any switch retries. With `RUST_LOG=vorcall_app=debug` the canceller logs its delay estimate and echo return loss every 10 s.
-
-**Global capture:** push-to-talk listens system-wide, not only while the window is focused, through a per-platform backend: Windows low-level keyboard/mouse hooks, macOS a listen-only `CGEventTap` gated by the Input Monitoring permission, Linux X11 raw XInput2 events on the root window, and Linux Wayland the `org.freedesktop.portal.GlobalShortcuts` portal (KDE Plasma 5.27+, GNOME 48+, Hyprland — keyboard only, bound in the compositor's own dialog; `WAYLAND_DISPLAY` selects the portal backend over X11). When global capture is unavailable (no portal, permission denied, hook failure) the client silently falls back to window-focused push-to-talk; Settings → Voice spells the reason out under the push-to-talk row, in the warning colour, with a Retry button beside it while a voice session is live.
-
-**macOS caveat:** the app bundle is ad-hoc signed, so the Input Monitoring grant is tied to that specific build and must be re-granted in System Settings → Privacy & Security → Input Monitoring after every update — until then push-to-talk is window-only. Caps Lock cannot be a global push-to-talk key on macOS: it arrives as a modifier-flag change, not a key event. F21–F24 also have no macOS key code, so those bindings stay window-only there too.
-
-**Per-user volume and mute:** click another occupant under a voice channel to expand a volume slider (0–200%) and a mute-for-me button, indented beneath their row. Both are local only — the server never learns about it — persisted in `config.toml` under `[peer_audio.<user id>]` (`volume`, `muted`) and re-applied whenever that user rejoins voice.
-
-**Network:** media goes over UDP 5005 to the server host (`VoiceReady` tells the client the exact host and port). Production needs an ingress rule for UDP 5005 in the OCI VCN security list **and** the host firewall step of `deploy/provision-host.sh`. Server config keys: `Vorcall__VoiceEnabled`, `Vorcall__VoicePort`, `Vorcall__VoiceHost` (all optional, with defaults). Local dev needs nothing extra: the relay binds `0.0.0.0:5005` as soon as the server starts.
-
-**Voice card:** while in voice, a card above the user bar names the channel and its state — "Voice connected" with the last round-trip time to the relay (" · N ms"), "Connecting…" while no pong has arrived yet, "Not connected" once the media path is gone. A card stuck off "Voice connected" with no round-trip time means the VCN rule or the host firewall is blocking UDP 5005.
-
-**Probe (runtime oracle):** two headless probes exchanging tone are the way to verify the voice path end to end, locally or in production, without opening the GUI.
-
-```
-cd client && cargo build -p vorcall-probe
-```
-
-Two terminals, local server:
-
-```
-VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username alice --send-seconds 10 --listen-seconds 14 --expect-peer
-VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username bob --send-seconds 10 --listen-seconds 14 --expect-peer --tone-hz 660
-```
-
-`--channel <id>` or `--channel-name <name>` (case-insensitive, mutually exclusive) picks which voice channel or DM to join; with neither, the probe joins the voice channel named `General` — the one the seed creates. An id that names no channel the account can see, or one that is a text channel, is a usage error.
-
-Each probe prints one JSON line to stdout: `channel_id`/`channel_name` (the channel it actually joined), `packets_sent`/`packets_received`, `decoded_seconds` and `tone_seconds` (how much of the peer's tone was actually decoded), `gaps`/`late`, `rtt_ms` (min/avg/max/last/samples), `link`, one `peers` entry per remote ssrc (received/lost/late/decoded_frames/decoder_resets), `speaking_events`, `frames_sent` (audio frames actually sent, excluding pings) and `frames_gated` (frames the voice-activation gate held back before encoding). A probe that a moderator moves or disconnects prints an extra `{"moved_to": <channel id or 0>}` line and ends its run with the normal report. Exit codes: `0` ran, `1` `--expect-peer` heard less than 1 s of tone or `--expect-silence` saw audio go out, `2` usage, sign-in, connection or media failure.
-
-Voice-activation flags: `--vad` runs the tone through the same noise gate the app uses before encoding, `--vad-threshold <db>` sets its threshold (default −45), `--tone-amplitude <0..1>` sets the tone's amplitude (default 0.3; `0` is digital silence), and `--expect-silence` exits 1 if any audio frame went out. Oracle recipe: `--vad --tone-amplitude 0 --expect-silence` exits 0 with `frames_sent: 0` (the gate holds silence back); `--tone-amplitude 0 --expect-silence` without `--vad` exits 1 (negative control — without the gate, silence still goes out); two probes run with `--vad --tone-amplitude 0.3 --expect-peer` hear each other normally.
-
-Against production, run the same two-terminal recipe with the two test accounts kept in the gitignored `client/.env.probe` (`export PROBE_A_USER=… PROBE_A_PASS=… PROBE_B_USER=… PROBE_B_PASS=…`), `VORCALL_SERVER_URL` left at its default, and the real key in `VORCALL_SERVER_KEY`.
-
-**Limits worth knowing:** 20 ms Opus frames at 48 kbps CBR; one voice session per voice channel or DM, and one per client at a time; echo cancellation covers only what Vorcall plays from the voice channel (the notification chime and music from another application still reach the microphone); mouse-button push-to-talk bindings are window-only on Wayland (the portal is keyboard-only).
-
-## Screen share
-
-Anyone in a voice channel (or a DM's voice session) who holds `SHARE_SCREEN` there can share a monitor or a window, with its audio, to the other members already in that channel; several members can share at once, and a viewer watches one share at a time. Video is H.264 (OpenH264, a pure-Rust-built BSD-2 port of Cisco's encoder/decoder, no cmake) fragmented over the same UDP session and key as voice, rendered through a wgpu texture in the app. A share ends the moment its voice session does.
-
-**Settings:** what a share sends is read from `config.toml` — `share_resolution` (`"source"`, `"720p"`, `"1080p"`, `"1440p"`, `"2160p"`; default `"720p"`), `share_fps` (15/30/60; default 30), an Auto/manual bitrate choice (`share_bitrate_kbps`, absent for Auto, otherwise 1000..30000 kbit/s) and `share_audio` (default on). `share_volume` (0..200%, default 100%) is the volume of whatever is being watched and has its slider on the stage toolbar.
-
-**Quality:** the source is scaled down to fit inside the chosen resolution's box, aspect kept, never upscaled (a `"source"` share is capped at 3840×2160, the largest picture OpenH264 accepts). Auto bitrate reads a table by output size and frame rate (kbit/s): 720p 1500/2500/4000, 1080p 3000/4500/7000, 1440p 5000/8000/12000, 2160p 10000/15000/24000 for 15/30/60 fps; a manual value overrides it. The encoder skips frames rather than exceed the target rate, and the stage shows the rate actually achieved.
-
-**Capture backends:** Windows captures a monitor with Desktop Duplication (the cursor composited in, since Desktop Duplication does not include it) and a window with Windows.Graphics.Capture, falling back to Windows.Graphics.Capture for a monitor too if Desktop Duplication is refused; an unpackaged app still gets the yellow WGC capture border on a captured window, whatever the request. macOS captures both kinds with ScreenCaptureKit. Linux goes through the desktop portal's picker (`org.freedesktop.portal.ScreenCast`) and PipeWire, so Vorcall never lists sources of its own there — the portal's own dialog does, and its choice is remembered (`PersistMode::ExplicitlyRevoked`) so a later share in the same run does not re-prompt; a compositor that only offers DMA-BUF frames ends the capture with a clear reason instead of failing silently.
-
-**macOS caveat:** the Screen Recording permission is tied to the specific (ad-hoc signed) build, so — like Input Monitoring for push-to-talk — it must be re-granted in System Settings → Privacy & Security → Screen Recording after every update, and only takes effect after relaunching. macOS 13 or newer is required. On macOS 15 the system alert about Vorcall bypassing the system picker is expected — "Allow for one month" keeps the share working. When a share ends on its own, the stop reason carries the ScreenCaptureKit error domain and code, with the two common ones translated: "the share was stopped from the macOS menu bar" (`UserStopped`) and "macOS stopped the share (Screen Recording permission changed, or the system alert was dismissed)" (`SystemStoppedStream`). While a share runs, the log gets one info line every 10 s — "ScreenCaptureKit stream running" with `video_samples`/`video_complete`/`video_forwarded`/`audio_samples`/`audio_forwarded`/`audio_rejected` — plus the first audio sample's format at debug, the first rejected one at warn, and the totals at stop; that line is the first thing to look for in a report from a Mac (see [Diagnostics](#diagnostics)).
-
-**Audio:** macOS excludes Vorcall's own playout from a share's audio natively (ScreenCaptureKit); Windows tries process-loopback capture (excluding this process, build 20348+) and falls back to plain loopback; Linux captures the default sink's monitor, which is always the whole desktop. Where the capture includes Vorcall's own voice audio, a second echo canceller (AEC3, echo cancellation only — no noise suppression, no automatic gain, since a share carries music and game sound as well as speech) subtracts it before encoding, so a watcher does not hear the room's own voices coming back through the share.
-
-**Watching:** the screen button on the voice card opens Vorcall's own picker — a list of monitors and windows plus a share-audio toggle — and on Linux the sources come from the desktop portal's own dialog, which the picker's Share button opens. A sharer carries a "LIVE" badge next to their name under the voice channel and in the member pane; pressing it (or "Watch screen" in their right-click menu) opens the stage in the chat column: a sharer picker (when more than one member is sharing), a volume slider when the share has audio, live stats, Pop out (its own window; closing it brings the stage back to the chat column), Fullscreen (Esc exits) and Stop watching.
-
-**Network:** share media rides the same UDP path as voice (see Network above), billed against its own byte budget rather than the packet-rate limit voice and pings use. Server options: `Vorcall__ShareEnabled` (default true, the kill switch), `Vorcall__ShareMaxKbps` (default 30000, the per-sharer ceiling), `Vorcall__MaxSharersPerRoom` (default 3). `deploy/provision-host.sh` raises the host's `net.core.rmem_max`/`wmem_max` to 16 MiB so the relay's 8 MiB socket buffers actually take; without that step the kernel clamps them silently. `MaxSharersPerRoom` keeps its name but caps sharers per **channel**. A channel's worst-case bandwidth is sharers × watchers × `ShareMaxKbps`.
-
-**While sharing:** the voice card's share button turns into "Stop sharing · N watching". The stage a watcher sees carries the live numbers instead — resolution, frame rate and the rate actually achieved.
-
-**Status line:** " · sharing N kbit/s" is appended while a share is active, N being the encoder's currently achieved rate; " · N datagrams lost" follows in the warning colour when the last second lost any. A datagram is lost when the socket refuses a fragment for good: the client's own sender retries a transient refusal (`WouldBlock`, or `ENOBUFS` — what macOS answers a full interface queue with) up to 40 times 1 ms apart, then abandons the rest of that frame, which the watcher sees as one dropped frame and the next keyframe repairs.
-
-**Probe (runtime oracle):** the same two-terminal idea as voice, one probe sharing a synthetic test pattern and the other watching it.
-
-```
-cd client && cargo build -p vorcall-probe
-VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username alice --share-seconds 10 --share-audio --listen-seconds 14
-VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username bob --watch alice --expect-video --expect-share-audio --listen-seconds 14
-```
-
-`--share-size WxH` (default 1280x720), `--share-fps` (15/30/60), `--encode-threads` (H.264 slice threads) and `--bitrate-kbps` tune the sharing side; `--share-seconds` and `--watch` are mutually exclusive within one probe. The sharing probe reports `"share": {frames_encoded, keyframes, keyframe_requests, encode_fps, kbps, watchers_max, bytes, threads, skipped, send_failures}` (`send_failures` being the fragments the socket refused for good — see Status line above); the watching probe reports `"watch": {user, user_id, pictures, keyframes, dropped, decode_errors, first_picture_ms, width, height, decode_fps, keyframe_requests_sent, share_tone_seconds}`. Exit codes add to the voice probe's: `1` also on `--expect-video` with fewer than 5 pictures decoded, or `--expect-share-audio` with less than 1 s of share tone heard.
-
-`--capture-seconds N [--capture-audio]` needs no server: it runs the real capture backend (the portal picker on Linux, ScreenCaptureKit on macOS) for N seconds and exits 0 when the capture ran and the stop path completed — the oracle for a capture backend on its own.
-
-**macOS probe without a Mac to build on:** every `release.yml` run, dry runs included, builds `vorcall-probe` for Apple Silicon and uploads it as the workflow artifact `vorcall-probe-macos-aarch64` (never attached to the GitHub Release, never pushed to the host). To check a friend's Mac: download the artifact from the run, then
-
-```
-xattr -d com.apple.quarantine vorcall-probe-macos-aarch64 && chmod +x vorcall-probe-macos-aarch64
-./vorcall-probe-macos-aarch64 --capture-seconds 10 --capture-audio
-```
-
-and paste the JSON line plus stderr; then share from the app and use Settings → "Report a problem" (see [Diagnostics](#diagnostics)).
-
-**Limits worth knowing:** one watched share per viewer; the source is never upscaled; keyframe requests are capped at 2 per second per viewer; a share ends the instant its voice session does, with no local self-preview for the sharer; there is no congestion control or retransmission — a lossy link shows as dropped frames and a black stage until the next keyframe.
-
-See [`PROTOCOL.md`](PROTOCOL.md#screen-share) for the signalling frames, audience rules and error codes, and § Media transport there for the datagram types and the limits table for the full set of numbers.
-
-## Channels and roles
-
-There is exactly one server, with a name, a description, an icon and an owner. Everything else hangs off it: **categories** group **channels**, and every account is a member from registration on — there is nothing to join and nothing to leave.
-
-A channel is a text channel (messages, history, read counters), a voice channel (a voice session and screen shares, no messages) or a DM (exactly two permanent members, no name). Text and voice channels sit under a category, or above the categories when they have none, ordered by positions the server assigns. Channel names are 1..32 characters and need not be unique. A DM is opened with `OpenDm` and never deleted; the client can hide one from the DM list until the next message arrives in it.
-
-Whether a member sees a channel is one question: does `VIEW_CHANNEL` resolve for it there? "Who is in this channel" is therefore "everyone who may view it", and the member pane lists exactly those. `general` — the text channel the server points at, not merely one named `general` — is the exception that is always visible: it cannot be deleted and its `VIEW_CHANNEL` cannot be denied to `@everyone`. A DM is visible to its two members and to nobody else.
-
-**Roles** carry the permissions. `@everyone` is the undeletable role at position 0 that every member holds; its defaults are view, send, attach, react, connect, speak, share screen and change own nickname. Beyond it a role has a name, a colour, an icon (an emoji or an image), a position in the hierarchy, a `hoist` flag and its own permission bits; a member's name is painted by their highest-positioned coloured role, and a hoisted role gets its own group in the member list. The owner bypasses every check, and a role can only be managed, or a member targeted, from strictly above it in the hierarchy. There are 21 permission bits, seven of them server-wide (manage server, manage roles, manage members, manage invites, kick, ban, change own nickname) and the rest per channel, where each can be allowed or denied by a **channel override** on a role or on a single member. Overrides resolve in order — `@everyone`, then the member's roles from the bottom up, then the member itself — so a higher role's decision wins a conflict; [`PROTOCOL.md`](PROTOCOL.md#roles-and-permissions) § Roles and permissions is the exact algorithm, and both the server and the client implement it from the same test matrix.
-
-**Profiles** are per member: a nickname (shown instead of the username everywhere), a description, an accent colour, an avatar and a banner. Someone with manage-members may set another member's nickname; everything else is your own. Roles can carry an icon image too, and the server an icon of its own. Images go through a separate endpoint from attachments and are downscaled by the client before upload: avatars and the server icon to 512×512, banners to 1600×600, role icons to 128×128; the server caps bytes (8 MiB) and type, never dimensions, and sweeps an image nothing refers to after an hour.
-
-The channel list shows a badge per channel — grey for unread, red for a mention — kept by a server-persisted read cursor per member and channel (`MarkRead`, debounced to one call per second); a channel only counts as read while it is in view, at the bottom of the message list, in a focused window. A category rolls its children's unread state up when collapsed. History for a channel loads on first view (`GET /api/messages?channel=…`).
-
-Messages support a reply (`reply_to_id`, shown as a quoted excerpt of up to 120 characters), edit (author only), delete (a tombstone: the row stays, its text/attachments/reactions are gone — the author, or anyone with manage-messages in that channel) and reactions from a fixed palette — 👍 ❤️ 😂 😮 😢 🔥 🎉 👀 — toggled per user and grouped by emoji. Reactions as text labels instead of emoji is a setting (or `VORCALL_TEXT_REACTIONS=1`), for fonts that cannot draw them. Hovering a message surfaces reply/react/edit/delete actions (delete asks for a second click), and right-clicking one, a member or a channel opens a context menu with whatever that member is allowed to do. `<@id>` mention tokens render as the member's display name and autocomplete after typing `@`. `@everyone` and `@here` are plain words that only become mentions when the sender holds mention-everyone in that channel: `@everyone` notifies everybody who can see the channel, `@here` only those online, and only `@everyone` is counted in the unread mention badge. A mention or a DM notifies unless that channel is already in view in a focused window, and anything else notifies only when the window is unfocused; a channel can be muted and `@everyone` suppressed from Settings. Message text is capped at 2000 characters; the client keeps at most 2000 messages per channel in memory.
-
-Attachments are images only (png, jpeg, gif, webp), up to 8 MiB each and 4 per message, picked with a file dialog (`rfd`) or dragged and dropped, downscaled to 1600 px on the longest side for display and cached under the platform cache directory (`vorcall/attachments`, pruned to 500 MiB at startup by oldest modification time). They upload as a raw body to `POST /api/attachments?channel=<id>` ahead of the message that references them (rate limited to 20 uploads per minute per user, the same policy images use) and are stored on the server under `Vorcall:AttachmentsDir` (env `Vorcall__AttachmentsDir`, default `/attachments`) up to a total quota `Vorcall:AttachmentsMaxBytes` (env `Vorcall__AttachmentsMaxBytes`, default 2 GiB — uploads are refused with `507` once it would be exceeded). An upload never linked to a message within 1 hour is swept (first sweep 1 minute after boot, then every 10 minutes). Deleting a message removes its attachment files with it.
-
-**Moderation** is kick (the account stays, its sessions are revoked, it can sign in again), ban (a ban row with a reason, every message it ever sent tombstoned, and login, refresh and the WebSocket upgrade refused from then on; unbanning lets it back in but the tombstones stay), server mute and server deafen (moderator state the member cannot clear, enforced by the relay itself), moving someone between voice channels or disconnecting them, and priority speaker (every client ducks the other peers by 12 dB while one is talking). Invites and bans are managed from the server settings pages by whoever holds the bits, alongside the admin CLI.
-
-See [`PROTOCOL.md`](PROTOCOL.md) § Server, channels and categories, § Roles and permissions, § Messages, § Profiles and images, § Moderation and § Attachments for the wire-level rules, and the limits table there for the full set of numbers.
-
-Write frames — send, edit, delete and react, and opening a DM, the five frames any member may send without a permission — are rate limited per account: a bucket of 20 refilling 2 per second (`Vorcall__MessageBurst`, `Vorcall__MessagesPerSecond`). Beyond it the server answers the non-fatal `ERROR_CODE_RATE_LIMITED` ("too many messages, slow down"), which the client shows as a notice; reading, `MarkRead`, presence, voice and share signalling, and every management or moderation frame (channels, categories, overrides, roles, member roles, nicknames, profiles, kick, ban, unban, voice moderation, server facts, ownership) are never charged — the latter because each is already gated behind a permission only a trusted member holds.
-
-## Diagnostics
-
-**Client log:** the app writes `vorcall.log` next to `config.toml` — `~/.config/vorcall/` on Linux, `~/Library/Application Support/br.com.freedomit.vorcall/` on macOS, `%APPDATA%\freedomit\vorcall\config\` on Windows — at debug level for Vorcall's own crates and info for everything else, rotated at 5 MiB keeping `vorcall.log.1` to `.3`. `RUST_LOG_FILE` overrides the file's filter; `RUST_LOG` still governs the console, which is stderr. Message text, tokens, media keys and invite codes never reach the file: frames are logged through a redacting description that renders a `ChatMessage` or `MessageEdited` as its id, channel, author id and text length only.
-
-**Crash reports:** a panic writes `crash-<utc>.txt` in the same directory — version, platform, thread, message, location, backtrace and the last 200 log lines — and the last 5 are kept. The next start with a signed-in session offers once: "Vorcall crashed last time. Send the crash report and the log to the server?" with Send / Not now.
-
-**Report a problem:** Settings → "Diagnostics" → "Report a problem" uploads `vorcall.log`, `vorcall.log.1` and every crash report, each capped to its last 4 MiB, to `POST /api/diagnostics` (door key + bearer, 10 reports per hour per account). Each crash report is deleted locally as soon as its own upload succeeds (a report cut short by the hourly limit resumes where it stopped on the next press) and the status line reads "Report sent (N files)". On the server the files land under `Vorcall__DiagnosticsDir` (default `/diagnostics`, the host's `diagnostics/` bind mount; `../diagnostics` in local dev) as `<userId>-<username>-<yyyyMMddTHHmmssZ>-<kind>-<name>` and are deleted after 30 days. The owner reads them on the host; there is no listing command. When a friend reports a share problem on a Mac, the "ScreenCaptureKit stream running" lines in the uploaded log are where to start (see [Screen share](#screen-share)).
-
-**Server side:** what the backend logs, exposes as metrics and keeps in the database is described under [Production](#production).
-
-## Protocol
-
-See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limits, and [`proto/vorcall.proto`](proto/vorcall.proto) for the message schema. Both sides generate code from the `.proto` file at build time; never hand-edit generated code.
-
-## Production
-
-- Domain `vorcall.example.com` points DNS-only (no Cloudflare proxy) at the Oracle ARM64 host `user@host`, app directory `/opt/vorcall`.
-- `deploy/provision-host.sh` runs on the host: installs certbot, issues the Let's Encrypt certificate, installs the nginx site (`deploy/nginx/vorcall.conf`, backend proxied from loopback `127.0.0.1:5004`, `listen 443 ssl http2` to match the other sites on the host and silence the "protocol options redefined" warning), sets up the certbot renewal hook, generates the host's `.env` from `.env.production.example` (random Postgres password, `Vorcall__ServerKey`, `Vorcall__JwtSigningKey` and `Vorcall__AdminKey`), creates `backups/`, `logs/` and `diagnostics/`, and installs the nightly backup cron. See the script header for the exact invocation. nginx config changes on an existing host are applied by hand — the deploy workflow only copies the compose file. An existing `.env` must gain `Vorcall__AdminKey` (`openssl rand -hex 32`) and `Vorcall__AdminUrl=http://backend:5000` by hand; `.env.production.example` shows both, and the script reminds you.
-- Deploy pipeline (`.github/workflows/deploy.yml`): a push to `main` builds an arm64 backend image on GitHub Actions, pushes it to `ghcr.io/freedomiit/vorcall-backend`, then copies `docker-compose.prod.yml` to the host and runs `docker compose pull && up -d` over SSH. The backend applies its own EF Core migrations on boot. A push to `main` deploys production immediately; there is no separate approval step.
-- The pre-shared door key lives only in the host's `.env` (`Vorcall__ServerKey`) and must be baked into client builds as `VORCALL_SERVER_KEY`. Rotating it means: generate a new value, update the host `.env`, restart the backend, and rebuild/redistribute the client with the new key.
-- `Vorcall:JwtSigningKey` (env `Vorcall__JwtSigningKey`) is required — base64 of 32 random bytes; the server refuses to boot without it. `.env.production.example` carries a placeholder and `deploy/provision-host.sh` generates a real value for fresh hosts; on an existing host, append it by hand (`openssl rand -base64 32`). Rotating it signs every client out within 15 minutes (the access token lifetime).
-- Image attachments live on the host under `$APP_DIR/attachments`, bind-mounted read-write into the backend as `/attachments` (`docker-compose.prod.yml`); `deploy/provision-host.sh` creates the directory. Profile and server images share that mount, under `attachments/images/`. nginx has a dedicated `location /api/attachments` and `location /api/images` (`client_max_body_size 9m`, unbuffered proxying, 300 s timeouts) alongside `location /api/updates/` and `location /api/diagnostics` (`client_max_body_size 5m`, unbuffered) — all are applied to an existing host by re-running `deploy/provision-host.sh` after copying `deploy/` there.
-- **Logs:** the backend logs through Serilog to the container's console and to daily compact-JSON files `logs/vorcall-YYYYMMDD.json` (31 kept by the server itself) under `Vorcall__LogsDir` (default `/logs`, the `./logs:/logs` bind mount; `../logs` in local dev). Every WebSocket line carries `SessionId` (the first 8 hex of the connection id), `UserId` and `Username`; every HTTP request produces one line (`HTTP GET /health answered 200 in 12.0 ms`) except a request the door key refused, which produces none; an unhandled exception is logged with its stack trace and answered as a 500 protobuf `ApiError { detail: "internal error" }`. Levels are `Serilog:MinimumLevel` in `appsettings*.json` (the old `Logging` section is gone). The admin CLI keeps console-only warnings and never opens the log file. Both compose services also cap Docker's own `json-file` logs at 20 MB × 5 files.
-- **Metrics:** `curl -s localhost:5004/metrics` on the host prints a Prometheus text exposition. It is served only to loopback/private sources (`server/Api/PrivateSource.cs`) and never proxied by nginx, so it needs no key. Gauges: `vorcall_connections`, `vorcall_online_users`, `vorcall_channels` (every channel the mirror holds, DMs included), `vorcall_voice_sessions`, `vorcall_relay_sessions`, `vorcall_sharers`, `vorcall_watchers`, `vorcall_uptime_seconds`. Counters: `vorcall_ws_connections_total`, `vorcall_messages_total`, `vorcall_uploads_total{kind="attachment"|"image"}`, `vorcall_http_responses_total{class}`, `vorcall_rate_limited_total{kind="http"|"message"}`, `vorcall_relay_packets_total{direction,kind}`, `vorcall_relay_bytes_total{direction,kind}`, `vorcall_relay_keyframe_requests_total`, `vorcall_relay_drops_total{reason}` with reasons `size`, `header`, `unknown_ssrc`, `rate`, `bad_tag`, `replay`, `no_address`, `muted` (a server-muted session's audio), `share_rate`, `not_sharing`, `not_watching`, `queue_full`, `send_error`, `channel_gone`, `seal_failed` (the relay's 30 s per-channel log line carries them too).
-- **Backups:** `deploy/backup-db.sh`, installed by `provision-host.sh` as `/usr/local/bin/vorcall-backup-db` with `/etc/cron.d/vorcall-backup`, runs `pg_dump -Fc` at 03:15 UTC daily into `backups/vorcall-<utc>.dump`, keeps 14 days and appends one line per run to `backups/backup.log`. Restore (destructive — it drops and recreates the objects in the dump):
-
-  ```
-  cd /opt/vorcall
-  set -a; . .env; set +a   # pg_restore's -U/-d below are expanded by this shell
-  docker compose -f docker-compose.prod.yml stop backend
-  docker compose -f docker-compose.prod.yml exec -T db pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner < backups/<file>.dump
-  docker compose -f docker-compose.prod.yml start backend
-  curl -fsS localhost:5004/health
-  ```
-
-  (`POSTGRES_USER`/`POSTGRES_DB` come from the host's `.env`.)
-- **Problem reports:** clients upload their log and crash reports to `POST /api/diagnostics` (see [Diagnostics](#diagnostics)); the files sit under `$APP_DIR/diagnostics` (`./diagnostics:/diagnostics`), one per upload, named `<userId>-<username>-<utc>-<kind>-<name>`, and are swept after 30 days. Read them with `ls`/`less` on the host.
-- **Sweepers:** besides the unlinked-attachment and unreferenced-image sweeps, `RefreshTokenSweeper` deletes refresh-token rows 7 days after they expired or were revoked, daily, and `DiagnosticsSweeper` removes reports older than 30 days.
-- **Rate limits and their knobs:** `Vorcall__AuthRequestsPerWindow` (10 per minute per IP on `/api/auth/*`), `Vorcall__UploadRequestsPerWindow` (20 per minute per account, attachments and images alike), `Vorcall__DiagnosticsReportsPerHour` (10), `Vorcall__MessageBurst` / `Vorcall__MessagesPerSecond` (20 / 2 on the write frames). Refusals count in `vorcall_rate_limited_total`.
-- **Admin:** `Vorcall__AdminKey` enables `POST /api/admin/kick` and `POST /api/admin/refresh-account`, which answer 404 unless the source is private and `X-Vorcall-Admin-Key` matches — nginx returns 404 for `/api/admin/` regardless; `Vorcall__AdminUrl` is where the CLI container finds the live server (see [Admin CLI](#admin-cli)).
-- **`.env` keys**, all under `Vorcall__`: `ServerKey`, `JwtSigningKey`, `AdminKey`, `AdminUrl` (set on every host); `VoiceEnabled`, `VoicePort`, `VoiceHost`, `ShareEnabled`, `ShareMaxKbps`, `MaxSharersPerRoom`, `ReleasesDir`, `LogsDir`, `DiagnosticsDir`, `DiagnosticsReportsPerHour`, `AttachmentsDir`, `AttachmentsMaxBytes`, `AuthRequestsPerWindow`, `UploadRequestsPerWindow`, `MessageBurst`, `MessagesPerSecond` (optional, defaults in `.env.production.example` and above).
-
-## Releases and updates
-
-### How updates reach friends
-
-Vorcall checks for a newer build automatically: on the first successful connection after the app starts, and every 6 hours after that while connected and in the chat. A manual check is also available from Settings ("Check for updates").
-
-A check fetches `/api/updates/manifest`, verifies its signature against the keys baked in at compile time from `client/update-keys.pub`, and — if there is something newer for the running platform — downloads the asset next to the running binary as `.vorcall-update-<version>`. Its size and SHA-256 are checked against the manifest before anything else happens with it.
-
-- **Optional update:** a banner appears under the header — "Vorcall {version} is ready." with "Restart now" and "Later". "Later" hides the banner until the next check finds something new; "Restart now" leaves the voice channel cleanly, then swaps the binary and relaunches.
-- **Required update:** when the manifest's `min_version` is above the running version, the chat screen is replaced by an "Update required" screen ("Vorcall {version} is needed to keep chatting.") that downloads and restarts on its own; a failure shows the error with a Retry button. The connection underneath is left alone, so a failed restart returns to a channel that is still there.
-- **Left for the next launch:** a verified download next to the binary that was never applied (the app was closed first) is re-verified from disk and installed at the next start, before the window opens. When the install directory is not writable, the download lands in the user's local data directory instead; that copy is never applied automatically — the UI says where it is and asks to install it by hand.
-- Settings also shows `Version {current} ({platform})` and, when the manifest carries notes, "What's new in {version}".
-
-Platform swap mechanics: Linux and macOS rename the downloaded file over the running binary and re-exec — safe, because the kernel keeps the old inode alive for the process that is still running it. On Linux the tarball's install script puts the binary at `~/.local/bin/vorcall`; on macOS it is `Vorcall.app/Contents/MacOS/vorcall`, so the swap happens inside the bundle and leaves the rest of it alone. Windows cannot overwrite a running executable, so it moves `vorcall.exe` to `vorcall.exe.old`, moves the new file into its place and relaunches; `.old` is deleted the next time the new binary starts.
-
-The updater is off entirely for a dev-key build, a debug build, when `VORCALL_NO_UPDATE` is set, or when `client/update-keys.pub` carries no keys — in each case Settings shows why instead of the Check button doing anything.
-
-### One-time setup (owner)
-
-1. `cd client && cargo run -p vorcall-release -- gen-key --out ~/vorcall-update-signing.key` — an Ed25519 key pair; the public half prints as 64 hex characters.
-2. Keep the private key file in a password manager. A lost key strands every client already out there: they refuse a manifest signed by any other key.
-3. `gh secret set VORCALL_UPDATE_SIGNING_KEY < ~/vorcall-update-signing.key`
-4. `gh secret set VORCALL_SERVER_KEY` with the production door key from `client/.env.release`.
-5. Paste the printed public key into `client/update-keys.pub` and commit it.
-6. Push `main` — deploys the `/api/updates/*` endpoints and the `releases/` compose mount.
-7. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — creates `releases/` and installs the nginx `location /api/updates/`.
-
-Key rotation: add the new public key to `client/update-keys.pub` alongside the old one, ship a release, sign later releases with the new key, then drop the old key from the file once every client has picked up a build that carries the new one.
-
-### Cutting a release
-
-CI builds only macOS. The Linux and Windows binaries are built on the owner's machine and pushed to the host first; the workflow fetches them back, compiles the Windows installer around the pushed exe, and signs one manifest covering all three platforms.
-
-1. Bump `version` in `client/Cargo.toml` (`[workspace.package]`); bump `min_version` too (`[workspace.metadata.vorcall]`) when older clients must be cut off. Commit and push.
-2. Optionally dispatch the `release` workflow with `publish` unchecked first — a dry run that builds macOS, then signs and verifies a **macOS-only** manifest. It reaches neither the host nor a GitHub Release, needs no tag, and needs nothing pushed to the host.
-3. `git tag -a vX.Y.Z -m "notes"`. The annotation becomes the manifest's `notes` and the GitHub Release body; a lightweight tag (no `-a`/`-m`) gives empty notes.
-4. `scripts/push-client.sh` — builds `dist/vorcall-linux-x86_64` (+ tarball) and `dist/vorcall-windows-x86_64.exe`, checksums them and scp's them into `~/freedom.vorcall/releases/<version>/` on the host. It needs `client/.env.release`, SSH access to the host and the Windows cross toolchain (`sudo dnf install -y clang lld llvm`, `cargo install cargo-xwin`), and it refuses to run unless the tag `vX.Y.Z` points at HEAD (`--no-tag-check` overrides, for a scratch build).
-5. `git push origin vX.Y.Z`.
-6. Watch the workflow run.
-7. Verify on the host: `ssh user@host 'head -c 300 ~/freedom.vorcall/releases/manifest.json'`.
-8. `users outdated` in the admin CLI (see [Admin CLI](#admin-cli)) lists who has not moved yet.
-
-The workflow refuses to publish when: the tag does not equal the workspace version; `min_version` is above `version`; the macOS build fails; the Linux/Windows binaries are not on the host for that version (run `scripts/push-client.sh` first) or their checksums do not match; or the signing key's public half is not in `client/update-keys.pub` (which is exactly when clients would reject the manifest).
-
-Because the Linux binary is built on the owner's Fedora machine instead of a pinned `ubuntu-22.04` runner, its glibc floor is that machine's glibc: a friend on an older distro can hit `GLIBC_2.xx not found` and needs a build made on an older base.
-
-### First install per platform
-
-Only the first build on each friend's machine is a manual hand-off — later builds arrive through the in-app updater described above.
-
-- **Linux:** hand over `vorcall-linux-x86_64.tar.gz`, then `tar xzf vorcall-linux-x86_64.tar.gz && vorcall-linux-x86_64/install.sh`. No root: the binary lands in `~/.local/bin`, the launcher entry and icon under `~/.local/share`, and Vorcall shows up in the app launcher. `install.sh --uninstall` removes the same files. (The bare `vorcall-linux-x86_64` still works after a `chmod +x`, from any directory the friend can write to.)
-- **Windows:** hand over `vorcall-windows-x86_64-setup.exe`. SmartScreen shows "Windows protected your PC" — "More info" then "Run anyway". It installs per user under `%LocalAppData%\Programs\Vorcall` with a Start menu entry, no admin prompt, and the updater keeps replacing `vorcall.exe` there; uninstall from Settings → Apps. Updates the app downloads itself carry no Mark-of-the-Web, so the SmartScreen prompt does not come back. (The bare `vorcall-windows-x86_64.exe` still runs on its own as a portable copy.)
-- **macOS (Apple Silicon only):** hand over `vorcall-macos-aarch64.dmg` from the GitHub Release, not the bare binary (Finder opens that one in TextEdit). Open the image, drag `Vorcall.app` onto the Applications shortcut next to it, eject the image and launch the copy in Applications — the image is read-only, so an app started from it could not update itself. The app is ad-hoc signed, not notarised, so macOS blocks the first launch: on macOS 14 and earlier, right-click → Open, then "Open"; on macOS 15, open it once, dismiss the dialog, then System Settings → Privacy & Security → "Open Anyway". `xattr -dr com.apple.quarantine /Applications/Vorcall.app` in Terminal is the shortcut. The updater replaces the binary inside the bundle, so the app has to live where the account can write (Applications is fine for an administrator account).
-
-### Update oracle
-
-`scripts/update-oracle.sh` drives `vorcall-probe check-update`/`apply-update` end to end against a locally running server, using an account that already exists:
-
-```
-VORCALL_PROBE_USER=alice VORCALL_PROBE_PASSWORD=... scripts/update-oracle.sh --http http://localhost:5000
-```
-
-It publishes a signed `9.9.9` manifest into the local `releases/` directory (backing up and restoring whatever manifest was already there) and cleans up after itself. What it proves:
-
-- **A** — an honest release is accepted, downloaded, and hashes to what the manifest says.
-- **B** — a tampered manifest is refused at the signature stage.
-- **C** — a tampered asset is refused at the size or hash stage.
-- **D** — a `min_version` above the running version is reported as `required`.
-- **E** (Linux only) — `apply-update` swaps a throwaway copy of the probe and relaunches it.
-- **F** — `--no-download` reports without fetching the asset.
-
-The two subcommands it drives:
-
-```
-vorcall-probe check-update --username U [--password P] --platform ID --out PATH [--pubkey HEX ...] [--no-download]
-vorcall-probe apply-update --file PATH
-```
-
-## Rolling out the accounts release
-
-1. Add `Vorcall__JwtSigningKey` to the host `.env` **before** pushing (see [Production](#production)).
-2. Push `main` — this deploys.
-3. Generate one invite per friend with the admin CLI (see [Admin CLI](#admin-cli)).
-4. Rebuild the clients: `scripts/build-client-linux.sh` / `scripts/build-client-windows.sh`. The Mac friend rebuilds from source.
-5. Distribute the new builds. Old clients stop working at deploy time and show "Unauthorized: rebuild the client".
-
-## Rolling out the voice release
-
-1. Open UDP 5005 ingress in the OCI VCN security list.
-2. Push `main` — this deploys. Old clients keep working: they ignore the voice frames (see [Forward compatibility](PROTOCOL.md#forward-compatibility)).
-3. On the host, run `deploy/provision-host.sh` (adds the iptables rule for UDP 5005; idempotent) — copy the updated `deploy/` to the host first, as the script header says.
-4. Verify with two probes against production, using `client/.env.probe` (see [Voice](#voice)).
-5. Rebuild and distribute both clients: `scripts/build-client-linux.sh`, `scripts/build-client-windows.sh`. The Mac friend rebuilds from source.
-6. Friends check the settings page for their microphone.
-
-## Rolling out the updates release
-
-0.2.0 is the first release with the signed self-updater — the one-time bootstrap below runs once, then every later release only needs [Cutting a release](#cutting-a-release).
-
-1. One-time setup: generate and store the signing key, set the `VORCALL_UPDATE_SIGNING_KEY`/`VORCALL_SERVER_KEY` secrets, paste the public key into `client/update-keys.pub` and commit it (see [One-time setup](#one-time-setup-owner)).
-2. Push `main` — deploys the `/api/updates/*` endpoints and the `releases/` compose mount.
-3. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — creates `releases/` and installs the nginx `location /api/updates/`.
-4. Dispatch `release` with `publish` unchecked as a dry run first.
-5. `git tag -a v0.2.0 -m "..."` && `git push origin v0.2.0`.
-6. Verify the manifest on the host: `ssh user@host 'head -c 300 ~/freedom.vorcall/releases/manifest.json'`.
-7. Hand-deliver 0.2.0 to each friend — the last manual install: the clients they are running now predate the updater and cannot pick it up themselves.
-
-## Rolling out the rooms release
-
-0.3.0 adds public rooms, DMs, reply/edit/delete, reactions and image attachments on top of `general`. `min_version` stays at 0.2.0: a client from the updates release keeps chatting in `general` without a rebuild, it just never sees the new frames (see [Forward compatibility](PROTOCOL.md#forward-compatibility)).
-
-1. Push `main` — this deploys; the backend applies the `AddRoomsAndRichMessages` migration (the `rooms`, `room_members`, `reactions` and `attachments` tables) on boot, and serves `/api/attachments/*`.
-2. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — creates the `attachments/` directory and installs the nginx `location /api/attachments` (see [Production](#production)).
-3. Verify with a client: create a room or open a DM, send a message with an image attachment, and confirm another member sees it.
-4. `git tag -a v0.3.0 -m "..."` && `git push origin v0.3.0` (see [Cutting a release](#cutting-a-release)); leave `min_version` at 0.2.0 unless friends still on the pre-rooms build must be forced to update.
-5. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
-
-## Rolling out the screen share release
-
-0.4.0 adds screen sharing on top of voice. `min_version` moves to 0.4.0: an older client is asked to update by the manifest rather than left to ignore the new frames, since it has no way to render a share at all.
-
-1. Push `main` — this deploys once.
-2. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — adds the sysctl step that lets the relay's 8 MiB socket buffers actually take (see [Screen share](#screen-share)).
-3. On each desktop: share a window and a monitor, watch from another machine, check audio, pop out, go fullscreen, and (macOS) grant Screen Recording, then relaunch.
-4. `git tag -a v0.4.0 -m "..."`, then `scripts/push-client.sh` (builds and pushes the Linux and Windows binaries to the host), then `git push origin v0.4.0` (see [Cutting a release](#cutting-a-release)).
-5. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
-
-## Rolling out the channels and operations release
-
-0.5.0 replaces rooms with channels and adds categories, roles, permissions, profiles and moderation, on a rewritten client; it carries the operations pass with it — Serilog logs, `/metrics`, the nightly database backup, the write rate limiter, the admin endpoint and disabled accounts on the server, and the client log, crash reports and "Report a problem" on the client. `min_version` moves to 0.5.0: a 0.4.x client knows nothing of channels at all, so it is asked to update rather than left to misread every id.
-
-**Read step 1 before pushing anything, and take every step below — the list is one list.** The database migration is the only irreversible step in the project's history, and a push to `main` deploys production immediately, with no approval gate.
-
-1. **Back production up.** `ssh` to the host and `pg_dump` the database before the deploy:
-
-   ```
-   cd /opt/vorcall
-   docker compose -f docker-compose.prod.yml exec -T db \
-     sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > ~/vorcall-pre-0.5.0.sql
-   ```
-
-   The `ChannelsRolesProfiles` migration converts every public room into a category holding a text and a voice channel, rewrites every message, attachment and read cursor onto numeric channel ids, turns each `dm-<a>-<b>` room into a DM channel, seeds the `server` row and `@everyone`, and drops `rooms` and `room_members`. Its `Down()` throws: there is no migrating back. Restoring that dump is the only rollback.
-2. **Add the admin keys to the host's `.env` by hand.** `Vorcall__AdminKey` (`openssl rand -hex 32`) and `Vorcall__AdminUrl=http://backend:5000` (see [Production](#production)). `deploy/provision-host.sh` generates them only for a fresh host; an existing `.env` it leaves alone, so without this step the admin endpoints stay unmapped and `users kick`/`users disable` print "admin endpoints are off".
-3. **Copy `deploy/` to the host and re-run `deploy/provision-host.sh`** — it creates `backups/`, `logs/` and `diagnostics/`, installs the nightly backup cron, and installs the new nginx blocks: `location /api/images` (raw upload bodies, unbuffered, 9 MiB), without which avatars, banners and icons fail to upload behind nginx, plus `location /api/diagnostics` and `location /api/admin/`. Idempotent, like the earlier runs.
-4. **Push `main`** — this deploys. The backend applies both migrations on boot — `AddDisabledAndRevoked` (`users.disabled_at`, `invites.revoked_at`) and `ChannelsRolesProfiles` — and mounts `logs/` and `diagnostics/`. It migrates, then seeds, then loads its model, all before Kestrel listens, so a failure in any of the three leaves the port closed rather than half-serving (`/health`, which the compose healthcheck polls, answers 200 only after that). The migration sets `owner_id` to the **lowest user id**, which is rarely the right account, so pick the real owner on the host straight away:
-
-   ```
-   docker compose -f docker-compose.prod.yml run --rm backend server set-owner <username>
-   docker compose -f docker-compose.prod.yml run --rm backend server show
-   ```
-
-   The owner bypasses every permission check; everyone else starts with `@everyone`'s defaults (view, send, attach, react, connect, speak, share screen, own nickname) and no further role. Hand out roles from the server settings pages afterwards.
-5. **Check the operational surface on the host.** `ls logs/` for today's `vorcall-YYYYMMDD.json`, `curl -s localhost:5004/metrics` for the exposition, and `docker compose -f docker-compose.prod.yml run --rm backend users list` — it must run without "admin endpoints are off". `ls backups/` after the first 03:15 UTC run.
-6. **Cut and distribute 0.5.0.** `git tag -a v0.5.0 -m "..."`, then `scripts/push-client.sh`, then `git push origin v0.5.0` (see [Cutting a release](#cutting-a-release)). Every friend still on 0.4.x gets the "Update required" screen until they take it, since `min_version` is 0.5.0; `users outdated` lists who has not moved.
-7. **Run the oracles.** `docker compose up -d db && dotnet test tests/Vorcall.Server.Tests` first — it is the primary oracle. The proto changed, so also regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run `smoke.py full` as a second opinion — it covers the snapshot shape, channel and category CRUD, permission refusals, override-driven visibility, mention flags, kick and ban with tombstones, images, invites, bans and voice moderation. Then the two-probe voice oracle and the share oracle against production with `client/.env.probe`.
-8. **Walk each desktop.** This part no automated check covers: open the GUI on Linux, Windows and macOS and go through the channel list, a message with an attachment, a profile, the settings and server-settings pages (including a drag-and-drop reorder), the quick switcher and the theme picker; confirm the three global keybinds (push-to-talk, mute, deafen) fire while another window is focused — on Wayland that means accepting all three in the compositor's portal dialog, which is a new prompt; and on macOS re-grant Input Monitoring and Screen Recording after the update, then relaunch, because both grants are tied to the specific ad-hoc-signed build. For a Mac friend without a build machine, dispatch the `release` workflow with `publish` unchecked and hand over the `vorcall-probe-macos-aarch64` artifact (see [Screen share](#screen-share)).
-
-## Development gates
-
-```
-cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app -p vorcall-hotkey -p vorcall-screen
-```
-
-```
-dotnet build server/Vorcall.Server.csproj -warnaserror
-docker compose up -d db && ~/.dotnet/dotnet test tests/Vorcall.Server.Tests
-```
-
-The Rust side has unit tests in `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app`, `vorcall-hotkey` and `vorcall-screen`. The server has `tests/Vorcall.Server.Tests`: the permission-engine matrix, the name grammar and validation as plain unit tests, plus an xunit integration suite that boots the backend in-process through `WebApplicationFactory` against the compose Postgres, in a database of its own per run (`vorcall_test_<hex>`), speaking the WebSocket protocol with the server's own generated protobuf types. `VORCALL_TEST_ADMIN` overrides the admin connection string it creates that database with (default `Host=localhost;Port=5433;Username=vorcall;Password=vorcall;Database=postgres`). It is the primary runtime oracle for the chat and REST surface; the Python smoke suite outside the repository (`CLAUDE.md` § Commands) is a second opinion on the wire protocol, and the voice and share media paths keep `vorcall-probe` (see [Voice](#voice) and [Screen share](#screen-share)). CI (`.github/workflows/ci.yml`) runs the same `cargo test` for the six crates and `dotnet test` with a Postgres service.
-
-`cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph. `cargo xwin clippy --target x86_64-pc-windows-msvc -p vorcall-screen` (from `client/`) checks the Windows capture backend from Linux; the macOS backend compiles only on `release.yml`'s macOS runner, so a dry-run dispatch (see [Cutting a release](#cutting-a-release)) is the only way to check it without a Mac.
+One WebSocket carries every live event. Audio, video and share audio go over a separate UDP
+relay because a reverse proxy cannot carry them and latency matters. Both sides generate
+their code from the same [`proto/vorcall.proto`](proto/vorcall.proto).
+
+| | |
+| --- | --- |
+| `server/` | ASP.NET Core (.NET 10) — API, permission engine, voice relay |
+| `client/` | Cargo workspace — the `iced` desktop app and its media crates |
+| `proto/` | The shared schema both sides compile from |
+| `tests/` | xunit suite: permission matrix, wire protocol, REST surface |
+| `deploy/` | nginx configs and host provisioning for a production install |
+
+## Documentation
+
+| | |
+| --- | --- |
+| [**Self-hosting**](docs/self-hosting.md) | Deploy, expose, configure, back up and upgrade a server |
+| [**Development**](docs/development.md) | Build from source, run locally, the test suite and the gates |
+| [**Protocol**](PROTOCOL.md) | Wire framing, state machines, permission resolution, limits |
+| [**Administration**](docs/administration.md) | The admin CLI: invites, accounts, ownership |
+| [**Releasing**](docs/releasing.md) | For maintainers: cutting and signing a client release |
+
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to
+build the project and what the gates are. Security problems go to
+[SECURITY.md](SECURITY.md), not to a public issue.
+
+## License
+
+[MIT](LICENSE) © Freedom IT

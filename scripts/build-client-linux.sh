@@ -6,7 +6,7 @@
 # or through client/.env.release (gitignored), whose format is:
 #
 #   export VORCALL_SERVER_KEY=<the Vorcall__ServerKey from the host .env>
-#   export VORCALL_SERVER_URL=https://vorcall.example.com   # optional
+#   export VORCALL_SERVER_URL=https://chat.example.org           # required
 #
 # Output: dist/vorcall-linux-x86_64 and the first-install tarball
 #         dist/vorcall-linux-x86_64.tar.gz (scripts/package-client-linux.sh)
@@ -28,7 +28,14 @@ if [ -z "${VORCALL_SERVER_KEY:-}" ] || [ "${VORCALL_SERVER_KEY}" = "dev" ]; then
 fi
 export VORCALL_SERVER_KEY
 
-SERVER_URL="${VORCALL_SERVER_URL:-https://vorcall.example.com}"
+if [ -z "${VORCALL_SERVER_URL:-}" ]; then
+    echo "ERROR: VORCALL_SERVER_URL is unset." >&2
+    echo "A release build has to name the server it ships pointed at." >&2
+    echo "Export it, or put it in client/.env.release:" >&2
+    echo "  export VORCALL_SERVER_URL=https://chat.example.org" >&2
+    exit 1
+fi
+SERVER_URL="$VORCALL_SERVER_URL"
 export VORCALL_SERVER_URL="$SERVER_URL"
 echo "server URL: $SERVER_URL"
 echo "server key: set (not printed)"

@@ -70,6 +70,9 @@ pub const STAGE_WINDOW: (f32, f32) = (960.0, 560.0);
 /// The window this account signs in through, and everything behind it.
 pub struct App {
     pub endpoints: Endpoints,
+    /// The sign-in screen's "Server" section, so a downloaded client can be
+    /// pointed at a self-hosted server without a rebuild.
+    pub server_form: ServerForm,
     pub session: Option<Session>,
     /// The connection subscription's identity, bumped by every sign-in and
     /// sign-out. The tokens themselves are not part of it: the loop rotates them
@@ -112,6 +115,42 @@ pub struct App {
     pub audio_unavailable: bool,
     pub last_toast: Option<Instant>,
     pub workers: Workers,
+}
+
+/// The sign-in screen's "Server" section: which server this client talks to.
+///
+/// Folded shut by default — the overwhelming case is a build that already points
+/// where it should — and only useful before signing in, which is the one moment
+/// no connection is live.
+pub struct ServerForm {
+    pub open: bool,
+    pub url: String,
+    pub key: String,
+    /// What the last save attempt refused, if anything.
+    pub error: Option<String>,
+    /// A `VORCALL_SERVER_*` variable is pinning the target, so the fields are
+    /// shown read-only: saving them would change nothing.
+    pub pinned: bool,
+}
+
+impl ServerForm {
+    fn new(endpoints: &Endpoints, config: &Config) -> Self {
+        Self {
+            open: false,
+            url: endpoints.display_url(),
+            // Never pre-filled from the build's own key: it is not the user's to
+            // read back out of a binary, and an empty field means "keep it".
+            key: config.server_key.clone().unwrap_or_default(),
+            error: None,
+            pinned: vorcall_core::endpoints::pinned_by_env(),
+        }
+    }
+
+    /// Whether a server of the user's own is in force, which is what the reset
+    /// button is for.
+    pub fn overridden(&self, config: &Config) -> bool {
+        config.server_url.is_some() || config.server_key.is_some()
+    }
 }
 
 /// The worker threads, started the first time something needs them and kept for
@@ -271,8 +310,11 @@ impl App {
         };
         let ui = UiState::new(&config);
 
+        let server_form = ServerForm::new(&endpoints, &config);
+
         let mut app = Self {
             endpoints,
+            server_form,
             session,
             session_generation: 0,
             config,

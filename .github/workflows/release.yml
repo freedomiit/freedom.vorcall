@@ -81,9 +81,9 @@ permissions:
   contents: write
 
 env:
-  SERVER: user@host
-  APP_DIR: /opt/vorcall
-  VORCALL_SERVER_URL: https://vorcall.example.com
+  SERVER: ${{ vars.DEPLOY_SERVER }}
+  APP_DIR: ${{ vars.DEPLOY_APP_DIR || '/opt/vorcall' }}
+  VORCALL_SERVER_URL: ${{ vars.VORCALL_SERVER_URL }}
 
 jobs:
   preflight:
@@ -404,7 +404,7 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 203.0.113.10 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H "${SERVER#*@}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Fetch the pushed Linux and Windows binaries from the host
         if: needs.preflight.outputs.publish == 'true'

@@ -70,6 +70,25 @@ public sealed class ServerDirectory(IDbContextFactory<AppDbContext> contexts, IL
         return true;
     }
 
+    // A fresh install seeds its server row before any account exists, so it has no owner. The
+    // first account to register takes it: on a self-hosted server that account is the person who
+    // deployed it and made the invite, and without this they would have to reach for the admin
+    // CLI before they could do anything. Only ever fires while OwnerId is null.
+    public async Task<bool> ClaimOwnerAsync(long userId, CancellationToken ct)
+    {
+        await using var db = await contexts.CreateDbContextAsync(ct);
+        var row = Require(await db.Server.FirstOrDefaultAsync(s => s.Id == Data.Server.RowId, ct));
+        if (row.OwnerId is not null)
+        {
+            return false;
+        }
+
+        row.OwnerId = userId;
+        await db.SaveChangesAsync(ct);
+        logger.LogInformation("Server had no owner; the first account to register ({UserId}) took it", userId);
+        return true;
+    }
+
     public async Task EnsureSeededAsync(CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);

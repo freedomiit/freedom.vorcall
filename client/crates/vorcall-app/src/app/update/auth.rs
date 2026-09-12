@@ -4,12 +4,12 @@
 //! be able to leave it again.
 
 use iced::Task;
-use vorcall_core::{ApiFailure, auth};
+use vorcall_core::{ApiFailure, Endpoints, auth};
 
 use crate::app::message::{AuthMsg, Message};
 use crate::app::state::rules::{describe, validate_password, validate_username};
 use crate::app::state::ui::Dialog;
-use crate::app::{App, Screen};
+use crate::app::{App, Screen, ServerForm};
 
 pub fn update(app: &mut App, message: AuthMsg) -> Task<Message> {
     match message {
@@ -60,6 +60,21 @@ pub fn update(app: &mut App, message: AuthMsg) -> Task<Message> {
             };
             focus_username()
         }
+        AuthMsg::ServerToggle => {
+            app.server_form.open = !app.server_form.open;
+            app.server_form.error = None;
+            Task::none()
+        }
+        AuthMsg::ServerUrlChanged(value) => {
+            app.server_form.url = value;
+            Task::none()
+        }
+        AuthMsg::ServerKeyChanged(value) => {
+            app.server_form.key = value;
+            Task::none()
+        }
+        AuthMsg::ServerSave => save_server(app),
+        AuthMsg::ServerReset => reset_server(app),
         AuthMsg::LoginSubmit => submit_login(app),
         AuthMsg::RegisterSubmit => submit_register(app),
         AuthMsg::LoginResult(Ok(session)) => app.signed_in(session),
@@ -211,6 +226,81 @@ fn logout(app: &mut App) -> Task<Message> {
     };
 
     Task::batch([told, app.sign_out(None)])
+}
+
+/// Points this client at the typed server and saves it.
+///
+/// An empty key field keeps whatever key is already in force, so a self-hoster
+/// who only moved their address does not have to type the key again.
+fn save_server(app: &mut App) -> Task<Message> {
+    if app.server_form.pinned {
+        return Task::none();
+    }
+
+    let url = app.server_form.url.trim().to_owned();
+    let typed_key = app.server_form.key.trim().to_owned();
+    let key = if typed_key.is_empty() {
+        app.endpoints.key.clone()
+    } else {
+        typed_key.clone()
+    };
+
+    let endpoints = match Endpoints::parse(&url, &key) {
+        Ok(endpoints) => endpoints,
+        Err(e) => {
+            app.server_form.error = Some(format!("{e:#}"));
+            return Task::none();
+        }
+    };
+
+    app.config.server_url = Some(endpoints.display_url());
+    if !typed_key.is_empty() {
+        app.config.server_key = Some(typed_key);
+    }
+    app.save_config();
+    app.server_form = ServerForm::new(&endpoints, &app.config);
+    app.endpoints = endpoints;
+
+    // A session is a token this server never issued; the account behind it may
+    // not even exist here.
+    forget_session(app)
+}
+
+/// Drops the saved server and goes back to the one the build carries.
+fn reset_server(app: &mut App) -> Task<Message> {
+    if app.server_form.pinned {
+        return Task::none();
+    }
+
+    app.config.server_url = None;
+    app.config.server_key = None;
+    app.save_config();
+
+    match vorcall_core::endpoints::resolve() {
+        Ok(endpoints) => {
+            app.server_form = ServerForm::new(&endpoints, &app.config);
+            app.endpoints = endpoints;
+            forget_session(app)
+        }
+        // Only a build that baked no key at all lands here, and it has nothing to
+        // fall back to: keep the server the user typed rather than strand them.
+        Err(e) => {
+            app.config.server_url = Some(app.endpoints.display_url());
+            app.config.server_key = Some(app.endpoints.key.clone());
+            app.save_config();
+            app.server_form.error = Some(format!("{e:#}"));
+            Task::none()
+        }
+    }
+}
+
+/// Back to a clean sign-in screen after the server underneath changed.
+fn forget_session(app: &mut App) -> Task<Message> {
+    if app.session.is_some() {
+        return app.sign_out(None);
+    }
+    app.screen = Screen::login(carried_username(app));
+    Task::none()
 }
 
 fn submit_change_password(app: &mut App) -> Task<Message> {

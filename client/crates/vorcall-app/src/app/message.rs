@@ -63,6 +63,14 @@ pub enum AuthMsg {
     InviteChanged(String),
     ShowLogin,
     ShowRegister,
+    /// Fold the sign-in screen's "Server" section open or shut.
+    ServerToggle,
+    ServerUrlChanged(String),
+    ServerKeyChanged(String),
+    /// Point this client at the typed server, saving it in `config.toml`.
+    ServerSave,
+    /// Forget the saved server and go back to the one the build carries.
+    ServerReset,
     LoginSubmit,
     RegisterSubmit,
     /// Registration and sign-in end the same way: a session or a failure.
@@ -86,6 +94,11 @@ impl fmt::Debug for AuthMsg {
             Self::InviteChanged(_) => f.write_str("InviteChanged(<redacted>)"),
             Self::ShowLogin => f.write_str("ShowLogin"),
             Self::ShowRegister => f.write_str("ShowRegister"),
+            Self::ServerToggle => f.write_str("ServerToggle"),
+            Self::ServerUrlChanged(_) => f.write_str("ServerUrlChanged(<hidden>)"),
+            Self::ServerKeyChanged(_) => f.write_str("ServerKeyChanged(<redacted>)"),
+            Self::ServerSave => f.write_str("ServerSave"),
+            Self::ServerReset => f.write_str("ServerReset"),
             Self::LoginSubmit => f.write_str("LoginSubmit"),
             Self::RegisterSubmit => f.write_str("RegisterSubmit"),
             Self::LoginResult(result) => match result {

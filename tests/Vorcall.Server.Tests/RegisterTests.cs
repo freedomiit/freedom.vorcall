@@ -78,4 +78,21 @@ public sealed class RegisterTests(ServerFixture fixture)
         Assert.Equal(HttpStatusCode.Forbidden, second.Status);
         Assert.Equal("invite code is invalid, used or expired", second.Detail);
     }
+
+    // The self-hosted first run: `docker compose up -d` seeds a server nobody owns, and whoever
+    // redeems the first invite takes it. Without this they would have to reach for the admin CLI
+    // before they could create so much as a channel.
+    [Fact]
+    public async Task The_first_account_on_an_unowned_server_becomes_its_owner()
+    {
+        var host = await fixture.UnownedAsync();
+
+        var alice = await Accounts.RegisterAsync(host, "alice");
+        var bob = await Accounts.RegisterAsync(host, "bob");
+
+        await using var client = await WsClient.ConnectAsync(host, alice);
+
+        Assert.Equal(alice.UserId, client.Session.Snapshot.Server.OwnerId);
+        Assert.NotEqual(bob.UserId, client.Session.Snapshot.Server.OwnerId);
+    }
 }

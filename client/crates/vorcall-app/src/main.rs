@@ -54,7 +54,18 @@ fn main() -> iced::Result {
         tracing::warn!(%error, "no log file");
     }
 
-    let endpoints = match vorcall_core::endpoints::resolve() {
+    // A broken preferences or session file is not worth refusing to start over:
+    // the worst case is a first run that asks for a sign-in again. Loaded before
+    // the endpoints because it is where a self-hosted server's address lives.
+    let config = match vorcall_core::config::load() {
+        Ok(config) => config.unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "ignoring the stored configuration");
+            Config::default()
+        }
+    };
+
+    let endpoints = match resolve_endpoints(&config) {
         Ok(endpoints) => endpoints,
         Err(e) => {
             eprintln!("vorcall: {e:#}");
@@ -77,15 +88,6 @@ fn main() -> iced::Result {
         apply_pending_update(&keys);
     }
 
-    // A broken preferences or session file is not worth refusing to start over:
-    // the worst case is a first run that asks for a sign-in again.
-    let config = match vorcall_core::config::load() {
-        Ok(config) => config.unwrap_or_default(),
-        Err(e) => {
-            tracing::warn!(error = %e, "ignoring the stored configuration");
-            Config::default()
-        }
-    };
     let session = match vorcall_core::session::load() {
         Ok(session) => session,
         Err(e) => {
@@ -113,6 +115,28 @@ fn main() -> iced::Result {
     .style(|_: &App, theme: &Theme| brand::palette::style(theme))
     .subscription(App::subscription)
     .run()
+}
+
+/// The server this run talks to, preferring the one saved from the sign-in
+/// screen's "Server" section.
+///
+/// A saved address that no longer parses falls back to the build's own rather
+/// than refusing to start: the field that would fix it lives inside the app, so
+/// exiting here would leave no way back in. Only a build with no key anywhere is
+/// fatal.
+fn resolve_endpoints(config: &Config) -> anyhow::Result<vorcall_core::Endpoints> {
+    use vorcall_core::endpoints;
+
+    let stored =
+        endpoints::resolve_with(config.server_url.as_deref(), config.server_key.as_deref());
+    match stored {
+        Ok(endpoints) => Ok(endpoints),
+        Err(e) if config.server_url.is_some() || config.server_key.is_some() => {
+            tracing::warn!(error = %e, "ignoring the saved server; falling back to the built-in one");
+            endpoints::resolve()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// A download an earlier run finished takes effect here, before the first window

@@ -1,4 +1,6 @@
-# Production stack for vorcall.example.com.
+# The maintainer's production stack: pulls a pre-built image from a registry
+# instead of building it. Self-hosting uses docker-compose.yml — see
+# docs/self-hosting.md. Everything host-specific lives in the host's own .env.
 #
 # TLS is terminated by the host nginx (Let's Encrypt); this stack only
 # publishes the backend on a loopback port that nginx proxies to.

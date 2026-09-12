@@ -20,3 +20,7 @@ dist/
 /diagnostics/
 # Database dumps written by deploy/backup-db.sh on the host; never committed
 /backups/
+# Agent worktrees and scratch state; never committed
+/.claude/worktrees/
+# Generated server secrets when the backend runs outside a container
+/data/

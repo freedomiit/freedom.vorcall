@@ -1,0 +1,70 @@
+name: Bug report
+description: Something is broken
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do **not** use this form for security
+        problems — see [SECURITY.md](../blob/main/SECURITY.md) instead.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+        3. …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`vorcall --version`, or the commit you built from."
+      placeholder: vorcall 0.5.2 linux-x86_64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: side
+    attributes:
+      label: Where
+      options:
+        - Desktop client
+        - Server
+        - Both / not sure
+        - Self-hosting or deployment
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - Windows
+        - macOS
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Client: `vorcall.log` next to `config.toml`. Server: `docker compose logs backend`.
+        Redact anything private — and never paste your server key or a token.
+      render: text

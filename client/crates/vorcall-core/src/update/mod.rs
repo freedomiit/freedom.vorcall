@@ -298,14 +298,9 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use url::Url;
 
     fn endpoints(key: &str) -> Endpoints {
-        Endpoints {
-            http_base: Url::parse("https://vorcall.example/").expect("should parse"),
-            ws_url: Url::parse("wss://vorcall.example/ws").expect("should parse"),
-            key: key.to_owned(),
-        }
+        Endpoints::parse("https://vorcall.example", key).expect("should parse")
     }
 
     fn a_key() -> PublicKey {

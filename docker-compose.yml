@@ -1,29 +1,118 @@
-# Vorcall local development: Postgres only. Run the server with
-#   ~/.dotnet/dotnet run --project server/Vorcall.Server.csproj
-# (listens on http://localhost:5000, key "dev", see server/appsettings.Development.json).
+# Vorcall: a whole server, from a clone of this repository.
 #
-# The server runs on the host, not in a container, so the releases it serves under
-# /api/updates/* come straight from the working tree: Vorcall:ReleasesDir is "../releases"
-# in server/appsettings.Development.json, which is the repo-root releases/ directory.
-# A backend service added here would need the mount production uses instead:
-#   volumes:
-#     - ./releases:/releases:ro
+#   docker compose up -d
+#
+# That is the whole install. The backend image is built here from source, the
+# database comes up beside it, and the two secrets that have no safe default —
+# the door key clients send and the token signing key — are generated on the
+# first boot and kept in the `data` volume. Read the door key back with:
+#
+#   docker compose logs backend | grep "Server key"
+#
+# Then make the first invite, which also makes its account the server owner:
+#
+#   docker compose exec backend dotnet Vorcall.Server.dll invites new
+#
+# By default the backend listens on 127.0.0.1:5000 and is reachable only from
+# this machine, which is the right shape behind a reverse proxy that terminates
+# TLS. See docs/self-hosting.md for putting it on the internet.
+#
+# Contributors working on the server itself run the database alone —
+# `docker compose up -d db` — and the backend from the SDK on the host.
 services:
   db:
     image: postgres:18
-    container_name: vorcall-dev-db
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: vorcall
-      POSTGRES_PASSWORD: vorcall
-      POSTGRES_DB: vorcall
+      POSTGRES_USER: ${POSTGRES_USER:-vorcall}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vorcall}
+      POSTGRES_DB: ${POSTGRES_DB:-vorcall}
     ports:
-      - "127.0.0.1:5433:5432"
+      # Published on loopback for the test suite and a locally run backend;
+      # nothing outside this machine needs it.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
+      # postgres:18 stores data under /var/lib/postgresql (per-major subdirectory).
       - pgdata:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vorcall -d vorcall"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vorcall} -d ${POSTGRES_DB:-vorcall}"]
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  backend:
+    build:
+      # The repository root, not server/: the Dockerfile reads proto/ as well.
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    environment:
+      ConnectionStrings__Default: >-
+        Host=db;Port=5432;Database=${POSTGRES_DB:-vorcall};Username=${POSTGRES_USER:-vorcall};Password=${POSTGRES_PASSWORD:-vorcall}
+      ASPNETCORE_ENVIRONMENT: Production
+      # Everything below is optional. Set any of them in a `.env` file next to
+      # this one to override what the image defaults to; see .env.example.
+      Vorcall__ServerKey: ${VORCALL_SERVER_KEY:-}
+      Vorcall__JwtSigningKey: ${VORCALL_JWT_SIGNING_KEY:-}
+      Vorcall__AdminKey: ${VORCALL_ADMIN_KEY:-}
+      Vorcall__AdminUrl: http://backend:5000
+      # Empty means "the host clients reached the WebSocket on", which is right
+      # whenever the relay and the API share a name.
+      Vorcall__VoiceHost: ${VORCALL_VOICE_HOST:-}
+      Vorcall__VoicePort: ${VORCALL_VOICE_PORT:-5005}
+      Vorcall__ShareEnabled: ${VORCALL_SHARE_ENABLED:-true}
+      Vorcall__DataDir: /data
+      Vorcall__AttachmentsDir: /attachments
+      Vorcall__LogsDir: /logs
+      Vorcall__DiagnosticsDir: /diagnostics
+      Vorcall__ReleasesDir: /releases
+    ports:
+      # Loopback by default: put a reverse proxy in front for TLS rather than
+      # exposing this directly. VORCALL_BIND=0.0.0.0 opens it to the network.
+      - "${VORCALL_BIND:-127.0.0.1}:${VORCALL_PORT:-5000}:5000"
+      # The voice and screen-share media relay. UDP, and necessarily public: a
+      # reverse proxy cannot carry it, clients talk to this port directly.
+      - "${VORCALL_VOICE_PORT:-5005}:5005/udp"
+    volumes:
+      # Generated secrets. Losing this volume rotates the door key and signs
+      # everyone out; it is the one thing here worth backing up besides the database.
+      - data:/data
+      # Uploaded images: message attachments, avatars, banners, icons.
+      - attachments:/attachments
+      # Daily JSON logs, 31 kept by the server itself.
+      - logs:/logs
+      # Problem reports uploaded from the client, swept after 30 days.
+      - diagnostics:/diagnostics
+      # Client releases served under /api/updates/*. Empty unless you publish
+      # builds of your own: the in-app updater fetches from whichever server the
+      # client is pointed at, so a self-hosted one serves no updates until you
+      # put a signed manifest here. Swap it for a bind mount if you do.
+      - releases:/releases
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # /health answers 200 only once the migration finished and the DB answers.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
 volumes:
   pgdata:
+  data:
+  releases:
+  attachments:
+  logs:
+  diagnostics:

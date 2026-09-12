@@ -131,7 +131,7 @@ Automated tests are the six crates' unit tests and `tests/Vorcall.Server.Tests` 
 - `AttachmentSweeper` runs two passes: unlinked attachments and unreferenced images, each once it is older than 1 hour. An image whose reference was replaced or cleared becomes unreferenced and is swept.
 - The `uploads` rate-limit policy (`AttachmentsEndpoints.RateLimitPolicy`) covers `POST /api/images` as well as `POST /api/attachments`.
 - nginx needs its own `location /api/images` beside `location /api/attachments` (raw body, `client_max_body_size 9m`, unbuffered) — a plain `/api/` proxy would apply nginx's 1 MiB default and buffer the whole upload.
-- **A push to `main` deploys production immediately.** `.github/workflows/deploy.yml` builds and ships to `vorcall.example.com` on every push to `main`, with no separate approval gate. Do not push to `main` casually.
+- **A push to `main` deploys production immediately.** `.github/workflows/deploy.yml` builds and ships to the host named by the `DEPLOY_SERVER` repository variable on every push to `main`, with no separate approval gate. Do not push to `main` casually.
 - **`client/.cargo/config.toml` only applies with cwd inside `client/`.** It supplies the placeholder `VORCALL_SERVER_KEY=dev` so a bare `cargo build` works there. Running cargo from the repo root does not pick it up.
 - **Do not run the GUI binary (`vorcall`, `cargo run -p vorcall-app`).** It opens an iced window on the owner's desktop. Use `cargo build` / `cargo check` / `cargo clippy` to verify the client instead.
 - **No `aws-lc-rs` in the client dependency graph.** Verify with `cargo tree -i aws-lc-rs` (from `client/`) — it must report no match. The Windows cross build (cargo-xwin) depends on `aws-lc-rs` staying out.

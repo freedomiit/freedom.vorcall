@@ -316,8 +316,105 @@ fn auth_screen(app: &App) -> Element<'_, Message> {
         fields = fields.push(text(error.clone()).size(TEXT_ROW).color(app.tokens.danger));
     }
 
+    fields = fields.push(server_section(app));
+
     container(fields)
         .center(Length::Fill)
         .style(styles::container::chat(tokens))
         .into()
+}
+
+/// Which server the sign-in goes to, folded shut until someone needs it.
+///
+/// The point of it is a self-hosted Vorcall: the released binary carries the
+/// project's own address, and this is how it is pointed somewhere else without a
+/// rebuild.
+fn server_section(app: &App) -> Element<'_, Message> {
+    let tokens = &app.tokens;
+    let form = &app.server_form;
+
+    let summary = button(
+        text(format!(
+            "{} Server: {}",
+            if form.open { "▾" } else { "▸" },
+            app.endpoints.host()
+        ))
+        .size(TEXT_ROW),
+    )
+    .on_press(Message::Auth(AuthMsg::ServerToggle))
+    .style(styles::button::ghost(tokens));
+
+    if !form.open {
+        return summary.into();
+    }
+
+    let mut body = column![summary].spacing(10).align_x(Horizontal::Center);
+
+    if form.pinned {
+        body = body.push(
+            text("Pinned by VORCALL_SERVER_URL / VORCALL_SERVER_KEY in the environment.")
+                .size(TEXT_ROW)
+                .color(tokens.text_secondary)
+                .width(FIELD_WIDTH),
+        );
+    }
+
+    let mut address = text_input("https://vorcall.example.org", &form.url)
+        .padding(12)
+        .width(FIELD_WIDTH)
+        .style(styles::text_input(tokens));
+    let mut key = text_input(
+        if app.config.server_key.is_some() {
+            "Server key"
+        } else {
+            "Server key (leave blank to keep the current one)"
+        },
+        &form.key,
+    )
+    .secure(true)
+    .padding(12)
+    .width(FIELD_WIDTH)
+    .style(styles::text_input(tokens));
+
+    if !form.pinned {
+        address = address
+            .on_input(|value| Message::Auth(AuthMsg::ServerUrlChanged(value)))
+            .on_submit(Message::Auth(AuthMsg::ServerSave));
+        key = key
+            .on_input(|value| Message::Auth(AuthMsg::ServerKeyChanged(value)))
+            .on_submit(Message::Auth(AuthMsg::ServerSave));
+    }
+
+    body = body.push(address).push(key);
+
+    if !form.pinned {
+        let mut buttons = row![
+            button(text("Use this server").size(TEXT_ROW))
+                .on_press(Message::Auth(AuthMsg::ServerSave))
+                .padding(10)
+                .style(styles::button::primary(tokens)),
+        ]
+        .spacing(8);
+
+        if form.overridden(&app.config) {
+            buttons = buttons.push(
+                button(text("Built-in server").size(TEXT_ROW))
+                    .on_press(Message::Auth(AuthMsg::ServerReset))
+                    .padding(10)
+                    .style(styles::button::ghost(tokens)),
+            );
+        }
+        body = body.push(buttons);
+    }
+
+    if let Some(error) = &form.error {
+        body = body.push(
+            text(error.clone())
+                .size(TEXT_ROW)
+                .color(tokens.danger)
+                .width(FIELD_WIDTH),
+        );
+    }
+
+    body.into()
 }

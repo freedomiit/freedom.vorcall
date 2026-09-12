@@ -8,10 +8,10 @@
 # exporting them or through client/.env.release (gitignored):
 #
 #   export VORCALL_SERVER_KEY=<the Vorcall__ServerKey from the host .env>
-#   export VORCALL_SERVER_URL=https://vorcall.example.com   # optional
+#   export VORCALL_SERVER_URL=https://chat.example.org           # optional
 #
 # Optional, same file or environment:
-#   VORCALL_RELEASE_SERVER   ssh target        (default user@host)
+#   VORCALL_RELEASE_SERVER   ssh target of the host, e.g. user@host (required)
 #   VORCALL_RELEASE_APP_DIR  app dir on it     (default /opt/vorcall)
 #   SSH_OPTS                 extra ssh/scp options
 #
@@ -45,7 +45,13 @@ if [ -z "${VORCALL_SERVER_KEY:-}" ] || [ "${VORCALL_SERVER_KEY}" = "dev" ]; then
 fi
 export VORCALL_SERVER_KEY
 
-SERVER="${VORCALL_RELEASE_SERVER:-user@host}"
+if [ -z "${VORCALL_RELEASE_SERVER:-}" ]; then
+    echo "ERROR: VORCALL_RELEASE_SERVER is unset." >&2
+    echo "Export it, or put it in client/.env.release:" >&2
+    echo "  export VORCALL_RELEASE_SERVER=user@your-host" >&2
+    exit 1
+fi
+SERVER="$VORCALL_RELEASE_SERVER"
 APP_DIR="${VORCALL_RELEASE_APP_DIR:-/opt/vorcall}"
 read -r -a SSH_OPT_ARR <<< "${SSH_OPTS:-}"
 

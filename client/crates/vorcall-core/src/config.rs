@@ -134,6 +134,16 @@ pub struct Config {
     /// `nickname` is what pre-accounts builds wrote here.
     #[serde(default, alias = "nickname")]
     pub username: String,
+    /// The self-hosted server this client talks to, set from the sign-in
+    /// screen's "Server" section. `None` = the address the build baked in. An
+    /// environment variable of the same name still wins over both; see
+    /// [`crate::endpoints`].
+    #[serde(default)]
+    pub server_url: Option<String>,
+    /// The pre-shared door key for [`Self::server_url`]. Not a credential of the
+    /// account — every client of a given server carries the same one.
+    #[serde(default)]
+    pub server_key: Option<String>,
     #[serde(default = "default_true")]
     pub notifications: bool,
     #[serde(default)]
@@ -236,6 +246,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             username: String::new(),
+            server_url: None,
+            server_key: None,
             notifications: true,
             sound: false,
             input_device: None,

@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest something
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Vorcall has a deliberately small scope. Please read
+        [what is out of scope](../blob/main/CONTRIBUTING.md#scope) first — federation,
+        a web or mobile client, bots and plugins, group DMs, threads and search are
+        all settled "no", and a request for one will be closed.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What is awkward or impossible today? Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds, or other ways this could be solved.

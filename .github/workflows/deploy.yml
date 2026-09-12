@@ -1,19 +1,25 @@
 name: deploy
 
-# Automatic deploy: every push to main rebuilds production
-# (https://vorcall.example.com).
+# Automatic deploy: every push to main rebuilds and ships production.
+#
+# The target host is not committed — it comes from the DEPLOY_SERVER repository
+# variable, so a fork points this at its own machine by setting that variable.
 #
 # Flow (build in CI, not on the server):
 #   1. job "build"  — builds the backend image on GitHub's ARM64 runners
 #      (with layer cache) and pushes it to GHCR, tagged with the commit SHA
-#      and "latest". The heavy `dotnet publish` runs here, off the Oracle VPS.
+#      and "latest". The heavy `dotnet publish` runs here, off the target host.
 #   2. job "deploy" — copies only the compose file to the server and runs
 #      `pull` + `up -d` (never --build). The backend applies its own
 #      migrations on boot, so there is no separate migration step.
 #
 # Prerequisites (one time):
+#   - Repository variable DEPLOY_SERVER — the ssh target, e.g. `user@203.0.113.10`.
+#     A fork points this at its own host; nothing about the target is committed.
+#   - Optional repository variable DEPLOY_APP_DIR — where the stack lives on the
+#     host (default /opt/vorcall).
 #   - Secret SSH_PRIVATE_KEY — runner -> server; a valid OpenSSH private key
-#     whose public key is in ~/.ssh/authorized_keys of user@host.
+#     whose public key is in the deploy user's ~/.ssh/authorized_keys.
 #   - On the server, a `.env` next to the compose file with the runtime
 #     secrets (POSTGRES_PASSWORD, ConnectionStrings__Default,
 #     Vorcall__ServerKey, ...) — never build-args, never committed
@@ -32,8 +38,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SERVER: user@host
-  APP_DIR: /opt/vorcall
+  SERVER: ${{ vars.DEPLOY_SERVER }}
+  APP_DIR: ${{ vars.DEPLOY_APP_DIR || '/opt/vorcall' }}
   REGISTRY: ghcr.io
   IMAGE_BASE: ghcr.io/freedomiit/vorcall
 
@@ -91,7 +97,7 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 203.0.113.10 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H "${SERVER#*@}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Copy the compose file to the server
         # only the compose file needs to travel; code and build live in the GHCR image
@@ -102,9 +108,9 @@ jobs:
       - name: Pull + restart
         run: |
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "${SERVER}" \
-            "IMAGE_TAG='${{ github.sha }}' bash -s" <<'EOF'
+            "IMAGE_TAG='${{ github.sha }}' APP_DIR='${APP_DIR}' bash -s" <<'EOF'
           set -e
-          cd /opt/vorcall
+          cd "${APP_DIR:?}"
           docker compose -f docker-compose.prod.yml pull
           docker compose -f docker-compose.prod.yml up -d
           # wait for the backend to become healthy (migration + warmup finish there)

@@ -1739,6 +1739,42 @@ public sealed partial class ConnectionRegistry
         return OpResult.Ok;
     }
 
+    // The registration endpoint's follow-up to MemberRegistered, for a server nobody owns yet.
+    // Unlike TransferOwnershipAsync there is no actor to authorise: the database decides, and it
+    // only says yes while the owner column is still null.
+    public async Task ClaimOwnershipIfUnownedAsync(long userId, CancellationToken ct)
+    {
+        lock (_gate)
+        {
+            if (_facts.OwnerId is not null)
+            {
+                return;
+            }
+        }
+
+        if (!await _server.ClaimOwnerAsync(userId, ct))
+        {
+            return;
+        }
+
+        List<ClientConnection>? slow = null;
+        List<uint> removed = [];
+        List<(long ChannelId, long UserId)> silenced = [];
+        lock (_gate)
+        {
+            _facts.OwnerId = userId;
+            RebuildHierarchyLocked();
+            BroadcastToAllLocked(ServerUpdatedOf(), except: null, ref slow);
+
+            // The new owner gains the bypass over every check.
+            ReevaluateLocked(null, null, ref slow, removed, silenced);
+        }
+
+        CloseSlow(slow);
+        ReleaseVoice(removed);
+        AnnounceSilenced(silenced);
+    }
+
     public async Task<OpResult> OpenDmAsync(long callerId, long otherId, CancellationToken ct)
     {
         lock (_gate)

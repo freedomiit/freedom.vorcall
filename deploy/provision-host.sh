@@ -1,24 +1,39 @@
 #!/usr/bin/env bash
-# Provision the Oracle host for Vorcall: certbot, nginx site, TLS renewal hook,
+# Provision a production host for Vorcall: certbot, nginx site, TLS renewal hook,
 # the voice media UDP port, the nightly database backup, the backup/log/diagnostics
 # directories, the production .env and (optionally) the deploy SSH key.
 #
-# Runs ON THE HOST as the `ubuntu` user, from /opt/vorcall/deploy/:
-#   scp -r deploy .env.production.example user@<host>:/opt/vorcall/
-#   ssh user@<host> 'cd /opt/vorcall/deploy && ./provision-host.sh'
+# Runs ON THE HOST, from $APP_DIR/deploy/. Everything host-specific comes from
+# the environment; nothing about any particular deployment is committed here:
+#   scp -r deploy .env.production.example <user>@<host>:<app-dir>/
+#   ssh <user>@<host> 'cd <app-dir>/deploy && \
+#       DOMAIN=chat.example.org CERT_EMAIL=you@example.org APP_DIR=<app-dir> ./provision-host.sh'
 #
 # Idempotent: safe to re-run. It never touches other sites' nginx files and
 # never prints secret values.
 #
-# Optional env overrides: EXPECTED_IP, DEPLOY_PUBKEY (public key appended to
-# ~/.ssh/authorized_keys so GitHub Actions can deploy).
+# Required: DOMAIN, CERT_EMAIL. Optional: APP_DIR (default /opt/vorcall),
+# EXPECTED_IP (unset skips the DNS check) and DEPLOY_PUBKEY (a public key appended
+# to ~/.ssh/authorized_keys so GitHub Actions can deploy). The nginx site configs
+# carry a placeholder hostname and are rewritten to $DOMAIN as they install.
+#
+# This targets one specific shape of host: Ubuntu, with nginx and Docker already
+# installed, running the stack from docker-compose.prod.yml. Most people should
+# use docs/self-hosting.md instead, which needs none of this.
 set -euo pipefail
 
-DOMAIN=vorcall.example.com
-EXPECTED_IP="${EXPECTED_IP:-203.0.113.10}"
-APP_DIR=/opt/vorcall
+# The placeholder hostname the site configs under nginx/ carry; install_site
+# rewrites it to $DOMAIN on the way in, so no real domain is ever committed.
+TEMPLATE_DOMAIN=vorcall.example.com
+
+DOMAIN="${DOMAIN:?DOMAIN must be set, e.g. DOMAIN=chat.example.org}"
+CERT_EMAIL="${CERT_EMAIL:?CERT_EMAIL must be set: where Let's Encrypt sends expiry notices}"
+APP_DIR="${APP_DIR:-/opt/vorcall}"
+# The address $DOMAIN must resolve to, as a guard against provisioning a host the
+# DNS does not point at. Unset skips the check.
+EXPECTED_IP="${EXPECTED_IP-}"
+
 SITE=/etc/nginx/sites-available/$DOMAIN
-CERT_EMAIL=admin@example.com
 WEBROOT=/var/www/certbot
 VOICE_PORT=5005
 
@@ -37,7 +52,7 @@ if [ -z "$addrs" ]; then
     exit 2
 fi
 for a in $addrs; do
-    if [ "$a" != "$EXPECTED_IP" ]; then
+    if [ -n "$EXPECTED_IP" ] && [ "$a" != "$EXPECTED_IP" ]; then
         echo "ERROR: $DOMAIN resolves to:" >&2
         printf '  %s\n' $addrs >&2
         echo "Expected only $EXPECTED_IP. The A record must point at this host with" >&2
@@ -46,7 +61,7 @@ for a in $addrs; do
         exit 2
     fi
 done
-echo "DNS ok: $DOMAIN -> $EXPECTED_IP"
+echo "DNS ok: $DOMAIN -> ${EXPECTED_IP:-$addrs}"
 
 if ! nginx -v 2>/dev/null && ! sudo nginx -v 2>/dev/null; then
     echo "ERROR: nginx is not available on this host." >&2
@@ -85,7 +100,13 @@ install_site() {
     if [ -L "/etc/nginx/sites-enabled/$DOMAIN" ]; then
         had_link=yes
     fi
-    sudo install -m 644 -o root -g root "$src" "$SITE"
+    # The configs name TEMPLATE_DOMAIN literally, in server_name and in the
+    # certificate paths; a fork's own domain is substituted on the way in.
+    local rendered
+    rendered="$(mktemp)"
+    sed "s/${TEMPLATE_DOMAIN//./\\.}/$DOMAIN/g" "$src" > "$rendered"
+    sudo install -m 644 -o root -g root "$rendered" "$SITE"
+    rm -f "$rendered"
     sudo ln -sfn "$SITE" "/etc/nginx/sites-enabled/$DOMAIN"
     if ! sudo nginx -t; then
         echo "ERROR: nginx -t failed with $(basename "$src"); rolling back." >&2

@@ -20,11 +20,13 @@ public sealed record JwtOptions
 
     public static JwtOptions FromConfiguration(IConfiguration configuration)
     {
-        var configured = configuration["Vorcall:JwtSigningKey"];
+        // Unconfigured, SecretStore generates one into Vorcall:DataDir and keeps it there, so a
+        // self-hosted server needs nothing filled in before its first boot.
+        var configured = SecretStore.JwtSigningKey(configuration);
         var key = string.IsNullOrWhiteSpace(configured) ? null : TryDecode(configured);
         if (key is null || key.Length < MinKeyBytes)
         {
-            throw new InvalidOperationException("Missing or too short configuration 'Vorcall:JwtSigningKey' (base64 of at least 32 bytes).");
+            throw new InvalidOperationException("Invalid or too short configuration 'Vorcall:JwtSigningKey' (base64 of at least 32 bytes).");
         }
 
         return new JwtOptions(new SymmetricSecurityKey(key));

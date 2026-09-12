@@ -105,6 +105,10 @@ public sealed class ServerFixture : IAsyncLifetime
         "tight-auth",
         settings => settings["Vorcall:AuthRequestsPerWindow"] = TightAuthPerWindow.ToString(CultureInfo.InvariantCulture));
 
+    // A host whose server row has no owner, which is what a self-hosted install looks like between
+    // `docker compose up -d` and the first account: the first registration takes ownership.
+    public Task<VorcallFactory> UnownedAsync() => NamedAsync("unowned", _ => { }, seedOwner: false);
+
     public async Task DisposeAsync()
     {
         foreach (var factory in _factories)
@@ -136,7 +140,10 @@ public sealed class ServerFixture : IAsyncLifetime
         _gate.Dispose();
     }
 
-    private async Task<VorcallFactory> NamedAsync(string name, Action<IDictionary<string, string>> overrides)
+    private async Task<VorcallFactory> NamedAsync(
+        string name,
+        Action<IDictionary<string, string>> overrides,
+        bool seedOwner = true)
     {
         await _gate.WaitAsync();
         try
@@ -146,7 +153,7 @@ public sealed class ServerFixture : IAsyncLifetime
                 return existing;
             }
 
-            var factory = await BuildAsync(overrides);
+            var factory = await BuildAsync(overrides, seedOwner);
             _named[name] = factory;
             return factory;
         }
@@ -156,7 +163,9 @@ public sealed class ServerFixture : IAsyncLifetime
         }
     }
 
-    private async Task<VorcallFactory> BuildAsync(Action<IDictionary<string, string>>? overrides)
+    private async Task<VorcallFactory> BuildAsync(
+        Action<IDictionary<string, string>>? overrides,
+        bool seedOwner = true)
     {
         var id = Guid.NewGuid().ToString("N")[..8];
         var database = $"vorcall_test_{id}";
@@ -188,7 +197,7 @@ public sealed class ServerFixture : IAsyncLifetime
 
         overrides?.Invoke(settings);
         Releases.Publish(settings["Vorcall:ReleasesDir"]);
-        await SeedOwnerAsync(settings["ConnectionStrings:Default"]);
+        await SeedOwnerAsync(settings["ConnectionStrings:Default"], seedOwner);
 
         var factory = new VorcallFactory(settings);
         _factories.Add(factory);
@@ -204,11 +213,19 @@ public sealed class ServerFixture : IAsyncLifetime
     // "server set-owner" takes effect only on the next start and a suite cannot restart its host.
     // Migrating and seeding here is what the host would have done at boot; its own Migrate and
     // EnsureSeededAsync then find the work already done.
-    private static async Task SeedOwnerAsync(string connectionString)
+    private static async Task SeedOwnerAsync(string connectionString, bool seedOwner = true)
     {
         var options = new DbContextOptionsBuilder<AppDbContext>().UseNpgsql(connectionString).Options;
         await using var db = new AppDbContext(options);
         await db.Database.MigrateAsync();
+
+        // What a fresh self-hosted install looks like: migrated and seeded, but with no account
+        // and so no owner. UnownedAsync's host boots from here.
+        if (!seedOwner)
+        {
+            await Seed.EnsureSeededAsync(db, CancellationToken.None);
+            return;
+        }
 
         var owner = new User
         {

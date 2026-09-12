@@ -37,14 +37,12 @@ public static class ServiceSetup
             throw new InvalidOperationException("Missing configuration 'ConnectionStrings:Default'.");
         }
 
-        // The pre-shared key is the only door: refusing to boot without it is deliberate.
-        var serverKey = builder.Configuration["Vorcall:ServerKey"];
-        if (string.IsNullOrWhiteSpace(serverKey))
-        {
-            throw new InvalidOperationException("Missing configuration 'Vorcall:ServerKey'.");
-        }
+        // The pre-shared key is the only door. Unconfigured, one is generated into Vorcall:DataDir
+        // and logged once, so a self-hosted server comes up on `docker compose up -d` with nothing
+        // to fill in first; a deployment that sets the key never reaches the file.
+        var serverKey = SecretStore.ServerKey(builder.Configuration);
 
-        // Same reasoning for the signing key: without it every access token would be forgeable.
+        // Same for the signing key, except that it is never logged.
         var jwt = JwtOptions.FromConfiguration(builder.Configuration);
 
         // Unusable voice settings fail the boot the same way; an absent key is a valid default.
