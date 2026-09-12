@@ -50,6 +50,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(75);
 /// A bare 401 means a stale build, not a blip: retry at the backoff cap.
 const UNAUTHORIZED_RETRY: Duration = Duration::from_secs(30);
+/// `PROTOCOL.md`'s admin close codes: neither is worth reconnecting after.
+const KICKED_CLOSE_CODE: u16 = 4001;
+const BANNED_CLOSE_CODE: u16 = 4003;
 const HISTORY_LIMIT: u32 = 100;
 /// `PROTOCOL.md` stops gap-filling here; beyond it a gap may remain.
 const GAP_FILL_MAX_PAGES: usize = 5;
@@ -198,6 +201,10 @@ pub enum DisconnectReason {
     /// The tokens are gone for good; the UI has to ask for a sign-in.
     AuthRequired(String),
     SessionReplaced,
+    /// An admin closed this connection; signing in again is allowed.
+    Kicked(String),
+    /// The account itself is disabled, so nothing this client holds still works.
+    Banned(String),
     ServerClosed {
         code: Option<u16>,
         reason: String,
@@ -213,6 +220,14 @@ impl fmt::Display for DisconnectReason {
             Self::Unauthorized => f.write_str("unauthorized"),
             Self::AuthRequired(detail) => write!(f, "sign in again: {detail}"),
             Self::SessionReplaced => f.write_str("this account connected from another device"),
+            Self::Kicked(detail) if !detail.is_empty() => {
+                write!(f, "disconnected by the admin: {detail}")
+            }
+            Self::Kicked(_) => f.write_str("disconnected by the admin"),
+            Self::Banned(detail) if !detail.is_empty() => {
+                write!(f, "this account is banned: {detail}")
+            }
+            Self::Banned(_) => f.write_str("this account is banned"),
             Self::ServerClosed { code, reason } => match code {
                 Some(code) if !reason.is_empty() => write!(f, "server closed ({code}): {reason}"),
                 Some(code) => write!(f, "server closed ({code})"),
@@ -363,8 +378,9 @@ fn watch_target(user_id: i64) -> Option<i64> {
     (user_id != 0).then_some(user_id)
 }
 
-/// A log-safe rendering of a received frame: `VoiceReady` carries the media key,
-/// which must never reach a log line.
+/// A log-safe rendering of a received frame: `VoiceReady` carries the media key
+/// and a message carries what somebody typed, neither of which may ever reach a
+/// log line.
 fn describe(frame: &ServerFrame) -> String {
     match &frame.payload {
         Some(server_frame::Payload::VoiceReady(ready)) => {
@@ -376,8 +392,29 @@ fn describe(frame: &ServerFrame) -> String {
                 "VoiceReady {{ room_id: {room_id:?}, host: {host:?}, port: {port}, ssrc: {ssrc}, key: <redacted> }}"
             )
         }
+        Some(server_frame::Payload::Message(message)) => {
+            format!("Message {{ {} }}", describe_message(message))
+        }
+        Some(server_frame::Payload::MessageEdited(edited)) => match &edited.message {
+            Some(message) => format!("MessageEdited {{ {} }}", describe_message(message)),
+            None => "MessageEdited { message: None }".to_owned(),
+        },
         _ => format!("{frame:?}"),
     }
+}
+
+/// Everything about a message that is worth a log line and nothing that is
+/// worth keeping private: no text, no author name, no reply excerpt.
+fn describe_message(message: &ChatMessage) -> String {
+    let id = message.id;
+    let room_id = &message.room_id;
+    let author_id = message.author_id;
+    let text_len = message.text.len();
+    let attachments = message.attachments.len();
+    let reply_to = message.reply_to.is_some();
+    format!(
+        "id: {id}, room_id: {room_id:?}, author_id: {author_id}, text_len: {text_len}, attachments: {attachments}, reply_to: {reply_to}"
+    )
 }
 
 /// What [`run`] does once one connection attempt is over.
@@ -1026,7 +1063,10 @@ where
                     // A payload this build does not know: a newer server may add
                     // frames without a version bump.
                     None => {
-                        tracing::warn!(frame = ?server_frame, "ignoring unknown server frame");
+                        tracing::warn!(
+                            frame = %describe(&server_frame),
+                            "ignoring unknown server frame"
+                        );
                     }
                     other => {
                         return Err(AfterAttempt::Reconnect {
@@ -1047,10 +1087,7 @@ where
                 });
             }
             WsMessage::Close(frame) => {
-                return Err(AfterAttempt::Reconnect {
-                    reason: closed_reason(frame.as_ref()),
-                    after: Retry::Backoff,
-                });
+                return Err(after_close(frame.as_ref(), Retry::Backoff));
             }
             // tungstenite answers Ping itself; both are just noise here.
             WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => continue,
@@ -1801,7 +1838,7 @@ where
                             Some(server_frame::Payload::Pong(_)) => {}
                             // A payload this build does not know: a newer server
                             // may add frames without a version bump.
-                            None => tracing::warn!(frame = ?server_frame, "ignoring unknown server frame"),
+                            None => tracing::warn!(frame = %describe(&server_frame), "ignoring unknown server frame"),
                             other => break AfterAttempt::Reconnect {
                                 reason: DisconnectReason::ProtocolError(format!("unexpected frame {other:?}")),
                                 after: Retry::BackoffAfterSession,
@@ -1812,10 +1849,7 @@ where
                         reason: DisconnectReason::ProtocolError("text frames are not allowed".to_owned()),
                         after: Retry::BackoffAfterSession,
                     },
-                    WsMessage::Close(frame) => break AfterAttempt::Reconnect {
-                        reason: closed_reason(frame.as_ref()),
-                        after: Retry::BackoffAfterSession,
-                    },
+                    WsMessage::Close(frame) => break after_close(frame.as_ref(), Retry::BackoffAfterSession),
                     WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
                 }
             }
@@ -2159,14 +2193,36 @@ fn fatal_outcome(error: &vorcall_proto::v1::Error) -> AfterAttempt {
 
 fn closed_reason(frame: Option<&CloseFrame>) -> DisconnectReason {
     match frame {
-        Some(frame) => DisconnectReason::ServerClosed {
-            code: Some(frame.code.into()),
-            reason: frame.reason.as_str().to_owned(),
-        },
+        Some(frame) => {
+            let reason = frame.reason.as_str().to_owned();
+            match u16::from(frame.code) {
+                KICKED_CLOSE_CODE => DisconnectReason::Kicked(reason),
+                BANNED_CLOSE_CODE => DisconnectReason::Banned(reason),
+                code => DisconnectReason::ServerClosed {
+                    code: Some(code),
+                    reason,
+                },
+            }
+        }
         None => DisconnectReason::ServerClosed {
             code: None,
             reason: String::new(),
         },
+    }
+}
+
+/// What a close frame leaves the loop doing. The two admin closes end it for
+/// good: reconnecting would only be refused again, and the UI has something to
+/// say about both.
+fn after_close(frame: Option<&CloseFrame>, after: Retry) -> AfterAttempt {
+    let reason = closed_reason(frame);
+    if matches!(
+        reason,
+        DisconnectReason::Kicked(_) | DisconnectReason::Banned(_)
+    ) {
+        AfterAttempt::Stop(Some(reason))
+    } else {
+        AfterAttempt::Reconnect { reason, after }
     }
 }
 
@@ -2212,6 +2268,8 @@ impl Backoff {
 
 #[cfg(test)]
 mod tests {
+    use vorcall_proto::v1::{MessageEdited, ReplyRef};
+
     use super::*;
 
     fn transfer(request_id: u64) -> Transfer {
@@ -2385,5 +2443,96 @@ mod tests {
     fn a_watch_state_of_zero_means_nobody() {
         assert_eq!(watch_target(0), None);
         assert_eq!(watch_target(7), Some(7));
+    }
+
+    /// A debug-level log file would otherwise persist every message anyone
+    /// sends, which is the one thing this client never writes to disk.
+    #[test]
+    fn describing_a_message_frame_never_prints_what_was_typed() {
+        let message = ChatMessage {
+            id: 7,
+            author: "alice".to_owned(),
+            text: "secret-needle".to_owned(),
+            room_id: GENERAL_ROOM.to_owned(),
+            author_id: 3,
+            reply_to: Some(ReplyRef {
+                id: 6,
+                author: "bob".to_owned(),
+                excerpt: "secret-excerpt".to_owned(),
+                deleted: false,
+            }),
+            attachments: vec![Attachment::default()],
+            ..ChatMessage::default()
+        };
+
+        for frame in [
+            ServerFrame {
+                payload: Some(server_frame::Payload::Message(message.clone())),
+            },
+            ServerFrame {
+                payload: Some(server_frame::Payload::MessageEdited(MessageEdited {
+                    message: Some(message.clone()),
+                })),
+            },
+        ] {
+            let described = describe(&frame);
+
+            assert!(!described.contains("secret-needle"), "{described}");
+            assert!(!described.contains("secret-excerpt"), "{described}");
+            assert!(!described.contains("alice"), "{described}");
+            assert!(described.contains("text_len: 13"), "{described}");
+            assert!(described.contains("attachments: 1"), "{described}");
+            assert!(described.contains("reply_to: true"), "{described}");
+            assert!(described.contains("author_id: 3"), "{described}");
+        }
+    }
+
+    fn close_frame(code: u16, reason: &str) -> CloseFrame {
+        CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn the_admin_close_codes_are_read_apart_from_every_other_close() {
+        match closed_reason(Some(&close_frame(4001, "kicked by admin"))) {
+            DisconnectReason::Kicked(detail) => assert_eq!(detail, "kicked by admin"),
+            other => panic!("4001 must read as a kick, got {other}"),
+        }
+
+        match closed_reason(Some(&close_frame(4003, "account banned"))) {
+            DisconnectReason::Banned(detail) => assert_eq!(detail, "account banned"),
+            other => panic!("4003 must read as a ban, got {other}"),
+        }
+
+        match closed_reason(Some(&close_frame(1008, "protocol error"))) {
+            DisconnectReason::ServerClosed { code, reason } => {
+                assert_eq!(code, Some(1008));
+                assert_eq!(reason, "protocol error");
+            }
+            other => panic!("1008 must stay a plain close, got {other}"),
+        }
+    }
+
+    #[test]
+    fn only_the_admin_close_codes_stop_the_loop_for_good() {
+        let kicked = after_close(Some(&close_frame(4001, "kicked by admin")), Retry::Backoff);
+        assert!(matches!(
+            kicked,
+            AfterAttempt::Stop(Some(DisconnectReason::Kicked(_)))
+        ));
+
+        let banned = after_close(Some(&close_frame(4003, "account banned")), Retry::Backoff);
+        assert!(matches!(
+            banned,
+            AfterAttempt::Stop(Some(DisconnectReason::Banned(_)))
+        ));
+
+        let closed = after_close(Some(&close_frame(1008, "protocol error")), Retry::Backoff);
+        assert!(matches!(closed, AfterAttempt::Reconnect { .. }));
+
+        let dropped = after_close(None, Retry::BackoffAfterSession);
+        assert!(matches!(dropped, AfterAttempt::Reconnect { .. }));
     }
 }

@@ -4,9 +4,9 @@ A private chat for a friend group: rooms and DMs, native Rust desktop client, .N
 
 ## Status
 
-MVP. Present: invite-only accounts, a mandatory `general` room plus public rooms anyone can create or join and two-person DMs, a presence sidebar, live messages with reply/edit/delete and reactions, image attachments, unread and mention counts, older history, notifications, voice channels per room with push-to-talk (global per platform, with a window-focused fallback) or voice activation, input cleanup (echo cancellation, noise suppression and an optional automatic gain), per-user volume and mute, and screen sharing (a monitor or a window, with its audio, watched by other voice members through an H.264 stage rendered in the app).
+MVP. Present: invite-only accounts, a mandatory `general` room plus public rooms anyone can create or join and two-person DMs, a presence sidebar, live messages with reply/edit/delete and reactions, image attachments, unread and mention counts, older history, notifications, voice channels per room with push-to-talk (global per platform, with a window-focused fallback) or voice activation, input cleanup (echo cancellation, noise suppression and an optional automatic gain), per-user volume and mute, and screen sharing (a monitor or a window, with its audio, watched by other voice members through an H.264 stage rendered in the app). On the operations side: structured server logs, a `/metrics` endpoint, a nightly database backup, admin kick/ban and invite revocation, a per-account write rate limit, a client-side log with crash reports and a "Report a problem" button that uploads them, and an integration test suite for the server.
 
-Deliberately absent: private (invite-only) rooms, file attachments beyond images, OAuth/2FA.
+Deliberately absent: private (invite-only) rooms, file attachments beyond images, OAuth/2FA, a web UI for the operational data (logs, metrics and problem reports are read on the host).
 
 ## Repository layout
 
@@ -14,8 +14,14 @@ Deliberately absent: private (invite-only) rooms, file attachments beyond images
 proto/vorcall.proto        shared schema; generated into both server and client at build time
 PROTOCOL.md                wire framing, state machines, limits
 server/                    ASP.NET Core (.NET 10) backend, Vorcall.Server.csproj (server/Voice/ is the voice UDP relay,
-                            server/Updates/ + server/Api/UpdatesEndpoints.cs serve /api/updates/*)
+                            server/Updates/ + server/Api/UpdatesEndpoints.cs serve /api/updates/*,
+                            server/Logging/ -> Serilog console + daily JSON files, server/Metrics/ + Api/MetricsEndpoints.cs
+                            -> GET /metrics, server/Diagnostics/ + Api/DiagnosticsEndpoints.cs -> problem reports,
+                            server/Admin/ + Api/AdminEndpoints.cs -> the CLI's kick/ban path, Api/PrivateSource.cs
+                            -> who may reach the operational endpoints)
+tests/Vorcall.Server.Tests xunit integration suite for the server (WebApplicationFactory + the compose Postgres)
 client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall-core -> incl. the `update` module,
+                            diagnostics.rs (the client log + crash reports) and report.rs (their upload),
                             crates/vorcall-voice -> media engine, incl. video.rs (fragmentation/reassembly)
                             and stereo share audio, crates/vorcall-screen -> screen capture backends
                             (Windows/macOS/Linux) + the OpenH264 codec, no GUI or audio device,
@@ -25,14 +31,17 @@ client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall
                             crates/vorcall-app -> binary `vorcall`, incl. share.rs -> the share pipeline
                             and decode threads, view/stage.rs -> the wgpu shader widget)
 client/update-keys.pub     Ed25519 public keys the client trusts for release manifests; empty disables the updater
-deploy/                    nginx site configs and the host provisioning script
+deploy/                    nginx site configs, the host provisioning script and backup-db.sh (the nightly pg_dump + restore recipe)
 scripts/                   client release build scripts (Linux, Windows cross-build), push-client.sh (build + push both to the host) and update-oracle.sh
 releases/                  gitignored; local dir the dev server serves under /api/updates/*; production's is the host's
+attachments/ logs/ diagnostics/  gitignored; the dev server's uploads, JSON logs and problem reports (../ from server/);
+                            production's are the host's bind mounts, plus backups/ for the nightly dumps
 docker-compose.yml         local dev: Postgres only
 docker-compose.prod.yml    production stack: Postgres + backend, pulled from GHCR
 .env.production.example    template for the production .env (never commit the real one)
-.github/workflows/         ci.yml (format/lint/build), deploy.yml (build + deploy on push to main),
-                            release.yml (build, sign and publish a client release)
+.github/workflows/         ci.yml (format/lint/build, cargo test, dotnet test against a Postgres service),
+                            deploy.yml (build + deploy on push to main), release.yml (build, sign and publish a client release;
+                            also uploads a macOS vorcall-probe as a workflow artifact)
 ```
 
 ## Prerequisites
@@ -106,7 +115,9 @@ cd client
 VORCALL_SERVER_URL=http://localhost:5000 cargo run -p vorcall-app
 ```
 
-Set `RUST_LOG=vorcall_core=debug` to see the client's connection log.
+The client always writes a debug-level log to `vorcall.log` next to `config.toml` (see [Diagnostics](#diagnostics)); `RUST_LOG=vorcall_core=debug` raises what reaches stderr as well, and `RUST_LOG_FILE` overrides the file's filter the same way.
+
+The server logs to the console and to `logs/vorcall-YYYYMMDD.json` at the repository root (`Vorcall:LogsDir` = `../logs` in `appsettings.Development.json`); problem reports uploaded through the app land in `diagnostics/` the same way. Levels live under `Serilog:MinimumLevel` in `appsettings*.json` (`Vorcall` is `Debug` in Development). `curl -s localhost:5000/metrics` prints the Prometheus exposition, and `appsettings.Development.json` sets `Vorcall:AdminKey` to `dev-admin` so `users kick`/`users ban` work against the local server.
 
 Client config on disk: `~/.config/vorcall/config.toml` on Linux (via `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`), keys `username`, `notifications` and `sound` (the old `nickname` key is still read). `notifications` (default on) and `sound` (default off) are also toggled by the two switches at the bottom of the sidebar. Session tokens are stored separately, next to it, in `session.toml` — see [Accounts](#accounts).
 
@@ -130,14 +141,20 @@ Invites and account maintenance run through the server binary's own subcommands.
 
 ```
 invites new [--days N]           # prints a one-time invite code, default 7-day expiry
-invites list
-users list                       # includes  client <version> <platform>  seen <ts>
+invites list                     # shows used / revoked / expired
+invites revoke <id>              # an unused code can no longer register
+users list                       # includes  client <version> <platform>  seen <ts>, and  banned <ts>
 users outdated [--min X.Y.Z]     # accounts below the floor; reads the manifest when --min is absent
+users kick <username>            # closes the live connection (close code 4001 "kicked by admin")
+users ban <username>             # disables the account, revokes its sessions, closes with 4003 "account banned"
+users unban <username>           # lets a banned account sign in again
 users revoke-sessions <username>
 users set-password <username>   # prompts for the new password
 ```
 
-`users list` shows each account's last-reported client version, platform and connection time (from the `Hello` frame — see [`PROTOCOL.md`](PROTOCOL.md#server-session-state-machine-per-connection)). `users outdated` lists accounts below `--min`, or below the version published in the current release manifest when `--min` is omitted (`Vorcall:ReleasesDir`, mounted read-only in the CLI container too); with neither a manifest nor `--min` it fails and says so.
+`users list` shows each account's last-reported client version, platform and connection time (from the `Hello` frame — see [`PROTOCOL.md`](PROTOCOL.md#server-session-state-machine-per-connection)) and marks banned accounts. `users outdated` lists accounts below `--min`, or below the version published in the current release manifest when `--min` is omitted (`Vorcall:ReleasesDir`, mounted read-only in the CLI container too); with neither a manifest nor `--min` it fails and says so.
+
+`users kick`, `users ban` and `users unban` are the only subcommands that talk to the running server: the CLI is a second process against the same database, so closing a live socket goes through `POST /api/admin/kick` (and `refresh-account`) with the key `Vorcall__AdminKey` at `Vorcall__AdminUrl` (`http://backend:5000` in production, where `docker compose run --rm backend …` is a sibling container; default `http://localhost:5000`). Without `Vorcall__AdminKey` the endpoints are not mapped and the CLI says "admin endpoints are off" — the database half of a ban still holds: login answers 403 "account disabled", refresh 401, a still-valid access token is refused within 30 s, and an open socket is closed with 4003 at its next write frame (the same 30 s cache); only the immediate kick is lost. A kicked client returns to sign-in with "Disconnected by the admin" and may sign in again; a banned one with "This account is banned". Unbanning does not restore the sessions the ban revoked.
 
 Production:
 
@@ -202,7 +219,7 @@ Any member of a room's voice channel can share a monitor or a window, with its a
 
 **Capture backends:** Windows captures a monitor with Desktop Duplication (the cursor composited in, since Desktop Duplication does not include it) and a window with Windows.Graphics.Capture, falling back to Windows.Graphics.Capture for a monitor too if Desktop Duplication is refused; an unpackaged app still gets the yellow WGC capture border on a captured window, whatever the request. macOS captures both kinds with ScreenCaptureKit. Linux goes through the desktop portal's picker (`org.freedesktop.portal.ScreenCast`) and PipeWire, so Vorcall never lists sources of its own there — the portal's own dialog does, and its choice is remembered (`PersistMode::ExplicitlyRevoked`) so a later share in the same run does not re-prompt; a compositor that only offers DMA-BUF frames ends the capture with a clear reason instead of failing silently.
 
-**macOS caveat:** the Screen Recording permission is tied to the specific (ad-hoc signed) build, so — like Input Monitoring for push-to-talk — it must be re-granted in System Settings → Privacy & Security → Screen Recording after every update, and only takes effect after relaunching. macOS 13 or newer is required.
+**macOS caveat:** the Screen Recording permission is tied to the specific (ad-hoc signed) build, so — like Input Monitoring for push-to-talk — it must be re-granted in System Settings → Privacy & Security → Screen Recording after every update, and only takes effect after relaunching. macOS 13 or newer is required. On macOS 15 the system alert about Vorcall bypassing the system picker is expected — "Allow for one month" keeps the share working. When a share ends on its own, the stop reason carries the ScreenCaptureKit error domain and code, with the two common ones translated: "the share was stopped from the macOS menu bar" (`UserStopped`) and "macOS stopped the share (Screen Recording permission changed, or the system alert was dismissed)" (`SystemStoppedStream`). While a share runs, the log gets one info line every 10 s — "ScreenCaptureKit stream running" with `video_samples`/`video_complete`/`video_forwarded`/`audio_samples`/`audio_forwarded`/`audio_rejected` — plus the first audio sample's format at debug, the first rejected one at warn, and the totals at stop; that line is the first thing to look for in a report from a Mac (see [Diagnostics](#diagnostics)).
 
 **Audio:** macOS excludes Vorcall's own playout from a share's audio natively (ScreenCaptureKit); Windows tries process-loopback capture (excluding this process, build 20348+) and falls back to plain loopback; Linux captures the default sink's monitor, which is always the whole desktop. Where the capture includes Vorcall's own voice audio, a second echo canceller (AEC3, echo cancellation only — no noise suppression, no automatic gain, since a share carries music and game sound as well as speech) subtracts it before encoding, so a watcher does not hear the room's own voices coming back through the share.
 
@@ -210,7 +227,7 @@ Any member of a room's voice channel can share a monitor or a window, with its a
 
 **Network:** share media rides the same UDP path as voice (see Network above), billed against its own byte budget rather than the packet-rate limit voice and pings use. Server options: `Vorcall__ShareEnabled` (default true, the kill switch), `Vorcall__ShareMaxKbps` (default 30000, the per-sharer ceiling), `Vorcall__MaxSharersPerRoom` (default 3). `deploy/provision-host.sh` raises the host's `net.core.rmem_max`/`wmem_max` to 16 MiB so the relay's 8 MiB socket buffers actually take; without that step the kernel clamps them silently. A room's worst-case bandwidth is sharers × watchers × `ShareMaxKbps`.
 
-**Status line:** " · sharing N kbit/s" is appended while a share is active, N being the encoder's currently achieved rate.
+**Status line:** " · sharing N kbit/s" is appended while a share is active, N being the encoder's currently achieved rate; " · N datagrams lost" follows in the warning colour when the last second lost any. A datagram is lost when the socket refuses a fragment for good: the sender retries a transient refusal (`WouldBlock`, or `ENOBUFS` — what macOS answers a full interface queue with) up to 40 times 1 ms apart, then abandons the rest of that frame, which the watcher sees as one dropped frame and the next keyframe repairs.
 
 **Probe (runtime oracle):** the same two-terminal idea as voice, one probe sharing a synthetic test pattern and the other watching it.
 
@@ -220,7 +237,18 @@ VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/deb
 VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username bob --watch alice --expect-video --expect-share-audio --listen-seconds 14
 ```
 
-`--share-size WxH` (default 1280x720), `--share-fps` (15/30/60), `--encode-threads` (H.264 slice threads) and `--bitrate-kbps` tune the sharing side; `--share-seconds` and `--watch` are mutually exclusive within one probe. The sharing probe reports `"share": {frames_encoded, keyframes, keyframe_requests, encode_fps, kbps, watchers_max, bytes, threads, skipped}`; the watching probe reports `"watch": {user, user_id, pictures, keyframes, dropped, decode_errors, first_picture_ms, width, height, decode_fps, keyframe_requests_sent, share_tone_seconds}`. Exit codes add to the voice probe's: `1` also on `--expect-video` with fewer than 5 pictures decoded, or `--expect-share-audio` with less than 1 s of share tone heard.
+`--share-size WxH` (default 1280x720), `--share-fps` (15/30/60), `--encode-threads` (H.264 slice threads) and `--bitrate-kbps` tune the sharing side; `--share-seconds` and `--watch` are mutually exclusive within one probe. The sharing probe reports `"share": {frames_encoded, keyframes, keyframe_requests, encode_fps, kbps, watchers_max, bytes, threads, skipped, send_failures}` (`send_failures` being the fragments the socket refused for good — see Status line above); the watching probe reports `"watch": {user, user_id, pictures, keyframes, dropped, decode_errors, first_picture_ms, width, height, decode_fps, keyframe_requests_sent, share_tone_seconds}`. Exit codes add to the voice probe's: `1` also on `--expect-video` with fewer than 5 pictures decoded, or `--expect-share-audio` with less than 1 s of share tone heard.
+
+`--capture-seconds N [--capture-audio]` needs no server: it runs the real capture backend (the portal picker on Linux, ScreenCaptureKit on macOS) for N seconds and exits 0 when the capture ran and the stop path completed — the oracle for a capture backend on its own.
+
+**macOS probe without a Mac to build on:** every `release.yml` run, dry runs included, builds `vorcall-probe` for Apple Silicon and uploads it as the workflow artifact `vorcall-probe-macos-aarch64` (never attached to the GitHub Release, never pushed to the host). To check a friend's Mac: download the artifact from the run, then
+
+```
+xattr -d com.apple.quarantine vorcall-probe-macos-aarch64 && chmod +x vorcall-probe-macos-aarch64
+./vorcall-probe-macos-aarch64 --capture-seconds 10 --capture-audio
+```
+
+and paste the JSON line plus stderr; then share from the app and use Settings → "Report a problem" (see [Diagnostics](#diagnostics)).
 
 **Limits worth knowing:** one watched share per viewer; the source is never upscaled; keyframe requests are capped at 2 per second per viewer; a share ends the instant its voice session does, with no local self-preview for the sharer; there is no congestion control or retransmission — a lossy link shows as dropped frames and a black stage until the next keyframe.
 
@@ -238,6 +266,18 @@ Attachments are images only (png, jpeg, gif, webp), up to 8 MiB each and 4 per m
 
 See [`PROTOCOL.md`](PROTOCOL.md) § Rooms and presence, § Messages and § Attachments for the wire-level rules, and the limits table there for the full set of numbers.
 
+Write frames — send, edit, delete, react, create a room, open a DM — are rate limited per account: a bucket of 20 refilling 2 per second (`Vorcall__MessageBurst`, `Vorcall__MessagesPerSecond`). Beyond it the server answers the non-fatal `ERROR_CODE_RATE_LIMITED` ("too many messages, slow down"), which the client shows as a notice; reading, presence, voice and share signalling are never charged.
+
+## Diagnostics
+
+**Client log:** the app writes `vorcall.log` next to `config.toml` — `~/.config/vorcall/` on Linux, `~/Library/Application Support/br.com.freedomit.vorcall/` on macOS, `%APPDATA%\freedomit\vorcall\config\` on Windows — at debug level for Vorcall's own crates and info for everything else, rotated at 5 MiB keeping `vorcall.log.1` to `.3`. `RUST_LOG_FILE` overrides the file's filter; `RUST_LOG` still governs the console, which is stderr. Message text, tokens, media keys and invite codes never reach the file: frames are logged through a redacting description that renders a `Message` or `MessageEdited` as its id, room, author id and text length only.
+
+**Crash reports:** a panic writes `crash-<utc>.txt` in the same directory — version, platform, thread, message, location, backtrace and the last 200 log lines — and the last 5 are kept. The next start with a signed-in session offers once: "Vorcall crashed last time. Send the crash report and the log to the server?" with Send / Not now.
+
+**Report a problem:** Settings → "Diagnostics" → "Report a problem" uploads `vorcall.log`, `vorcall.log.1` and every crash report, each capped to its last 4 MiB, to `POST /api/diagnostics` (door key + bearer, 10 reports per hour per account). Each crash report is deleted locally as soon as its own upload succeeds (a report cut short by the hourly limit resumes where it stopped on the next press) and the status line reads "Report sent (N files)". On the server the files land under `Vorcall__DiagnosticsDir` (default `/diagnostics`, the host's `diagnostics/` bind mount; `../diagnostics` in local dev) as `<userId>-<username>-<yyyyMMddTHHmmssZ>-<kind>-<name>` and are deleted after 30 days. The owner reads them on the host; there is no listing command. When a friend reports a share problem on a Mac, the "ScreenCaptureKit stream running" lines in the uploaded log are where to start (see [Screen share](#screen-share)).
+
+**Server side:** what the backend logs, exposes as metrics and keeps in the database is described under [Production](#production).
+
 ## Protocol
 
 See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limits, and [`proto/vorcall.proto`](proto/vorcall.proto) for the message schema. Both sides generate code from the `.proto` file at build time; never hand-edit generated code.
@@ -245,11 +285,30 @@ See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limi
 ## Production
 
 - Domain `vorcall.example.com` points DNS-only (no Cloudflare proxy) at the Oracle ARM64 host `user@host`, app directory `/opt/vorcall`.
-- `deploy/provision-host.sh` runs on the host: installs certbot, issues the Let's Encrypt certificate, installs the nginx site (`deploy/nginx/vorcall.conf`, backend proxied from loopback `127.0.0.1:5004`, `listen 443 ssl http2` to match the other sites on the host and silence the "protocol options redefined" warning), sets up the certbot renewal hook, and generates the host's `.env` from `.env.production.example` (random Postgres password, `Vorcall__ServerKey` and `Vorcall__JwtSigningKey`). See the script header for the exact invocation. nginx config changes on an existing host are applied by hand — the deploy workflow only copies the compose file.
+- `deploy/provision-host.sh` runs on the host: installs certbot, issues the Let's Encrypt certificate, installs the nginx site (`deploy/nginx/vorcall.conf`, backend proxied from loopback `127.0.0.1:5004`, `listen 443 ssl http2` to match the other sites on the host and silence the "protocol options redefined" warning), sets up the certbot renewal hook, generates the host's `.env` from `.env.production.example` (random Postgres password, `Vorcall__ServerKey`, `Vorcall__JwtSigningKey` and `Vorcall__AdminKey`), creates `backups/`, `logs/` and `diagnostics/`, and installs the nightly backup cron. See the script header for the exact invocation. nginx config changes on an existing host are applied by hand — the deploy workflow only copies the compose file. An existing `.env` must gain `Vorcall__AdminKey` (`openssl rand -hex 32`) and `Vorcall__AdminUrl=http://backend:5000` by hand; `.env.production.example` shows both, and the script reminds you.
 - Deploy pipeline (`.github/workflows/deploy.yml`): a push to `main` builds an arm64 backend image on GitHub Actions, pushes it to `ghcr.io/freedomiit/vorcall-backend`, then copies `docker-compose.prod.yml` to the host and runs `docker compose pull && up -d` over SSH. The backend applies its own EF Core migrations on boot. A push to `main` deploys production immediately; there is no separate approval step.
 - The pre-shared door key lives only in the host's `.env` (`Vorcall__ServerKey`) and must be baked into client builds as `VORCALL_SERVER_KEY`. Rotating it means: generate a new value, update the host `.env`, restart the backend, and rebuild/redistribute the client with the new key.
 - `Vorcall:JwtSigningKey` (env `Vorcall__JwtSigningKey`) is required — base64 of 32 random bytes; the server refuses to boot without it. `.env.production.example` carries a placeholder and `deploy/provision-host.sh` generates a real value for fresh hosts; on an existing host, append it by hand (`openssl rand -base64 32`). Rotating it signs every client out within 15 minutes (the access token lifetime).
-- Image attachments live on the host under `$APP_DIR/attachments`, bind-mounted read-write into the backend as `/attachments` (`docker-compose.prod.yml`); `deploy/provision-host.sh` creates the directory. nginx has a dedicated `location /api/attachments` (`client_max_body_size 9m`, unbuffered proxying, 300 s timeouts) alongside `location /api/updates/` — both are applied to an existing host by re-running `deploy/provision-host.sh` after copying `deploy/` there.
+- Image attachments live on the host under `$APP_DIR/attachments`, bind-mounted read-write into the backend as `/attachments` (`docker-compose.prod.yml`); `deploy/provision-host.sh` creates the directory. nginx has a dedicated `location /api/attachments` (`client_max_body_size 9m`, unbuffered proxying, 300 s timeouts) alongside `location /api/updates/` and `location /api/diagnostics` (`client_max_body_size 5m`, unbuffered) — all applied to an existing host by re-running `deploy/provision-host.sh` after copying `deploy/` there.
+- **Logs:** the backend logs through Serilog to the container's console and to daily compact-JSON files `logs/vorcall-YYYYMMDD.json` (31 kept by the server itself) under `Vorcall__LogsDir` (default `/logs`, the `./logs:/logs` bind mount; `../logs` in local dev). Every WebSocket line carries `SessionId` (the first 8 hex of the connection id), `UserId` and `Username`; every HTTP request produces one line (`HTTP GET /health answered 200 in 12.0 ms`) except a request the door key refused, which produces none; an unhandled exception is logged with its stack trace and answered as a 500 protobuf `ApiError { detail: "internal error" }`. Levels are `Serilog:MinimumLevel` in `appsettings*.json` (the old `Logging` section is gone). The admin CLI keeps console-only warnings and never opens the log file. Both compose services also cap Docker's own `json-file` logs at 20 MB × 5 files.
+- **Metrics:** `curl -s localhost:5004/metrics` on the host prints a Prometheus text exposition. It is served only to loopback/private sources (`server/Api/PrivateSource.cs`) and never proxied by nginx, so it needs no key. Gauges: `vorcall_connections`, `vorcall_online_users`, `vorcall_rooms`, `vorcall_voice_sessions`, `vorcall_relay_sessions`, `vorcall_sharers`, `vorcall_watchers`, `vorcall_uptime_seconds`. Counters: `vorcall_ws_connections_total`, `vorcall_messages_total`, `vorcall_uploads_total`, `vorcall_http_responses_total{class}`, `vorcall_rate_limited_total{kind="http"|"message"}`, `vorcall_relay_packets_total{direction,kind}`, `vorcall_relay_bytes_total{direction,kind}`, `vorcall_relay_keyframe_requests_total`, `vorcall_relay_drops_total{reason}` with reasons `size`, `header`, `unknown_ssrc`, `rate`, `bad_tag`, `replay`, `no_address`, `share_rate`, `not_sharing`, `not_watching`, `queue_full`, `send_error`, `room_gone`, `seal_failed` (the last three were silent before this pass; the relay's 30 s per-room log line carries them too).
+- **Backups:** `deploy/backup-db.sh`, installed by `provision-host.sh` as `/usr/local/bin/vorcall-backup-db` with `/etc/cron.d/vorcall-backup`, runs `pg_dump -Fc` at 03:15 UTC daily into `backups/vorcall-<utc>.dump`, keeps 14 days and appends one line per run to `backups/backup.log`. Restore (destructive — it drops and recreates the objects in the dump):
+
+  ```
+  cd /opt/vorcall
+  set -a; . .env; set +a   # pg_restore's -U/-d below are expanded by this shell
+  docker compose -f docker-compose.prod.yml stop backend
+  docker compose -f docker-compose.prod.yml exec -T db pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner < backups/<file>.dump
+  docker compose -f docker-compose.prod.yml start backend
+  curl -fsS localhost:5004/health
+  ```
+
+  (`POSTGRES_USER`/`POSTGRES_DB` come from the host's `.env`.)
+- **Problem reports:** clients upload their log and crash reports to `POST /api/diagnostics` (see [Diagnostics](#diagnostics)); the files sit under `$APP_DIR/diagnostics` (`./diagnostics:/diagnostics`), one per upload, named `<userId>-<username>-<utc>-<kind>-<name>`, and are swept after 30 days. Read them with `ls`/`less` on the host.
+- **Sweepers:** besides the unlinked-attachment sweep, `RefreshTokenSweeper` deletes refresh-token rows 7 days after they expired or were revoked, daily, and `DiagnosticsSweeper` removes reports older than 30 days.
+- **Rate limits and their knobs:** `Vorcall__AuthRequestsPerWindow` (10 per minute per IP on `/api/auth/*`), `Vorcall__UploadRequestsPerWindow` (20 per minute per account), `Vorcall__DiagnosticsReportsPerHour` (10), `Vorcall__MessageBurst` / `Vorcall__MessagesPerSecond` (20 / 2 on the write frames). Refusals count in `vorcall_rate_limited_total`.
+- **Admin:** `Vorcall__AdminKey` enables `POST /api/admin/kick` and `POST /api/admin/refresh-account`, which answer 404 unless the source is private and `X-Vorcall-Admin-Key` matches — nginx returns 404 for `/api/admin/` regardless; `Vorcall__AdminUrl` is where the CLI container finds the live server (see [Admin CLI](#admin-cli)).
+- **`.env` keys**, all under `Vorcall__`: `ServerKey`, `JwtSigningKey`, `AdminKey`, `AdminUrl` (set on every host); `VoiceEnabled`, `VoicePort`, `VoiceHost`, `ShareEnabled`, `ShareMaxKbps`, `MaxSharersPerRoom`, `ReleasesDir`, `LogsDir`, `DiagnosticsDir`, `DiagnosticsReportsPerHour`, `AttachmentsDir`, `AttachmentsMaxBytes`, `AuthRequestsPerWindow`, `UploadRequestsPerWindow`, `MessageBurst`, `MessagesPerSecond` (optional, defaults in `.env.production.example` and above).
 
 ## Releases and updates
 
@@ -357,7 +416,6 @@ vorcall-probe apply-update --file PATH
 5. `git tag -a v0.2.0 -m "..."` && `git push origin v0.2.0`.
 6. Verify the manifest on the host: `ssh user@host 'head -c 300 ~/freedom.vorcall/releases/manifest.json'`.
 7. Hand-deliver 0.2.0 to each friend — the last manual install: the clients they are running now predate the updater and cannot pick it up themselves.
-8. The `Hello` frame changed (`client_version`/`client_platform`) — regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run the full smoke suite before pushing.
 
 ## Rolling out the rooms release
 
@@ -366,9 +424,8 @@ vorcall-probe apply-update --file PATH
 1. Push `main` — this deploys; the backend applies the `AddRoomsAndRichMessages` migration (the `rooms`, `room_members`, `reactions` and `attachments` tables) on boot, and serves `/api/attachments/*`.
 2. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — creates the `attachments/` directory and installs the nginx `location /api/attachments` (see [Production](#production)).
 3. Verify with a client: create a room or open a DM, send a message with an image attachment, and confirm another member sees it.
-4. The proto changed — regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run the full smoke suite, which now covers rooms, DMs, rich messages (reply/edit/delete/reactions) and attachments, before cutting the release.
-5. `git tag -a v0.3.0 -m "..."` && `git push origin v0.3.0` (see [Cutting a release](#cutting-a-release)); leave `min_version` at 0.2.0 unless friends still on the pre-rooms build must be forced to update.
-6. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
+4. `git tag -a v0.3.0 -m "..."` && `git push origin v0.3.0` (see [Cutting a release](#cutting-a-release)); leave `min_version` at 0.2.0 unless friends still on the pre-rooms build must be forced to update.
+5. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
 
 ## Rolling out the screen share release
 
@@ -377,9 +434,19 @@ vorcall-probe apply-update --file PATH
 1. Push `main` — this deploys once.
 2. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — adds the sysctl step that lets the relay's 8 MiB socket buffers actually take (see [Screen share](#screen-share)).
 3. On each desktop: share a window and a monitor, watch from another machine, check audio, pop out, go fullscreen, and (macOS) grant Screen Recording, then relaunch.
-4. The proto changed — regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run the full smoke suite, which now covers screen share too, before cutting the release.
-5. `git tag -a v0.4.0 -m "..."`, then `scripts/push-client.sh` (builds and pushes the Linux and Windows binaries to the host), then `git push origin v0.4.0` (see [Cutting a release](#cutting-a-release)).
-6. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
+4. `git tag -a v0.4.0 -m "..."`, then `scripts/push-client.sh` (builds and pushes the Linux and Windows binaries to the host), then `git push origin v0.4.0` (see [Cutting a release](#cutting-a-release)).
+5. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
+
+## Rolling out the operations and diagnostics changes
+
+No version bump of its own: the server side lands with the push, the client side (log, crash reports, "Report a problem", the share send retry, the macOS capture fixes) rides the next release.
+
+1. On the host, add `Vorcall__AdminKey` (`openssl rand -hex 32`) and `Vorcall__AdminUrl=http://backend:5000` to `.env` (see [Production](#production)).
+2. Copy `deploy/` to the host and re-run `deploy/provision-host.sh` — creates `backups/`, `logs/` and `diagnostics/`, installs the nightly backup cron and the nginx `location /api/diagnostics` and `/api/admin/` blocks.
+3. Push `main` — this deploys; the backend applies the `AddDisabledAndRevoked` migration (`users.disabled_at`, `invites.revoked_at`) on boot and mounts `logs/` and `diagnostics/`.
+4. On the host, check `ls logs/` for today's `vorcall-YYYYMMDD.json` and `curl -s localhost:5004/metrics` for the exposition; `docker compose -f docker-compose.prod.yml run --rm backend users list` should run without "admin endpoints are off".
+5. Dispatch the `release` workflow with `publish` unchecked and download the `vorcall-probe-macos-aarch64` artifact for the Mac friend (see [Screen share](#screen-share) for the recipe).
+6. Cut the next release as usual; once friends are on it, the crash offer and Settings → "Report a problem" are live.
 
 ## Development gates
 
@@ -389,6 +456,9 @@ cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warning
 
 ```
 dotnet build server/Vorcall.Server.csproj -warnaserror
+docker compose up -d db && ~/.dotnet/dotnet test tests/Vorcall.Server.Tests
 ```
 
-There are no automated tests in the MVP outside `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app`, `vorcall-hotkey` and `vorcall-screen`'s unit tests. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph. `cargo xwin clippy --target x86_64-pc-windows-msvc -p vorcall-screen` (from `client/`) checks the Windows capture backend from Linux; the macOS backend compiles only on `release.yml`'s macOS runner, so a dry-run dispatch (see [Cutting a release](#cutting-a-release)) is the only way to check it without a Mac.
+The Rust side has unit tests in `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app`, `vorcall-hotkey` and `vorcall-screen`. The server has `tests/Vorcall.Server.Tests`: an xunit integration suite that boots the backend in-process through `WebApplicationFactory` against the compose Postgres, in a database of its own per run (`vorcall_test_<hex>`), speaking the WebSocket protocol with the server's own generated protobuf types. `VORCALL_TEST_ADMIN` overrides the admin connection string it creates that database with (default `Host=localhost;Port=5433;Username=vorcall;Password=vorcall;Database=postgres`). It is the runtime oracle for the chat and REST surface; the voice and share media paths keep `vorcall-probe` (see [Voice](#voice) and [Screen share](#screen-share)). CI (`.github/workflows/ci.yml`) runs the same `cargo test` for the six crates and `dotnet test` with a Postgres service.
+
+`cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph. `cargo xwin clippy --target x86_64-pc-windows-msvc -p vorcall-screen` (from `client/`) checks the Windows capture backend from Linux; the macOS backend compiles only on `release.yml`'s macOS runner, so a dry-run dispatch (see [Cutting a release](#cutting-a-release)) is the only way to check it without a Mac.

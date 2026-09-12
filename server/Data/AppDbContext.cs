@@ -62,6 +62,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         user.Property(u => u.LastClientVersion).HasColumnName("last_client_version").HasMaxLength(64);
         user.Property(u => u.LastClientPlatform).HasColumnName("last_client_platform").HasMaxLength(64);
         user.Property(u => u.LastSeenAt).HasColumnName("last_seen_at").HasColumnType("timestamp with time zone");
+        user.Property(u => u.DisabledAt).HasColumnName("disabled_at").HasColumnType("timestamp with time zone");
         user.HasIndex(u => u.UsernameNormalized).IsUnique();
 
         var refreshToken = modelBuilder.Entity<RefreshToken>();
@@ -90,6 +91,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         invite.Property(i => i.ExpiresAt).HasColumnName("expires_at").HasColumnType("timestamp with time zone").IsRequired();
         invite.Property(i => i.UsedAt).HasColumnName("used_at").HasColumnType("timestamp with time zone");
         invite.Property(i => i.UsedByUserId).HasColumnName("used_by_user_id");
+        invite.Property(i => i.RevokedAt).HasColumnName("revoked_at").HasColumnType("timestamp with time zone");
         invite.HasIndex(i => i.CodeHash).IsUnique();
 
         var room = modelBuilder.Entity<Room>();

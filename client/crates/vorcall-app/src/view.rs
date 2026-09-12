@@ -21,9 +21,9 @@ use vorcall_screen::{Source, SourceId, SourceKind};
 use vorcall_voice::{Link, Stats};
 
 use crate::app::{
-    ChatState, Dialog, HotkeyStatus, ImageState, MESSAGE_LIMIT, Message, NO_CAPTURE, Page, RoomUi,
-    SettingsState, SourcesState, Status, VoiceUi, WatchUi, can_share, can_watch, hotkey_sentence,
-    key_label, share_sentence, sharer_list, sharer_name,
+    ChatState, Dialog, HotkeyStatus, ImageState, MESSAGE_LIMIT, Message, NO_CAPTURE, Page,
+    ReportState, RoomUi, SettingsState, SourcesState, Status, VoiceUi, WatchUi, can_share,
+    can_watch, hotkey_sentence, key_label, share_sentence, sharer_list, sharer_name,
 };
 use crate::brand::mark::mark;
 use crate::brand::palette::{DANGER, DEEP, MUTED, SUCCESS, WARNING};
@@ -729,12 +729,47 @@ fn settings<'a>(
         hotkey,
         share_settings(config, voice),
         button(text("Back")).on_press(Message::CloseSettings),
+        diagnostics_settings(state),
         update_ui::section(update),
     ]
     .spacing(12)
     .padding(16)
     .width(Length::Fill)
     .into()
+}
+
+/// Where the log lives, and the one button that hands it to the server.
+fn diagnostics_settings<'a>(state: &SettingsState) -> Element<'a, Message> {
+    let log = match vorcall_core::diagnostics::log_path() {
+        Some(path) => format!("Log file: {}", path.display()),
+        None => "No log file on this system".to_owned(),
+    };
+    let sending = matches!(state.report, ReportState::Sending);
+
+    column![
+        text("Diagnostics").font(bold()),
+        text(log).color(MUTED),
+        row![
+            button(text("Report a problem"))
+                .on_press_maybe((!sending).then_some(Message::ReportProblem)),
+            report_line(&state.report),
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center),
+    ]
+    .spacing(12)
+    .into()
+}
+
+fn report_line<'a>(state: &ReportState) -> Element<'a, Message> {
+    match state {
+        ReportState::Idle => text("Sends the log and any crash reports to the server")
+            .color(MUTED)
+            .into(),
+        ReportState::Sending => text("Sending…").color(MUTED).into(),
+        ReportState::Sent(count) => text(format!("Sent {count} files")).color(MUTED).into(),
+        ReportState::Failed(error) => text(error.clone()).color(WARNING).into(),
+    }
 }
 
 /// What a share is worth before it starts. Nothing here reaches a share
@@ -870,6 +905,7 @@ fn overlay<'a>(dialog: &'a Dialog, chat: &'a ChatState) -> Element<'a, Message> 
         Dialog::ChangePassword { .. } => change_password(dialog),
         Dialog::NewRoom { name, error } => new_room(name, error.as_deref()),
         Dialog::Image(id) => picture(chat, *id),
+        Dialog::CrashReport => crash_report(),
         Dialog::SharePicker {
             sources,
             selected,
@@ -986,6 +1022,26 @@ fn new_room<'a>(name: &'a str, error: Option<&'a str>) -> Element<'a, Message> {
         ]
         .spacing(8),
     );
+
+    form_dialog(form.into())
+}
+
+/// The offer made once when the last run left a crash report behind.
+fn crash_report<'a>() -> Element<'a, Message> {
+    let form = column![
+        text("Vorcall crashed last time").size(20).font(bold()),
+        text("Send the crash report and the log to the server?").color(MUTED),
+        row![
+            button(text("Send"))
+                .on_press(Message::SendCrashReport)
+                .padding(10),
+            button(text("Not now"))
+                .on_press(Message::DismissCrashReport)
+                .padding(10),
+        ]
+        .spacing(8),
+    ]
+    .spacing(12);
 
     form_dialog(form.into())
 }
@@ -1158,8 +1214,16 @@ fn status_line(
             }
         }
         if voice.share.active {
-            let kbps = voice.share.stats.as_ref().map_or(0, |stats| stats.kbps);
+            let share = voice.share.stats.as_ref();
+            let kbps = share.map_or(0, |stats| stats.kbps);
+            let refused = share.map_or(0, |stats| stats.send_failures);
             label.push_str(&format!(" · sharing {kbps} kbit/s"));
+            // Datagrams the socket refuses are what a frozen watcher looks
+            // like from this side, so the sharer is the one told about them.
+            if refused > 0 {
+                label.push_str(&format!(" · {refused} datagrams lost"));
+                colour = WARNING;
+            }
         }
         // Push-to-talk still works, but only while this window has the focus.
         if mode == TransmitMode::PushToTalk

@@ -113,6 +113,8 @@ pub struct ShareOutcome {
     pub skipped: u64,
     pub bytes: u64,
     pub threads: u16,
+    /// Datagrams this session's socket gave up on, retries included.
+    pub send_failures: u64,
     pub elapsed: Duration,
 }
 
@@ -224,6 +226,7 @@ fn send_share_video(sender: FrameSender, plan: SharePlan) -> ShareOutcome {
         }
     }
 
+    outcome.send_failures = sender.send_failures();
     outcome.elapsed = started.elapsed();
     outcome
 }

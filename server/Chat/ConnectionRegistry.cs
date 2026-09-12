@@ -117,6 +117,16 @@ public enum UnwatchShareOutcome
     Unwatched,
 }
 
+// Everything a scrape wants to know about the presence model, read in one pass so the six
+// figures describe the same moment rather than six different ones.
+public readonly record struct RegistrySnapshot(
+    int Connections,
+    int OnlineUsers,
+    int Rooms,
+    int VoiceSessions,
+    int Sharers,
+    int Watchers);
+
 // The connection set and the presence model in one place. Every membership change and every
 // room broadcast runs under _gate, which is what gives PROTOCOL.md its ordering guarantee: a
 // connection cannot see a ChatMessage, MemberJoined or MemberLeft before its own Welcome and
@@ -153,6 +163,37 @@ public sealed class ConnectionRegistry
     }
 
     public int Count => _connections.Count;
+
+    // One pass under the lock every membership change already takes: a scrape costs the rooms a
+    // single traversal and never holds the gate across anything that can block.
+    public RegistrySnapshot Snapshot()
+    {
+        lock (_gate)
+        {
+            var voiceSessions = 0;
+            var sharers = 0;
+            var watchers = 0;
+
+            foreach (var room in _rooms.Values)
+            {
+                voiceSessions += room.Voice.Count;
+                foreach (var slot in room.Voice.Values)
+                {
+                    if (slot.Sharing)
+                    {
+                        sharers++;
+                    }
+
+                    if (slot.Watching is not null)
+                    {
+                        watchers++;
+                    }
+                }
+            }
+
+            return new RegistrySnapshot(_connections.Count, _online.Count, _rooms.Count, voiceSessions, sharers, watchers);
+        }
+    }
 
     public void Add(ClientConnection connection) => _connections[connection.Id] = connection;
 
@@ -890,6 +931,32 @@ public sealed class ConnectionRegistry
 
         CloseSlow(slow);
         return UnwatchShareOutcome.Unwatched;
+    }
+
+    // The admin endpoint's reach into a live session. Nothing is sent ahead of the close: the
+    // client has to see the close code itself, where an Error frame would read as a failure to
+    // reconnect from. Presence, voice and any share are released by the handler's own Detach
+    // when its receive loop unwinds, exactly as on any other close.
+    public async Task<bool> DisconnectAsync(long userId, WebSocketCloseStatus status, string reason)
+    {
+        ClientConnection? connection;
+        lock (_gate)
+        {
+            _online.TryGetValue(userId, out connection);
+        }
+
+        if (connection is null)
+        {
+            return false;
+        }
+
+        _logger.LogInformation(
+            "Admin closed the connection of user {UserId} with {CloseCode} {CloseReason}",
+            userId,
+            (int)status,
+            reason);
+        await CloseQuietlyAsync(connection, status, reason);
+        return true;
     }
 
     public Task CloseAllAsync(WebSocketCloseStatus status, string reason)

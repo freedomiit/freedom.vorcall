@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using Vorcall.Server.Attachments;
 using Vorcall.Server.Data;
+using Vorcall.Server.Metrics;
 using Vorcall.Server.Protocol;
 
 namespace Vorcall.Server.Chat;
@@ -74,7 +75,7 @@ public sealed record ReactOutcome(ReactOutcome.Kind Status, string RoomId, IRead
         => new(Kind.Changed, roomId, reactions);
 }
 
-public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactory)
+public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactory, ServerMetrics metrics)
 {
     private const int ExcerptMaxScalars = 120;
 
@@ -168,6 +169,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         }
 
         await transaction.CommitAsync();
+        metrics.CountMessage();
 
         // The client's order, not the database's: the sender chose it.
         var ordered = attachmentIds

@@ -5,6 +5,7 @@
 //! locally and against production. Nothing here touches an audio device: the
 //! source is a synthesized sine and the sink is a level meter.
 
+mod capture;
 mod report;
 mod share;
 mod update_cmd;
@@ -78,6 +79,11 @@ Options:
   --bitrate-kbps <n>     share bitrate (default: the preset table's value for
                          the size and frame rate)
   --watch <name>         watch that user's share and decode it
+  --capture-seconds <n>  capture this machine's screen for n seconds and print
+                         what the backend produced; needs no server and no
+                         --username, and excludes --share-seconds and --watch
+  --capture-audio        ask the capture for this machine's audio as well
+  --capture-fps <n>      capture frame rate: 15, 30 or 60 (default: 30)
   --expect-peer          exit 1 unless at least 1.00 s of tone was heard
   --expect-silence       exit 1 if any audio frame was sent
   --expect-video         exit 1 unless at least 5 pictures decoded
@@ -97,6 +103,11 @@ Screen-share oracle, two terminals against the same room:
   vorcall-probe --username bob --watch alice --expect-video \
                 --expect-share-audio --listen-seconds 14
 
+Capture oracle, no server and no account; on Linux the portal asks which
+screen to hand over, so someone has to answer the dialog:
+
+  vorcall-probe --capture-seconds 5 --capture-audio
+
 The server URL and key come from VORCALL_SERVER_URL and VORCALL_SERVER_KEY,
 with the values baked in at build time as fallbacks.
 
@@ -104,8 +115,8 @@ Prints one JSON line on stdout; logs go to stderr.
 
 Exit codes: 0 ran, 1 --expect-silence sent audio, --expect-peer heard nothing,
 --expect-video saw too few pictures, --expect-share-audio heard no share tone,
-or the watch was never confirmed; 2 usage, sign-in, connection or media
-failure.
+the watch was never confirmed, or --capture-seconds produced fewer than 5
+frames; 2 usage, sign-in, connection, media or capture failure.
 
 Update subcommands:
   vorcall-probe check-update --username U [--password P] --platform ID
@@ -178,6 +189,12 @@ async fn main() {
         Some("check-update") => std::process::exit(update_cmd::check_update(argv).await),
         Some("apply-update") => std::process::exit(update_cmd::apply_update(argv)),
         _ => {}
+    }
+
+    // The capture oracle signs in to nothing and every backend brings its own
+    // runtime, so it never touches this one.
+    if argv.iter().any(|arg| arg == "--capture-seconds") {
+        std::process::exit(capture::run(argv));
     }
 
     let args = match parse_args(argv.into_iter()) {
@@ -337,6 +354,7 @@ async fn probe(args: Args) -> i32 {
             bytes: outcome.bytes,
             threads: outcome.threads,
             skipped: outcome.skipped,
+            send_failures: outcome.send_failures,
         }
     });
     if args.share_seconds.is_some() {

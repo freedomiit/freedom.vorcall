@@ -6,7 +6,7 @@ Schema: `proto/vorcall.proto` (proto3). Both the .NET server and the Rust client
 
 Live traffic: one WebSocket at `/ws`. Every WebSocket message is a **binary** frame holding exactly one `ClientFrame` (client to server) or one `ServerFrame` (server to client). Text frames are a protocol error. Max inbound WebSocket message: 16 KiB; larger messages are a fatal protocol error.
 
-REST: every request and response body is `application/x-protobuf`. Request bodies are capped at 16 KiB; a larger body gets `413`. The one exception is the attachment upload body, which is raw image bytes and is capped at 8 MiB instead.
+REST: every request and response body is `application/x-protobuf`. Request bodies are capped at 16 KiB; a larger body gets `413`. The exceptions are the attachment upload body (raw image bytes, capped at 8 MiB), the diagnostics upload body (raw UTF-8 text, capped at 4 MiB), the Prometheus exposition `GET /metrics` answers with, and the admin endpoints, which speak JSON to the admin CLI only.
 
 | Endpoint | Request | Success | Failure |
 |---|---|---|---|
@@ -19,6 +19,10 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 | `POST /api/auth/refresh` | `RefreshRequest` | 200 `TokenResponse` | 401 / 429 `ApiError` |
 | `POST /api/auth/logout` | `LogoutRequest` | 204 | — |
 | `POST /api/auth/password` | `ChangePasswordRequest` | 204 | 400 / 401 `ApiError` |
+| `POST /api/diagnostics?kind=log\|crash` | raw UTF-8 text | 204 | 400 / 413 / 429 `ApiError` |
+| `GET /metrics` | — | 200 Prometheus text (`text/plain; version=0.0.4`) | 404 unless the source is private |
+| `POST /api/admin/kick` | JSON `{"userId","code","reason"}` | 200 JSON `{"closed":true\|false}` | 400 JSON; 404 unless the source is private and the admin key matches |
+| `POST /api/admin/refresh-account` | JSON `{"userId"}` | 204 | 400 JSON; 404 unless the source is private and the admin key matches |
 | `GET /health` | — | 200 `{"status":"ok"}` | 503 |
 
 - `GET /api/messages`: `room` is optional and defaults to `general`; a value that does not match the room id grammar is `400`. `limit` is clamped to 1..100 (default 100). `before` is optional and exclusive: only messages with `id < before` are returned. Messages come back **ascending by id**; without `before` the page is the newest `limit` messages. `has_more` is true when older messages exist before `messages[0]`.
@@ -30,6 +34,9 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 - `POST /api/auth/refresh`: `401` when the token is unknown, expired, revoked or already rotated (see Sessions); `429` when rate-limited.
 - `POST /api/auth/logout`: always `204`, idempotent; it revokes the presented refresh token. No bearer needed.
 - `POST /api/auth/password`: bearer required. `400` when the new password fails the policy; `401` when the current password is wrong or the bearer is invalid.
+- `POST /api/diagnostics?kind=log|crash`: door key and bearer. The body is the raw text of one client log file or crash report, `text/plain` UTF-8, at most 4 MiB; `X-Vorcall-Filename` names it. `400` `ApiError{"not text"}`, `{"invalid file name"}` or `{"invalid kind"}`; `413` `{"reports must be 4 MiB or smaller"}`; `429` beyond 10 reports per hour per account (`Vorcall:DiagnosticsReportsPerHour`). Stored under `Vorcall:DiagnosticsDir` as `<userId>-<username>-<yyyyMMddTHHmmssZ>-<kind>-<name>` and deleted after 30 days. There is no listing endpoint: the owner reads the files on the host.
+- `GET /metrics`: outside `/api`, so neither the door key nor a bearer gates it; what gates it is the source address — loopback, RFC 1918, link-local and their IPv6 counterparts (`PrivateSource.IsPrivate`) get the exposition, anything else gets the same `404` as an unknown path. nginx never proxies it; on the host it is `curl -s localhost:5004/metrics`.
+- `POST /api/admin/kick` and `POST /api/admin/refresh-account`: the admin CLI's way to reach the live server for `users kick`/`users ban`/`users unban`. Door key plus `X-Vorcall-Admin-Key: <Vorcall:AdminKey>` compared in constant time; the source must also be private (`PrivateSource.IsPrivate`), otherwise — and whenever `Vorcall:AdminKey` is unset, in which case the endpoints are not mapped at all — the answer is `404`, indistinguishable from an unknown path. `kick` closes the user's live connection with `code` 4001 or 4003 (anything else is `400`) and reports whether one was open; `refresh-account` drops the cached ban state of that user so a ban or an unban applies to the next request rather than at the end of the cache's 30 s. nginx answers `404` for `/api/admin/` itself.
 - `GET /health` needs neither the door key nor a bearer.
 
 ## Access
@@ -37,9 +44,11 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 Two gates, both checked before any WebSocket upgrade:
 
 1. **Door key** — the header `X-Vorcall-Key: <pre-shared key>` on every `/ws` and `/api/*` request. It is compared in constant time. A missing or wrong key gets an empty `401` with `WWW-Authenticate: X-Vorcall-Key`. It is a door key, not identity.
-2. **Bearer access token** — `Authorization: Bearer <jwt>` on `/ws`, `/api/messages`, `/api/users`, `/api/attachments/*` and `/api/auth/password`. Failure is `401` with `WWW-Authenticate: Bearer ...`.
+2. **Bearer access token** — `Authorization: Bearer <jwt>` on `/ws`, `/api/messages`, `/api/users`, `/api/attachments/*`, `/api/diagnostics`, `/api/updates/*` and `/api/auth/password`. Failure is `401` with `WWW-Authenticate: Bearer ...`. A bearer whose account has been banned (`users ban`) is refused with `401` within 30 s of the ban.
 
-`/api/auth/register`, `/api/auth/login`, `/api/auth/refresh` and `/api/auth/logout` need only the door key.
+`/api/auth/register`, `/api/auth/login`, `/api/auth/refresh` and `/api/auth/logout` need only the door key. `/api/admin/*` needs the door key, the admin key and a private source (see the endpoint notes above); `/metrics` sits outside `/api` and is gated by source alone.
+
+A request refused by the door key produces no request log line on the server; every other request produces exactly one.
 
 Clients tell the gates apart by the `WWW-Authenticate` scheme: `X-Vorcall-Key` means a stale build (wrong key); `Bearer` means refresh or sign in again; a 401 with no challenge is an application answer from the auth endpoints (`ApiError`, e.g. wrong password or refused refresh token).
 
@@ -51,7 +60,9 @@ Accounts are invite-only.
 - **Password** — 8..128 Unicode scalars, no other rules.
 - **Invite code** — 20 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, shown as four groups of five separated by `-`. Input is uppercased and stripped of `-` and whitespace. Single use; expires 7 days after creation by default; created only by the admin CLI on the server.
 
-Registration signs the user in and returns tokens. `Hello.nickname` is deprecated and ignored.
+Registration signs the user in and returns tokens. `Hello.nickname` is deprecated and ignored. An invite the admin CLI has revoked (`invites revoke <id>`) is refused like an unknown one (`403`).
+
+**Banned accounts** — `users ban` sets `users.disabled_at`, revokes every refresh token of the account and closes its live connection with close code 4003. From then on login answers `403` `ApiError{"account disabled"}`, refresh `401`, and a still-valid access token is refused with `401` within 30 s. `users unban` clears the flag; the sessions the ban revoked are not restored.
 
 ## Sessions (tokens)
 
@@ -59,7 +70,9 @@ Registration signs the user in and returns tokens. `Hello.nickname` is deprecate
 
 **Refresh token** — opaque, 32 random bytes base64url; the server stores only its SHA-256. Each token belongs to a family created at login or registration. A refresh rotates the token (the presented one is marked rotated, a new one is issued in the same family) and slides the expiry to now + 30 days. Presenting a token that was already rotated or revoked revokes the whole family and answers `401` (reuse detection). Logout revokes the presented token's whole family (so a token the client had already rotated still ends the session). Changing the password revokes every refresh token of the user except the live token of the family the presented one belongs to. The admin CLI can revoke all tokens of a user.
 
-**Rate limits** — `/api/auth/register|login|refresh` allow 10 requests per minute per client IP (sliding window; `429` with `Retry-After: 60`). Login locks a username after 5 consecutive failures for 60 s, doubling on each further lock up to 15 minutes, cleared by a successful login.
+**Rate limits** — `/api/auth/register|login|refresh` allow 10 requests per minute per client IP (sliding window; `429` with `Retry-After: 60`; `Vorcall:AuthRequestsPerWindow`). Login locks a username after 5 consecutive failures for 60 s, doubling on each further lock up to 15 minutes, cleared by a successful login. Attachment uploads allow 20 per minute per account (`Vorcall:UploadRequestsPerWindow`) and diagnostics uploads 10 per hour per account (`Vorcall:DiagnosticsReportsPerHour`). All three windows are configuration, so a test host can raise them.
+
+**Sweeps** — a refresh token row is deleted 7 days after it expired or was revoked, by a daily sweep (`RefreshTokenSweeper`); a revoked token is refused the moment it is revoked, the row only lingers for the reuse-detection window.
 
 ## Updates
 
@@ -114,6 +127,8 @@ Ordering guarantee: membership changes and room broadcasts are serialized by the
 Mentions on the wire are the token `<@user_id>`. Clients render it as the mentioned user's username and convert a typed `@username` into the token before sending; the server never parses usernames out of text.
 
 Every error above is non-fatal. Every broadcast in this section is serialized under the same server lock as membership changes.
+
+**Write rate limit** — the write frames `SendMessage`, `EditMessage`, `DeleteMessage`, `React`, `CreateRoom` and `OpenDm` draw from one token bucket per account: 20 tokens, refilling 2 per second (`Vorcall:MessageBurst`, `Vorcall:MessagesPerSecond`). A write frame that finds the bucket empty is not handled at all and answers non-fatal `ERROR_CODE_RATE_LIMITED` (18) with detail `"too many messages, slow down"`; the client shows it as a notice. Reads, presence, voice and share signalling and pings are never charged, so a throttled account can still navigate.
 
 ## Attachments
 
@@ -223,7 +238,7 @@ Share audio payload (type 5): exactly one Opus packet of 20 ms at 48 kHz **stere
 
 Keyframe request payload (type 6): 4 bytes, `target_ssrc u32` — the sharer the request is for. A viewer sends at most 2 per second; a sharer coalesces the requests it receives into at most one extra keyframe.
 
-The relay processes each inbound datagram in this order: size (≤ 1200 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2, 4, 5, 6}`) → session lookup by ssrc → per-session rate limit — share media (types 4 and 5) is charged to a byte budget (`Vorcall:ShareMaxKbps`, default 30000 kbit/s, burst the larger of 1.5 MiB and half a second of that rate) instead of the packet bucket, and types 1, 2 and 6 to the packet bucket (100 packets/s sustained, burst 200) → AEAD open → replay window (1024 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason — the share-media reasons being share-rate, not-sharing, not-watching and queue-full — and logs per-room counters every 30 s while the room has voice members.
+The relay processes each inbound datagram in this order: size (≤ 1200 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2, 4, 5, 6}`) → session lookup by ssrc → per-session rate limit — share media (types 4 and 5) is charged to a byte budget (`Vorcall:ShareMaxKbps`, default 30000 kbit/s, burst the larger of 1.5 MiB and half a second of that rate) instead of the packet bucket, and types 1, 2 and 6 to the packet bucket (100 packets/s sustained, burst 200) → AEAD open → replay window (1024 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason — `size`, `header`, `unknown_ssrc`, `rate`, `bad_tag`, `replay`, `no_address`, the share-media reasons `share_rate`, `not_sharing`, `not_watching`, `queue_full`, and the send-side reasons `send_error`, `room_gone`, `seal_failed` — logs per-room counters every 30 s while the room has voice members, and exposes the totals as `vorcall_relay_drops_total{reason}` on `GET /metrics`.
 
 `Speaking` is derived from type 1 alone: share media never marks a session as speaking. The relay's UDP socket buffers are 8 MiB in each direction, which the host sysctl in `deploy/provision-host.sh` has to allow.
 
@@ -242,8 +257,8 @@ The receive side keeps one jitter buffer per ssrc: adaptive 60–100 ms, packet 
 ## Server session state machine (per connection)
 
 1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. `Hello` may also carry `client_version` (e.g. `"0.2.0"`) and `client_platform` (e.g. `"linux-x86_64"`), both optional: the server logs them and stores them on the account (`users.last_client_version`/`last_client_platform`/`last_seen_at`) for the admin CLI's `users list` and `users outdated`. Neither field is enforced — a client that omits them (any build before the updater) still connects normally. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by the Hello sequence described under Rooms and presence — `RoomState`+`VoiceState` per room, then `RoomList` — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
-2. **Ready** — handles `JoinRoom`, `LeaveRoom`, `CreateRoom`, `OpenDm` and `MarkRead` as described under Rooms and presence, `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages, `JoinVoice`/`LeaveVoice` as described under Voice, `StartShare`/`StopShare`/`WatchShare`/`UnwatchShare` as described under Screen share, and `Ping`/`Pong`. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
-3. **Any state** — unparsable bytes or a text frame: fatal protocol error, close 1008. No frame received for 120 s: close 1001. A connection whose outbound queue exceeds 256 frames is closed with 1013. On server shutdown every socket is closed with 1001. If a connection's outbound queue is already full when a fatal error occurs, the `Error` frame may be dropped and only the close frame (1013 or 1008) is delivered: a slow consumer is closed as a slow consumer.
+2. **Ready** — handles `JoinRoom`, `LeaveRoom`, `CreateRoom`, `OpenDm` and `MarkRead` as described under Rooms and presence, `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages (subject to the write rate limit there), `JoinVoice`/`LeaveVoice` as described under Voice, `StartShare`/`StopShare`/`WatchShare`/`UnwatchShare` as described under Screen share, and `Ping`/`Pong`. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
+3. **Any state** — unparsable bytes or a text frame: fatal protocol error, close 1008. No frame received for 120 s: close 1001. A connection whose outbound queue exceeds 256 frames is closed with 1013. On server shutdown every socket is closed with 1001. If a connection's outbound queue is already full when a fatal error occurs, the `Error` frame may be dropped and only the close frame (1013 or 1008) is delivered: a slow consumer is closed as a slow consumer. The admin CLI closes a connection with the application close codes 4001 "kicked by admin" (`users kick`) or 4003 "account banned" (`users ban`; also sent to an already-open connection at its next write frame after the account was banned), no `Error` frame first; the account's rooms see the usual `VoiceMemberLeft`/`MemberLeft`. A client must not reconnect on either: 4001 means sign in again by hand, 4003 means the account is disabled.
 
 The server also sends WebSocket-level keep-alive pings every 30 s; clients answer with pong frames automatically.
 
@@ -259,7 +274,8 @@ The server also sends WebSocket-level keep-alive pings every 30 s; clients answe
 - After `Welcome` the client fetches `GET /api/users`, then merges live frames. History is fetched per room on demand (`GET /api/messages?room=…`, the newest 100 messages) when a room is first opened.
 - Gap-fill: per room it has already loaded, the client remembers the newest message id it has delivered there. If the newest page starts after that id + 1 and `has_more` is true, it pages backwards with `before` until the pages overlap that id, up to 5 pages in total (500 messages); beyond that a gap may remain. "Load older" uses `before = <oldest known id>`. The client keeps at most 2000 messages per room, dropping the oldest.
 - The client sends `MarkRead` for a room while it is viewing that room at the bottom of the list and the window is focused, debounced to at most one per second per room.
-- `ERROR_CODE_SESSION_REPLACED` stops the loop for good; the UI returns to sign-in.
+- `ERROR_CODE_SESSION_REPLACED` stops the loop for good; the UI returns to sign-in. So do close codes 4001 (kicked) and 4003 (banned): the client signs out and returns to sign-in with "Disconnected by the admin" / "This account is banned".
+- `ERROR_CODE_RATE_LIMITED` is shown as a notice; the connection stays up.
 - The client sends `Ping` every 30 s while connected.
 - Backoff: 1, 2, 4, 8, 16, 30 s (cap) with ±20 % jitter, reset after `Welcome`.
 
@@ -286,7 +302,13 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 | Attachment file name | 128 chars after sanitising |
 | Attachment storage quota | 2 GiB by default |
 | Unlinked attachment sweep | older than 1 h, every 10 min |
-| Attachment upload rate limit | 20 uploads/min per user |
+| Attachment upload rate limit | 20 uploads/min per user, configurable |
+| Write frame rate limit | bucket of 20 per account, refilling 2/s, configurable |
+| Diagnostics report | 4 MiB per file, text only |
+| Diagnostics rate limit | 10 reports/hour per account, configurable |
+| Diagnostics retention | 30 days |
+| Refresh token row sweep | 7 days after expiry or revocation, daily |
+| Ban visibility to a live bearer | within 30 s |
 | MarkRead debounce | 1 s per room |
 | Inbound WebSocket message | 16 KiB |
 | REST request body | 16 KiB |
@@ -295,7 +317,7 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 | Client message cap | 2000 messages per room |
 | Access token | 15 min |
 | Refresh token | 30 days sliding |
-| Auth rate limit | 10 requests/min per IP |
+| Auth rate limit | 10 requests/min per IP, configurable |
 | Login lockout | 5 failures → 60 s, doubling, cap 15 min |
 | Hello deadline | 5 s |
 | Server idle close | 120 s |

@@ -14,4 +14,8 @@ public class Invite
     public DateTime? UsedAt { get; set; }
 
     public long? UsedByUserId { get; set; }
+
+    // Set by "invites revoke": an invite that was never used and must never be usable. Kept
+    // apart from UsedAt so the listing can still say which of the two ended it.
+    public DateTime? RevokedAt { get; set; }
 }

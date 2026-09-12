@@ -106,6 +106,9 @@ pub struct ShareStats {
     pub dropped_frames: u64,
     pub skipped_frames: u64,
     pub audio_frames: u64,
+    /// Datagrams the socket gave up on over the last window, retries included:
+    /// a share that keeps losing fragments is one the watchers see freeze.
+    pub send_failures: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +280,9 @@ struct Pipeline {
     counters: Counters,
     /// The counters as of the last [`ShareEvent::Stats`], for the two rates.
     window: Counters,
+    /// The engine's own send-failure total as of that same report; it counts
+    /// the whole session, so only the difference belongs to this share.
+    last_send_failures: u64,
     stats_at: Instant,
     warning: Throttle,
 }
@@ -304,6 +310,9 @@ impl Pipeline {
         share_far_end: Arc<Mutex<VecDeque<f32>>>,
     ) -> Self {
         let now = Instant::now();
+        // Read before the sender is handed over, so a session that already had
+        // failures does not report them all as this share's first second.
+        let last_send_failures = sender.send_failures();
         Self {
             events,
             capturer,
@@ -326,6 +335,7 @@ impl Pipeline {
             far_end_scratch: Vec::with_capacity(FAR_END_MAX_SAMPLES),
             counters: Counters::default(),
             window: Counters::default(),
+            last_send_failures,
             stats_at: now,
             warning: Throttle::default(),
         }
@@ -597,6 +607,16 @@ impl Pipeline {
             (current.saturating_sub(previous) as f64 / seconds) as f32
         };
 
+        let send_failures = self.sender.send_failures();
+        let refused = send_failures.saturating_sub(self.last_send_failures);
+        self.last_send_failures = send_failures;
+        if refused > 0 && self.warning.allow(now) {
+            tracing::warn!(
+                refused,
+                "share datagrams refused by the socket in the last second"
+            );
+        }
+
         let stats = ShareStats {
             capture_fps: rate(counters.captured, self.window.captured),
             encode_fps: rate(counters.encoded, self.window.encoded),
@@ -609,6 +629,7 @@ impl Pipeline {
             dropped_frames: counters.dropped,
             skipped_frames: counters.skipped,
             audio_frames: counters.audio_frames,
+            send_failures: refused,
         };
         self.window = counters;
         self.emit(ShareEvent::Stats(stats));

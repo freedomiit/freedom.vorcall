@@ -215,8 +215,15 @@ fn normalize(config: &mut Config) {
 
 /// `None` when the platform exposes no config directory at all.
 pub fn path() -> Option<PathBuf> {
+    log_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// The directory holding `config.toml`, which is also where the rolling log and
+/// the crash reports go; `None` when the platform exposes no config directory
+/// at all.
+pub fn log_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("br.com", "freedomit", "vorcall")
-        .map(|dirs| dirs.config_dir().join("config.toml"))
+        .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 /// Where anything the client can re-fetch belongs; `None` when the platform

@@ -27,7 +27,8 @@ use vorcall_core::mentions::Segment;
 use vorcall_core::update::{self, Checker, Outcome, Progress, PublicKey, Ready, Version};
 use vorcall_core::{
     ApiFailure, Attachment, ChatMessage, Config, Endpoints, ErrorCode, Member, Room, RoomEntry,
-    RoomKind, Session, VoiceMember, attachments, auth, config, mentions, session,
+    RoomKind, Session, VoiceMember, attachments, auth, config, diagnostics, mentions, report,
+    session,
 };
 use vorcall_hotkey::{Backend, Binding, Edge, Listener, MouseButton, Unavailable};
 use vorcall_screen::codec::Picture;
@@ -113,6 +114,9 @@ pub struct App {
     main_window: Option<window::Id>,
     entrance: Option<brand::entrance::Entrance>,
     icon: Option<window::Icon>,
+    /// The last run left a crash report behind and nobody has been asked about
+    /// it yet. Cleared by the offer, whichever way it is answered.
+    crash_offer: bool,
     update: UpdateState,
     update_keys: Vec<PublicKey>,
     /// The release notes of the last download, kept for the settings page after
@@ -270,6 +274,8 @@ pub enum Dialog {
     },
     /// One attachment at full size.
     Image(i64),
+    /// The offer made once at startup when the last run left a crash report.
+    CrashReport,
     /// What to share, before any capture starts. A system whose own picker
     /// chooses the source has nothing to list here.
     SharePicker {
@@ -477,6 +483,17 @@ pub struct SettingsState {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub capturing_ptt: bool,
+    pub report: ReportState,
+}
+
+/// How far the problem report started from the Settings page has got.
+#[derive(Debug, Clone, Default)]
+pub enum ReportState {
+    #[default]
+    Idle,
+    Sending,
+    Sent(usize),
+    Failed(String),
 }
 
 /// A [`MediaEngine`] is not `Clone` and every [`Message`] is, so the engine
@@ -761,6 +778,13 @@ pub enum Message {
     /// One per frame while the splash is up.
     SplashTick(Instant),
     SplashSkip,
+    /// The Settings button that sends the logs and the crash reports, and the
+    /// count of files sent, or why none were.
+    ReportProblem,
+    ReportFinished(Result<usize, String>),
+    /// The answers to the offer made after a crash.
+    SendCrashReport,
+    DismissCrashReport,
     /// A check somebody asked for: the settings button, and the retry on the
     /// required screen.
     CheckForUpdates,
@@ -794,7 +818,7 @@ impl App {
             Screen::login(config.username.clone())
         };
 
-        Self {
+        let mut app = Self {
             endpoints,
             config,
             session,
@@ -808,6 +832,9 @@ impl App {
             main_window: None,
             entrance: None,
             icon: None,
+            // Listing the directory is all this reads; the files themselves are
+            // only ever read off the UI thread.
+            crash_offer: !diagnostics::crash_reports().is_empty(),
             update: match disabled {
                 Some(reason) => UpdateState::Disabled(reason),
                 None => UpdateState::Idle,
@@ -819,7 +846,9 @@ impl App {
             pending_restart: None,
             loading: brand::loading::Loading::new(),
             loading_elapsed: Duration::ZERO,
-        }
+        };
+        app.offer_crash_report();
+        app
     }
 
     /// Builds the state and asks for the first window: the splash, or the main
@@ -1473,6 +1502,18 @@ impl App {
                 Task::none()
             }
             Message::SplashSkip => self.close_splash(),
+            Message::ReportProblem => self.report_problem(),
+            Message::ReportFinished(result) => self.on_report_finished(result),
+            Message::SendCrashReport => {
+                self.close_crash_offer();
+                self.report_problem()
+            }
+            Message::DismissCrashReport => {
+                // The files stay on disk: the Settings button can still send
+                // them later.
+                self.close_crash_offer();
+                Task::none()
+            }
             Message::CheckForUpdates | Message::UpdateTick => self.check_for_updates(),
             Message::UpdateProgress(progress) => self.on_update_progress(progress),
             Message::UpdateResult(result) => self.on_update_result(result),
@@ -1754,6 +1795,7 @@ impl App {
         self.session = Some(session);
         self.session_generation = self.session_generation.wrapping_add(1);
         self.screen = chat_screen(&self.config);
+        self.offer_crash_report();
         operation::focus(Id::new(view::INPUT_ID))
     }
 
@@ -3046,6 +3088,22 @@ impl App {
                 )),
                 operation::focus(Id::new(view::USERNAME_ID)),
             ]),
+            // A kick ends the session and nothing else: the account is free to
+            // sign in again, exactly as after a replacement.
+            Event::Disconnected {
+                reason: DisconnectReason::Kicked(_),
+                ..
+            } => Task::batch([
+                self.sign_out(Some("Disconnected by the admin".to_owned())),
+                operation::focus(Id::new(view::USERNAME_ID)),
+            ]),
+            Event::Disconnected {
+                reason: DisconnectReason::Banned(_),
+                ..
+            } => Task::batch([
+                self.sign_out(Some("This account is banned".to_owned())),
+                operation::focus(Id::new(view::USERNAME_ID)),
+            ]),
             // The first connection is the earliest moment there is a token to
             // check with; every later one is the timer's business.
             Event::Connected { .. } if !self.checked_on_connect => {
@@ -3188,6 +3246,75 @@ impl App {
         if let Some(audio) = &self.audio {
             audio.chime();
         }
+    }
+
+    /// Opens the offer on entering the chat screen, never over another dialog,
+    /// until it is answered; from then on the Settings button is the only way
+    /// to send. Keeping the offer until an answer is what lets it survive a
+    /// stale stored session, whose chat screen gives way to sign-in before
+    /// anyone can act on it.
+    fn offer_crash_report(&mut self) {
+        if !self.crash_offer || self.session.is_none() {
+            return;
+        }
+        let Screen::Chat(chat) = &mut self.screen else {
+            return;
+        };
+        if chat.dialog.is_none() {
+            chat.dialog = Some(Dialog::CrashReport);
+        }
+    }
+
+    fn close_crash_offer(&mut self) {
+        self.crash_offer = false;
+        if let Screen::Chat(chat) = &mut self.screen
+            && matches!(chat.dialog, Some(Dialog::CrashReport))
+        {
+            chat.dialog = None;
+        }
+    }
+
+    /// Sends the log files and every crash report, one upload at a time; each
+    /// crash report is deleted as soon as its own upload succeeds, so a report
+    /// the server's hourly limit cut short resumes where it stopped on the
+    /// next press. The token is a clone taken now: a 401 comes back as a
+    /// failure the user can press again, the same way an update check does.
+    fn report_problem(&mut self) -> Task<Message> {
+        let Some(session) = &self.session else {
+            return Task::none();
+        };
+        if self.reporting() {
+            return Task::none();
+        }
+
+        let endpoints = self.endpoints.clone();
+        let token = session.access_token.clone();
+        if let Some(settings) = self.settings() {
+            settings.report = ReportState::Sending;
+        }
+
+        Task::perform(send_report(endpoints, token), Message::ReportFinished)
+    }
+
+    fn reporting(&self) -> bool {
+        match &self.screen {
+            Screen::Chat(chat) => match &chat.page {
+                Page::Settings(settings) => matches!(settings.report, ReportState::Sending),
+                Page::Chat => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn on_report_finished(&mut self, result: Result<usize, String>) -> Task<Message> {
+        let (state, notice) = report_outcome(result);
+        if let Some(settings) = self.settings() {
+            settings.report = state;
+        }
+        if let Screen::Chat(chat) = &mut self.screen {
+            chat.notice = Some(notice);
+        }
+        Task::none()
     }
 
     /// Starts one check, unless one is already going or this build does not
@@ -5178,6 +5305,96 @@ fn device_choice(name: String) -> Option<String> {
     (name != view::SYSTEM_DEFAULT).then_some(name)
 }
 
+/// What a finished report leaves behind: the settings page's state, and the
+/// line the chat shows either way.
+fn report_outcome(result: Result<usize, String>) -> (ReportState, String) {
+    match result {
+        Ok(count) => (
+            ReportState::Sent(count),
+            format!("Report sent ({count} files)"),
+        ),
+        Err(error) => (
+            ReportState::Failed(error.clone()),
+            format!("Report failed: {error}"),
+        ),
+    }
+}
+
+/// One file of a report, as it goes over the wire.
+struct ReportFile {
+    kind: &'static str,
+    name: String,
+    path: PathBuf,
+    body: Vec<u8>,
+}
+
+/// Collects the files off the UI thread and uploads them one at a time,
+/// stopping at the first refusal: a half-sent report is still worth reading.
+/// A crash file goes away as soon as its own upload lands, so a report the
+/// server's hourly limit cut short picks up where it stopped on the next
+/// press instead of replaying files already sent.
+async fn send_report(endpoints: Endpoints, token: String) -> Result<usize, String> {
+    let files = tokio::task::spawn_blocking(collect_report)
+        .await
+        .map_err(|e| e.to_string())?;
+    if files.is_empty() {
+        return Err("there is nothing to send".to_owned());
+    }
+
+    let count = files.len();
+    let bytes: usize = files.iter().map(|file| file.body.len()).sum();
+    tracing::info!(files = count, bytes, "sending a problem report");
+
+    for file in files {
+        report::upload(&endpoints, &token, file.kind, &file.name, file.body)
+            .await
+            .map_err(|failure| describe(&failure))?;
+        if file.kind != "crash" {
+            continue;
+        }
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(file.path))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result.map_err(|e| e.to_string()));
+        if let Err(error) = removed {
+            tracing::warn!(error = %error, "could not delete a sent crash report");
+        }
+    }
+
+    Ok(count)
+}
+
+/// The live log, the generation behind it and every crash report on disk. A
+/// file that cannot be read is left out rather than losing the whole report.
+fn collect_report() -> Vec<ReportFile> {
+    let mut files = Vec::new();
+
+    if let Some(live) = diagnostics::log_path() {
+        let mut rotated = live.clone().into_os_string();
+        rotated.push(".1");
+        for path in [live, PathBuf::from(rotated)] {
+            files.extend(read_report(&path, "log"));
+        }
+    }
+    for path in diagnostics::crash_reports() {
+        files.extend(read_report(&path, "crash"));
+    }
+
+    files
+}
+
+fn read_report(path: &Path, kind: &'static str) -> Option<ReportFile> {
+    let body = std::fs::read(path).ok()?;
+    let name = path.file_name().and_then(OsStr::to_str)?.to_owned();
+
+    Some(ReportFile {
+        kind,
+        name,
+        path: path.to_path_buf(),
+        body: report::tail(body, report::MAX_BYTES),
+    })
+}
+
 /// The one place an [`ApiFailure`] becomes something a person can act on.
 fn describe(failure: &ApiFailure) -> String {
     match failure {
@@ -6029,5 +6246,25 @@ mod tests {
 
         assert!(throttle.admit(&Progress::Checking));
         assert!(throttle.admit(&report(0, 10_000)));
+    }
+
+    /// A finished report leaves the settings page and the chat line saying the
+    /// same thing.
+    #[test]
+    fn a_sent_report_counts_its_files() {
+        let (state, notice) = report_outcome(Ok(3));
+
+        assert!(matches!(state, ReportState::Sent(3)));
+        assert_eq!(notice, "Report sent (3 files)");
+    }
+
+    #[test]
+    fn a_refused_report_keeps_the_reason() {
+        let (state, notice) = report_outcome(Err("Cannot reach the server".to_owned()));
+
+        assert!(
+            matches!(state, ReportState::Failed(reason) if reason == "Cannot reach the server")
+        );
+        assert_eq!(notice, "Report failed: Cannot reach the server");
     }
 }

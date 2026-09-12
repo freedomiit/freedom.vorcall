@@ -14,3 +14,9 @@ dist/
 /releases/
 # Local attachment storage read by the dev server (Vorcall:AttachmentsDir = ../attachments); never committed
 /attachments/
+# Local log output of the dev server (Vorcall:LogsDir = ../logs); never committed
+/logs/
+# Local problem reports uploaded to the dev server (Vorcall:DiagnosticsDir = ../diagnostics); never committed
+/diagnostics/
+# Database dumps written by deploy/backup-db.sh on the host; never committed
+/backups/

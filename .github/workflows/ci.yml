@@ -1,6 +1,6 @@
 name: ci
 
-# Quality gates for visibility only: format, lint and build of both sides.
+# Quality gates for visibility only: format, lint, build and tests of both sides.
 # The deploy workflow does NOT wait for this run (same policy as the rest of
 # the fleet) — a red CI is a signal to fix, not a deploy block.
 
@@ -44,9 +44,28 @@ jobs:
       - name: Build
         run: cargo build
 
+      - name: Test
+        run: cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app -p vorcall-hotkey -p vorcall-screen
+
   server:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The integration suite creates a database of its own per server it boots, on the same
+    # port and credentials docker-compose.yml gives the local one.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: vorcall
+          POSTGRES_PASSWORD: vorcall
+          POSTGRES_DB: vorcall
+        ports:
+          - "5433:5432"
+        options: >-
+          --health-cmd "pg_isready -U vorcall"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
 
@@ -56,3 +75,8 @@ jobs:
 
       - name: Build
         run: dotnet build server/Vorcall.Server.csproj -warnaserror -nologo
+
+      - name: Test
+        run: dotnet test tests/Vorcall.Server.Tests -nologo
+        env:
+          VORCALL_TEST_ADMIN: Host=localhost;Port=5433;Username=vorcall;Password=vorcall;Database=postgres

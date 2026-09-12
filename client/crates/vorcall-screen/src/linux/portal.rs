@@ -25,6 +25,10 @@ pub(super) type Revoked<'a> = Pin<Box<dyn Stream<Item = ()> + 'a>>;
 ///
 /// Dropping this leaves the session open on the portal's side: [`Cast::close`]
 /// is what takes the compositor's "screen is being shared" indicator down.
+///
+/// Drop it, and the [`Revoked`] stream, only from inside the tokio runtime's
+/// context: zbus unsubscribes from D-Bus by spawning a task, and spawning
+/// outside a runtime panics.
 pub(super) struct Cast {
     session: Session<Screencast>,
     pub(super) node_id: u32,

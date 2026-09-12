@@ -123,6 +123,8 @@ objc2-screen-capture-kit = "=0.3.2"
 objc2-core-media = { version = "=0.3.2", features = ["objc2-core-video", "objc2-core-audio-types"] }
 objc2-core-video = "0.3"
 objc2-core-audio-types = "=0.3.2"
+# Owns the block buffer CoreMedia hands out with an audio sample's buffer list (`CFRetained`).
+objc2-core-foundation = "0.3"
 block2 = "0.6"
 dispatch2 = "0.3"
 # PipeWire client for the portal's screencast stream and the sink monitor; links libpipewire-0.3 at build time (pkg-config + bindgen).

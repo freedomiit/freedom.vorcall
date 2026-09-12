@@ -61,6 +61,11 @@ public static class AuthEndpoints
             case LoginStatus.Invalid:
                 return ProtobufBody.Fail(StatusCodes.Status401Unauthorized, "invalid username or password");
 
+            // Only ever reached with the right password, so naming the reason tells the holder
+            // of the account something they are entitled to know.
+            case LoginStatus.Disabled:
+                return ProtobufBody.Fail(StatusCodes.Status403Forbidden, "account disabled");
+
             default:
                 return ProtobufBody.Proto(outcome.Tokens!);
         }

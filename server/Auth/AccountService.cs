@@ -22,6 +22,7 @@ public enum LoginStatus
 {
     Locked,
     Invalid,
+    Disabled,
     LoggedIn,
 }
 
@@ -44,6 +45,8 @@ public readonly record struct RegisterOutcome(RegisterStatus Status, TokenRespon
 public readonly record struct LoginOutcome(LoginStatus Status, TokenResponse? Tokens, int RetryAfterSeconds)
 {
     public static LoginOutcome Invalid { get; } = new(LoginStatus.Invalid, null, 0);
+
+    public static LoginOutcome Disabled { get; } = new(LoginStatus.Disabled, null, 0);
 
     public static LoginOutcome LockedFor(int retryAfterSeconds) => new(LoginStatus.Locked, null, retryAfterSeconds);
 
@@ -91,7 +94,7 @@ public sealed class AccountService(
         await using var transaction = await db.Database.BeginTransactionAsync();
 
         var invite = await db.Invites.AsNoTracking().FirstOrDefaultAsync(i => i.CodeHash == codeHash);
-        if (invite is null || invite.UsedAt is not null || invite.ExpiresAt <= now)
+        if (invite is null || invite.UsedAt is not null || invite.RevokedAt is not null || invite.ExpiresAt <= now)
         {
             return RegisterOutcome.Rejected(RegisterStatus.InviteUnusable);
         }
@@ -121,7 +124,7 @@ public sealed class AccountService(
         // Conditional claim rather than a write on the row we read: another registration may
         // have consumed the invite between the two statements.
         var claimed = await db.Invites
-            .Where(i => i.Id == invite.Id && i.UsedAt == null)
+            .Where(i => i.Id == invite.Id && i.UsedAt == null && i.RevokedAt == null)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(i => i.UsedAt, (DateTime?)now)
                 .SetProperty(i => i.UsedByUserId, (long?)user.Id));
@@ -168,6 +171,13 @@ public sealed class AccountService(
         {
             throttle.RecordFailure(normalized, now);
             return LoginOutcome.Invalid;
+        }
+
+        // After the verification, not before: a banned account has to cost exactly what a live
+        // one does, or the answer time says which names are banned.
+        if (user.DisabledAt is not null)
+        {
+            return LoginOutcome.Disabled;
         }
 
         if (verification == PasswordVerificationResult.SuccessRehashNeeded)

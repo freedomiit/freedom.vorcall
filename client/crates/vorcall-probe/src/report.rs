@@ -30,6 +30,9 @@ pub struct ShareReport {
     pub bytes: u64,
     pub threads: u16,
     pub skipped: u64,
+    /// Datagrams the socket gave up on, retries included; the sharer's half of
+    /// the top-level `send_failures`, read when the share thread finished.
+    pub send_failures: u64,
 }
 
 /// Only under `--watch`: what came back from the sharer.
@@ -135,7 +138,8 @@ impl Report {
         let share = self.share.as_ref().map_or(String::new(), |share| {
             format!(
                 ",\"share\":{{\"frames_encoded\":{},\"keyframes\":{},\"keyframe_requests\":{},\
-\"encode_fps\":{:.2},\"kbps\":{:.1},\"watchers_max\":{},\"bytes\":{},\"threads\":{},\"skipped\":{}}}",
+\"encode_fps\":{:.2},\"kbps\":{:.1},\"watchers_max\":{},\"bytes\":{},\"threads\":{},\"skipped\":{},\
+\"send_failures\":{}}}",
                 share.frames_encoded,
                 share.keyframes,
                 share.keyframe_requests,
@@ -145,6 +149,7 @@ impl Report {
                 share.bytes,
                 share.threads,
                 share.skipped,
+                share.send_failures,
             )
         });
 
@@ -215,7 +220,7 @@ fn millis(value: Option<f64>) -> String {
     }
 }
 
-fn quote(value: &str) -> String {
+pub fn quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for c in value.chars() {

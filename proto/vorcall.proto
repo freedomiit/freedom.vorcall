@@ -343,6 +343,7 @@ enum ErrorCode {
   ERROR_CODE_NOT_SHARING = 15;       // non-fatal: StopShare while not sharing, or WatchShare of someone who is not sharing (yourself included)
   ERROR_CODE_SHARE_LIMIT = 16;       // non-fatal: the room already has the maximum number of sharers
   ERROR_CODE_SHARE_UNAVAILABLE = 17; // non-fatal: sharing is disabled on this server
+  ERROR_CODE_RATE_LIMITED = 18;      // non-fatal: too many write frames from this account; retry after a moment
 }
 
 message Error {

@@ -149,6 +149,14 @@ fn capture(
             return;
         }
     };
+    // Held, named and never dropped early, for everything below: zbus drops a
+    // signal stream or a proxy by spawning the D-Bus unsubscribe onto the
+    // runtime, and a `tokio::spawn` outside a runtime's context panics. A panic
+    // in a destructor while another is unwinding aborts the process, so this
+    // guard is what keeps the end of a share from taking the app with it. It is
+    // declared here so it outlives every zbus value and is dropped just before
+    // the runtime itself.
+    let _context = runtime.enter();
 
     let (cast, remote) = match runtime.block_on(portal::open(&request)) {
         Ok(opened) => opened,
@@ -168,10 +176,18 @@ fn capture(
         ending: Rc::new(Ending::new(events)),
         reports,
     };
-    let revoked = runtime.block_on(cast.revoked());
-    if let Err(err) = capture.run(&cast, remote, revoked, stopped) {
+    let mut revoked = runtime.block_on(cast.revoked());
+    if let Err(err) = capture.run(&cast, remote, &mut revoked, stopped) {
         let _ = reports.send(Err(err));
     }
+
+    // Ordered by hand: the events sender first, so the consumer's stream ends
+    // without waiting on the portal, and then the two values whose `Drop` talks
+    // to D-Bus — the signal stream unsubscribing its match rule, and the
+    // session's proxy unsubscribing in turn as `close` consumes it. Those two
+    // are why the runtime context above is still held here.
+    drop(capture);
+    drop(revoked);
     runtime.block_on(cast.close());
 }
 
@@ -191,7 +207,7 @@ impl Capture<'_> {
         &self,
         cast: &portal::Cast,
         remote: OwnedFd,
-        mut revoked: Option<portal::Revoked<'_>>,
+        revoked: &mut Option<portal::Revoked<'_>>,
         stopped: channel::Receiver<()>,
     ) -> Result<(), Unavailable> {
         pipewire::init();
@@ -227,7 +243,7 @@ impl Capture<'_> {
 
         while !self.ending.done() && !stopping.get() {
             mainloop.loop_().iterate(Timeout::Finite(ITERATION));
-            if self.revoked(&mut revoked) {
+            if self.revoked(revoked) {
                 self.ending
                     .end("the screen share was stopped from the desktop".to_string());
             }
