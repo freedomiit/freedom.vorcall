@@ -56,3 +56,6 @@ jobs:
 
       - name: Build
         run: dotnet build server/Vorcall.Server.csproj -warnaserror -nologo
+
+      - name: Test
+        run: dotnet test tests/Vorcall.Server.Tests -nologo

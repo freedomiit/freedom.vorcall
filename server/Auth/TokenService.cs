@@ -66,6 +66,18 @@ public sealed class TokenService(
         return plaintext;
     }
 
+    // The account a presented refresh token belongs to, without rotating, revoking or otherwise
+    // touching the row. Null when no row carries that token, expired and revoked rows included:
+    // the caller is deciding about the account, not about the token's usability.
+    public Task<long?> FindUserIdAsync(AppDbContext db, string plaintext)
+    {
+        var hash = Credentials.Sha256Hex(plaintext);
+        return db.RefreshTokens
+            .Where(t => t.TokenHash == hash)
+            .Select(t => (long?)t.UserId)
+            .FirstOrDefaultAsync();
+    }
+
     public async Task<RefreshOutcome> RefreshAsync(string plaintext, DateTime now)
     {
         var hash = Credentials.Sha256Hex(plaintext);

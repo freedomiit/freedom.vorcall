@@ -16,8 +16,16 @@ public sealed record AttachmentsOptions
 
     public const int MaxPerMessage = 4;
 
-    // An upload nothing linked to a message within this is swept, file and row together.
+    // Enough for the longest magic number the four accepted types use (RIFF....WEBP).
+    public const int MagicLength = 12;
+
+    // An upload nothing linked to a message within this is swept, file and row together; the same
+    // age makes an unreferenced image sweepable.
     public static readonly TimeSpan UnlinkedTtl = TimeSpan.FromHours(1);
+
+    private static ReadOnlySpan<byte> PngMagic => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    private static ReadOnlySpan<byte> JpegMagic => [0xFF, 0xD8, 0xFF];
 
     private AttachmentsOptions(string dir, long maxBytes)
     {
@@ -51,6 +59,18 @@ public sealed record AttachmentsOptions
 
         return ext.Length > 0;
     }
+
+    // The first bytes every accepted type must start with, checked while the body streams in so a
+    // renamed file is refused rather than stored. Shared by both stores: the attachments and the
+    // images accept exactly the same four types.
+    public static bool MatchesMagic(string contentType, ReadOnlySpan<byte> header) => contentType switch
+    {
+        "image/png" => header.StartsWith(PngMagic),
+        "image/jpeg" => header.StartsWith(JpegMagic),
+        "image/gif" => header.StartsWith("GIF87a"u8) || header.StartsWith("GIF89a"u8),
+        "image/webp" => header.StartsWith("RIFF"u8) && header[8..12].SequenceEqual("WEBP"u8),
+        _ => false,
+    };
 
     private static long ParseMaxBytes(string? configured)
     {

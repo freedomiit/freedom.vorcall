@@ -8,8 +8,9 @@ namespace Vorcall.Server.Voice;
 
 // One voice membership: the key handed to the client in VoiceReady, the cipher built from it,
 // and the per-sender state the relay keeps. Replay, Bucket and ShareBucket belong to the receive
-// loop and are touched from nowhere else; the address, the speaking flag and the share state
-// cross threads. The share state is only ever written under the relay's gate.
+// loop and are touched from nowhere else; the address, the speaking flag, the share state and the
+// moderation flags cross threads. The share state and the moderation flags are only ever written
+// under the relay's gate.
 public sealed class VoiceSession : IDisposable
 {
     public const int KeyBytes = 32;
@@ -32,16 +33,19 @@ public sealed class VoiceSession : IDisposable
     private int _speaking;
     private bool _sharing;
     private bool _shareAudio;
+    private bool _muted;
+    private bool _deafened;
+    private bool _priority;
     private ImmutableArray<VoiceSession> _watchers = [];
     private VoiceSession? _watching;
     private Channel<Outbound> _shareQueue;
     private long _queueDrops;
 
-    internal VoiceSession(uint ssrc, long userId, string roomId, byte[] key, int shareMaxKbps)
+    internal VoiceSession(uint ssrc, long userId, long channelId, byte[] key, int shareMaxKbps)
     {
         Ssrc = ssrc;
         UserId = userId;
-        RoomId = roomId;
+        ChannelId = channelId;
         Key = key;
         Cipher = new ChaCha20Poly1305(key);
         _shareQueue = CreateShareQueue();
@@ -54,7 +58,7 @@ public sealed class VoiceSession : IDisposable
 
     public long UserId { get; }
 
-    public string RoomId { get; }
+    public long ChannelId { get; }
 
     public byte[] Key { get; }
 
@@ -82,6 +86,28 @@ public sealed class VoiceSession : IDisposable
         internal set => Volatile.Write(ref _shareAudio, value);
     }
 
+    // Server mute: the relay drops this session's audio before it is forwarded or counted as
+    // speaking. Server deafen: the session is skipped as a recipient of everyone else's media.
+    public bool Muted
+    {
+        get => Volatile.Read(ref _muted);
+        internal set => Volatile.Write(ref _muted, value);
+    }
+
+    public bool Deafened
+    {
+        get => Volatile.Read(ref _deafened);
+        internal set => Volatile.Write(ref _deafened, value);
+    }
+
+    // Carried, never acted on: the signalling side mirrors it into VoiceMember.priority instead of
+    // keeping a second store of its own.
+    public bool Priority
+    {
+        get => Volatile.Read(ref _priority);
+        internal set => Volatile.Write(ref _priority, value);
+    }
+
     // The sessions this share is forwarded to. Replaced under the relay's gate, never mutated,
     // and read as a snapshot by the sender worker: the interlocked write publishes the array, and
     // the worker reads the field again for every datagram it dequeues.
@@ -103,7 +129,7 @@ public sealed class VoiceSession : IDisposable
     internal ChannelWriter<Outbound> ShareWriter => Volatile.Read(ref _shareQueue).Writer;
 
     // Frames this session's queue evicted because the worker could not keep up. Cumulative over
-    // the session, across however many shares it ran, and reported with the room's other drops.
+    // the session, across however many shares it ran, and reported with the channel's other drops.
     internal long QueueDrops => Interlocked.Read(ref _queueDrops);
 
     internal bool IsSpeaking => Volatile.Read(ref _speaking) != 0;

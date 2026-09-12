@@ -954,7 +954,159 @@ def rust_module():
            ""]
     return "\n".join(out)
 
+# ----------------------------------------------------------------------------
+# --- icons ---
+# The UI icon set: one grid, one stroke weight, no colour of its own. The client
+# embeds these and tints them through iced's `svg::Style { color }`, so every
+# shape is stroked with `currentColor` and nothing is filled but a few dots.
+# Run:  python3 assets/brand/gen.py icons assets/icons      (no shapely needed)
+# ----------------------------------------------------------------------------
+
+ICON_HEAD = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+             'stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">')
+ICON_SLASH = "M4 4 L20 20"      # the bar across every "off" variant
+
+
+def inum(v):
+    """At most one decimal, no trailing zero, no negative zero."""
+    s = f"{v:.1f}"
+    if s.endswith(".0"):
+        s = s[:-2]
+    return "0" if s == "-0" else s
+
+
+def iring(cx, cy, r):
+    """A stroked circle, as two half arcs."""
+    return (f"M{inum(cx - r)} {inum(cy)} a{inum(r)} {inum(r)} 0 1 0 {inum(2 * r)} 0 "
+            f"a{inum(r)} {inum(r)} 0 1 0 {inum(-2 * r)} 0")
+
+
+def idisc(cx, cy, r):
+    """A filled dot: the one element that carries a fill, marked for the writer."""
+    return ("fill", iring(cx, cy, r))
+
+
+def irect(x0, y0, x1, y1, r):
+    return (f"M{inum(x0 + r)} {inum(y0)} H{inum(x1 - r)} A{inum(r)} {inum(r)} 0 0 1 {inum(x1)} {inum(y0 + r)} "
+            f"V{inum(y1 - r)} A{inum(r)} {inum(r)} 0 0 1 {inum(x1 - r)} {inum(y1)} H{inum(x0 + r)} "
+            f"A{inum(r)} {inum(r)} 0 0 1 {inum(x0)} {inum(y1 - r)} V{inum(y0 + r)} "
+            f"A{inum(r)} {inum(r)} 0 0 1 {inum(x0 + r)} {inum(y0)} Z")
+
+
+def ipoly(pts, close=True):
+    return "M" + " L".join(f"{inum(x)} {inum(y)}" for x, y in pts) + (" Z" if close else "")
+
+
+def igear(cx=12, cy=12, r_in=2.8, r_body=7.2, r_tooth=9.2, teeth=8):
+    """Hub, body ring and the teeth as radial stubs: a cog that still reads at 16 px."""
+    out = [iring(cx, cy, r_in), iring(cx, cy, r_body)]
+    for k in range(teeth):
+        a = 2 * math.pi * k / teeth
+        out.append(f"M{inum(cx + r_body * math.cos(a))} {inum(cy + r_body * math.sin(a))} "
+                   f"L{inum(cx + r_tooth * math.cos(a))} {inum(cy + r_tooth * math.sin(a))}")
+    return out
+
+
+def istar(cx=12, cy=12.4, r_out=9, r_in=3.9, points=5):
+    pts = []
+    for k in range(2 * points):
+        a = -math.pi / 2 + math.pi * k / points
+        r = r_out if k % 2 == 0 else r_in
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return ipoly(pts)
+
+
+SPEAKER_CONE = "M4 10 H8 L13 6 V18 L8 14 H4 Z"
+MIC_BODY = ["M9 6 a3 3 0 0 1 6 0 V11 a3 3 0 0 1 -6 0 Z", "M5 11 a7 7 0 0 0 14 0", "M12 18 V21"]
+HEADPHONES = ["M4 14 a8 8 0 0 1 16 0", "M4 14 V18.5 a1.5 1.5 0 0 0 3 0 V14",
+              "M17 14 V18.5 a1.5 1.5 0 0 0 3 0 V14"]
+SCREEN = [irect(3, 5, 21, 17, 2), "M12 17 V21", "M8 21 H16"]
+BELL = ["M6 17 V11 a6 6 0 0 1 12 0 V17", "M4.5 17 H19.5", "M10.5 19.5 a1.5 1.5 0 0 0 3 0"]
+
+ICONS = {
+    "hash": ["M5 9.5 H19", "M5 14.5 H19", "M10.5 4 L9 20", "M16 4 L14.5 20"],
+    "speaker": [SPEAKER_CONE, "M16.5 9 a4.5 4.5 0 0 1 0 6"],
+    "speaker_off": [SPEAKER_CONE, "M16 9.5 L21 14.5", "M21 9.5 L16 14.5"],
+    "mic": MIC_BODY,
+    "mic_off": MIC_BODY + [ICON_SLASH],
+    "headphones": HEADPHONES,
+    "headphones_off": HEADPHONES + [ICON_SLASH],
+    "screen": SCREEN,
+    "screen_off": SCREEN + [ICON_SLASH],
+    "chevron_down": ["M6 9 L12 15 L18 9"],
+    "chevron_right": ["M9 6 L15 12 L9 18"],
+    "plus": ["M12 5 V19", "M5 12 H19"],
+    "gear": igear(),
+    "bell": BELL,
+    "bell_off": BELL + [ICON_SLASH],
+    "users": [iring(9.5, 8, 3.4), "M3 20.5 a6.5 6.5 0 0 1 13 0",
+              iring(17.6, 9, 2.6), "M16.6 14.8 a5.2 5.2 0 0 1 4.4 5.7"],
+    "user": [iring(12, 8, 4), "M4 20.5 a8 6 0 0 1 16 0"],
+    "search": [iring(11, 11, 6), "M15.5 15.5 L20 20"],
+    "reply": ["M9 14 L4 9 L9 4", "M4 9 H13 a7 7 0 0 1 7 7 V19"],
+    "edit": ["M4 20 V16 L16 4 L20 8 L8 20 Z", "M13 7 L17 11"],
+    "trash": ["M4 7 H20", "M9 7 V4 H15 V7", "M6 7 l1 13 h10 l1 -13", "M10 11 V17", "M14 11 V17"],
+    "smile": [iring(12, 12, 9), "M8 14 a5 4 0 0 0 8 0", "M9 9.5 V10.5", "M15 9.5 V10.5"],
+    "paperclip": ["M21 12 l-8.5 8.5 a5 5 0 0 1 -7 -7 L14 5 a3.5 3.5 0 0 1 5 5 "
+                  "l-8.5 8.5 a2 2 0 0 1 -3 -3 L15 8"],
+    "close": ["M6 6 L18 18", "M18 6 L6 18"],
+    "check": ["M5 12 L9 16 L19 6"],
+    "dots": [idisc(6, 12, 1.25), idisc(12, 12, 1.25), idisc(18, 12, 1.25)],
+    "shield": ["M12 3 L19 6 V12 c0 4.5 -3 7.5 -7 9 c-4 -1.5 -7 -4.5 -7 -9 V6 Z"],
+    "crown": ["M4 17 L5 8 L9 12 L12 6 L15 12 L19 8 L20 17 Z"],
+    "pin": ["M10 10 H4 V20 H14 V14", "M12 12 L20 4", "M14 4 H20 V10"],
+    "expand": ["M4 9 V4 H9", "M20 15 V20 H15", "M5.5 5.5 L18.5 18.5"],
+    "link": ["M10 16.5 H8.5 a4.5 4.5 0 0 1 0 -9 H10", "M14 7.5 H15.5 a4.5 4.5 0 0 1 0 9 H14",
+             "M8.5 12 H15.5"],
+    "ban": [iring(12, 12, 9), "M5.6 5.6 L18.4 18.4"],
+    "boot": ["M4 3 H14 V21 H4 Z", "M14 12 H21", "M18 9 L21 12 L18 15"],
+    "move": ["M12 5 V19", "M5 12 H19", "M9.5 7.5 L12 5 L14.5 7.5", "M9.5 16.5 L12 19 L14.5 16.5",
+             "M7.5 9.5 L5 12 L7.5 14.5", "M16.5 9.5 L19 12 L16.5 14.5"],
+    "star": [istar()],
+    "drag": [idisc(9, 6, 1.1), idisc(15, 6, 1.1), idisc(9, 12, 1.1),
+             idisc(15, 12, 1.1), idisc(9, 18, 1.1), idisc(15, 18, 1.1)],
+    "arrow_up": ["M12 19 V5", "M6 11 L12 5 L18 11"],
+    "arrow_down": ["M12 5 V19", "M6 13 L12 19 L18 13"],
+    "image": [irect(3, 4, 21, 20, 2.5), iring(9, 10, 1.5), "M21 16 L16 11 L8 20"],
+    "palette": [iring(12, 12, 8.5), idisc(9, 9.5, 1.2), idisc(13, 8, 1.2),
+                idisc(16.2, 11.5, 1.2), idisc(14.5, 15.8, 1.2)],
+    "keyboard": [irect(3, 6, 21, 18, 2.5), "M6 10.5 H7", "M9.5 10.5 H10.5", "M13 10.5 H14",
+                 "M16.5 10.5 H17.5", "M8 14.5 H16"],
+    "logout": ["M12 3 H4 V21 H12", "M10 12 H20", "M17 9 L20 12 L17 15"],
+    "info": [iring(12, 12, 9), idisc(12, 8, 1.05), "M12 11 V16"],
+    "warning": ["M12 3.5 L21 19.5 H3 Z", "M12 9 V13.5", idisc(12, 16.8, 1.05)],
+}
+
+
+def icon_file(parts):
+    """One icon: stroked path commands, plus any filled dot marked by `idisc`."""
+    body = "".join(f'<path fill="currentColor" stroke="none" d="{p[1]}"/>' if isinstance(p, tuple)
+                   else f'<path d="{p}"/>' for p in parts)
+    return f"{ICON_HEAD}{body}</svg>\n"
+
+
+def write_icons(outdir):
+    assert len(ICONS) == 44, len(ICONS)
+    os.makedirs(outdir, exist_ok=True)
+    written = []
+    for name, parts in ICONS.items():
+        assert name == name.lower() and name.replace("_", "").isalnum(), name
+        text = icon_file(parts)
+        assert len(text) <= 1024, (name, len(text))
+        with open(os.path.join(outdir, f"{name}.svg"), "w") as fh:
+            fh.write(text)
+        written.append((name, len(text)))
+    return written
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["icons"]:
+        if len(sys.argv) < 3:
+            sys.exit("usage: gen.py icons <outdir>")
+        for name, size in write_icons(sys.argv[2]):
+            print(f"{name}.svg {size}")
+        print("wrote", len(ICONS), "icons to", sys.argv[2])
+        sys.exit(0)
     outdir = sys.argv[1] if len(sys.argv) > 1 else "."
     os.makedirs(outdir, exist_ok=True)
     for name, fn in (("mark", mark_svg), ("icon", icon_svg), ("intro", intro_svg),

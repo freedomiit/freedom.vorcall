@@ -1,6 +1,7 @@
 using System.Globalization;
 using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
+using Vorcall.Server.Permissions;
 
 namespace Vorcall.Server.Api;
 
@@ -10,18 +11,21 @@ public static class MessagesEndpoints
     private const int MinLimit = 1;
     private const int MaxLimit = 100;
 
-    // GET /api/messages?room=&limit=&before= -> MessagePage as application/x-protobuf.
+    // The query parameter a 400 names, so a client can point at the field that was wrong.
+    private const string ChannelField = "channel";
+
+    // GET /api/messages?channel=&limit=&before= -> MessagePage as application/x-protobuf.
     public static async Task<IResult> GetPageAsync(
-        string? room,
+        string? channel,
         string? limit,
         string? before,
         HttpContext context,
         ConnectionRegistry registry,
         MessageService messages)
     {
-        if (!Validation.TryNormalizeRoomId(room, out var roomId))
+        if (!Validation.TryParseChannelId(channel, out var channelId))
         {
-            return Results.BadRequest();
+            return ProtobufBody.Fail(StatusCodes.Status400BadRequest, ChannelField);
         }
 
         // The token validated, so a missing claim is this server's own bug.
@@ -30,11 +34,18 @@ public static class MessagesEndpoints
             return ProtobufBody.Fail(StatusCodes.Status401Unauthorized, "invalid bearer");
         }
 
-        // A room the caller is not in and a room that does not exist answer alike: the reader
-        // learns nothing about rooms it was never told about.
-        if (!registry.IsMember(roomId, userId))
+        // A channel the caller may not view and a channel that does not exist answer alike: the
+        // reader learns nothing about channels it was never told about.
+        if (registry.ChannelOf(channelId) is not { } info || !registry.CanView(userId, channelId))
         {
-            return ProtobufBody.Fail(StatusCodes.Status403Forbidden, "not a member");
+            return ProtobufBody.Fail(StatusCodes.Status403Forbidden, PermNames.Name(Perm.ViewChannel));
+        }
+
+        // A voice channel holds no messages at all, so asking for its history is a malformed
+        // request rather than one this caller is not allowed to make.
+        if (info.Kind == Data.ChannelKind.Voice)
+        {
+            return ProtobufBody.Fail(StatusCodes.Status400BadRequest, ChannelField);
         }
 
         var pageSize = DefaultLimit;
@@ -59,7 +70,7 @@ public static class MessagesEndpoints
             exclusiveUpperBound = parsedBefore;
         }
 
-        var page = await messages.GetPageAsync(roomId, pageSize, exclusiveUpperBound);
+        var page = await messages.GetPageAsync(channelId, pageSize, exclusiveUpperBound);
         return ProtobufBody.Proto(page);
     }
 }

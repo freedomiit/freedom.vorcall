@@ -5,7 +5,6 @@
 //! change also needs a bearer. Nothing here logs a body: they all hold secrets.
 
 use prost::Message as _;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use vorcall_proto::v1::{
     ChangePasswordRequest, LoginRequest, LogoutRequest, RefreshRequest, RegisterRequest,
     TokenResponse,
@@ -14,8 +13,6 @@ use vorcall_proto::v1::{
 use crate::endpoints::Endpoints;
 use crate::http::{self, ApiFailure};
 use crate::session::{self, Session};
-
-const PROTOBUF: &str = "application/x-protobuf";
 
 /// Registration signs the user in: the 201 carries the same tokens a login does.
 pub async fn register(
@@ -29,7 +26,7 @@ pub async fn register(
         password: password.to_owned(),
         invite_code: invite_code.to_owned(),
     };
-    tokens(endpoints, "/api/auth/register", body.encode_to_vec()).await
+    tokens(endpoints, "/api/auth/register", &body).await
 }
 
 pub async fn login(
@@ -41,7 +38,7 @@ pub async fn login(
         username: username.to_owned(),
         password: password.to_owned(),
     };
-    tokens(endpoints, "/api/auth/login", body.encode_to_vec()).await
+    tokens(endpoints, "/api/auth/login", &body).await
 }
 
 /// Rotates the pair: the presented refresh token is spent, whatever the answer.
@@ -49,7 +46,7 @@ pub async fn refresh(endpoints: &Endpoints, refresh_token: &str) -> Result<Sessi
     let body = RefreshRequest {
         refresh_token: refresh_token.to_owned(),
     };
-    tokens(endpoints, "/api/auth/refresh", body.encode_to_vec()).await
+    tokens(endpoints, "/api/auth/refresh", &body).await
 }
 
 /// Best effort: the server answers 204 whatever it finds, and a session the
@@ -59,15 +56,16 @@ pub async fn logout(endpoints: &Endpoints, refresh_token: &str) -> Result<(), Ap
     let body = LogoutRequest {
         refresh_token: refresh_token.to_owned(),
     };
-    let response = post(endpoints, "/api/auth/logout", body.encode_to_vec(), None).await?;
+    let url = http::api_url(endpoints, "/api/auth/logout")?;
 
-    if !response.status().is_success() {
-        tracing::warn!(
-            status = response.status().as_u16(),
-            "logout was refused; dropping the session anyway"
-        );
+    match http::post_proto(endpoints, None, url, &body).await {
+        Ok(_) => Ok(()),
+        Err(failure @ ApiFailure::Transport(_)) => Err(failure),
+        Err(failure) => {
+            tracing::warn!(%failure, "logout was refused; dropping the session anyway");
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Keeps the caller's own refresh token alive; the server revokes every other
@@ -83,60 +81,21 @@ pub async fn change_password(
         new_password: new.to_owned(),
         refresh_token: session.refresh_token.clone(),
     };
-    let response = post(
-        endpoints,
-        "/api/auth/password",
-        body.encode_to_vec(),
-        Some(&session.access_token),
-    )
-    .await?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(http::failure_from(response).await)
-    }
+    let url = http::api_url(endpoints, "/api/auth/password")?;
+    http::post_proto(endpoints, Some(&session.access_token), url, &body).await?;
+    Ok(())
 }
 
 /// The three endpoints that answer with a `TokenResponse`.
-async fn tokens(endpoints: &Endpoints, path: &str, body: Vec<u8>) -> Result<Session, ApiFailure> {
-    let response = post(endpoints, path, body, None).await?;
-
-    if !response.status().is_success() {
-        return Err(http::failure_from(response).await);
-    }
-
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| ApiFailure::Transport(e.to_string()))?;
-    let tokens = TokenResponse::decode(body).map_err(|e| ApiFailure::Malformed(e.to_string()))?;
-
-    Ok(Session::from_response(tokens, session::now_unix()))
-}
-
-async fn post(
+async fn tokens<M: prost::Message>(
     endpoints: &Endpoints,
     path: &str,
-    body: Vec<u8>,
-    access_token: Option<&str>,
-) -> Result<reqwest::Response, ApiFailure> {
-    let url = endpoints
-        .http_base
-        .join(path)
-        .map_err(|e| ApiFailure::Malformed(e.to_string()))?;
+    body: &M,
+) -> Result<Session, ApiFailure> {
+    let url = http::api_url(endpoints, path)?;
+    let response = http::post_proto(endpoints, None, url, body).await?;
+    let tokens =
+        TokenResponse::decode(response).map_err(|e| ApiFailure::Malformed(e.to_string()))?;
 
-    let mut request = http::client()?
-        .post(url)
-        .header(http::KEY_HEADER, &endpoints.key)
-        .header(CONTENT_TYPE, PROTOBUF)
-        .body(body);
-    if let Some(access_token) = access_token {
-        request = request.header(AUTHORIZATION, http::bearer(access_token));
-    }
-
-    request
-        .send()
-        .await
-        .map_err(|e| ApiFailure::Transport(e.to_string()))
+    Ok(Session::from_response(tokens, session::now_unix()))
 }

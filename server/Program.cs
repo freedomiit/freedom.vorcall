@@ -27,9 +27,13 @@ using (var scope = app.Services.CreateScope())
     db.Database.Migrate();
 }
 
-// Presence is served from an in-memory mirror of the room tables, so it is filled from the
-// migrated schema before the first connection can ask about a room.
-await app.Services.GetRequiredService<ConnectionRegistry>().LoadRoomsAsync();
+// The server row, its @everyone role and its general channel are what everything else resolves
+// against, so a database that has never been seeded is seeded here, before the mirror reads it.
+await app.Services.GetRequiredService<ServerDirectory>().EnsureSeededAsync(CancellationToken.None);
+
+// Presence and permissions are served from an in-memory mirror of the server tables, so it is
+// filled from the migrated schema before the first connection can ask about a channel.
+await app.Services.GetRequiredService<ConnectionRegistry>().LoadAsync(CancellationToken.None);
 
 // nginx is the only thing that can reach this port: docker publishes it on host loopback. That
 // is why the known-proxy list stays empty (which skips the check entirely) and why trusting the
@@ -72,7 +76,7 @@ app.MapGet("/health", async (IDbContextFactory<AppDbContext> contextFactory, ILo
     }
 });
 
-app.MapGet("/ws", async (HttpContext context, ChatSocketHandler handler) =>
+app.MapGet("/ws", async (HttpContext context, ChatSocketHandler handler, MemberDirectory members) =>
 {
     if (!context.WebSockets.IsWebSocketRequest)
     {
@@ -95,6 +99,15 @@ app.MapGet("/ws", async (HttpContext context, ChatSocketHandler handler) =>
         return;
     }
 
+    // An access token outlives the ban that revoked the account's refresh tokens, so the upgrade is
+    // where a banned account is turned away. PROTOCOL.md § Moderation: a bare 403, which is how the
+    // client tells this apart from the two gates above.
+    if (await members.IsBannedAsync(userId, context.RequestAborted))
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        return;
+    }
+
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
     await handler.HandleAsync(socket, userId, username, context.RequestAborted);
 }).RequireAuthorization();
@@ -104,6 +117,9 @@ UsersEndpoints.Map(app);
 AuthEndpoints.Map(app);
 UpdatesEndpoints.Map(app);
 AttachmentsEndpoints.Map(app);
+ImagesEndpoints.Map(app);
+InvitesEndpoints.Map(app);
+BansEndpoints.Map(app);
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {

@@ -2,7 +2,6 @@ using System.Security.Cryptography;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
-using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
 using Vorcall.Server.Protocol;
 
@@ -22,7 +21,18 @@ public enum LoginStatus
 {
     Locked,
     Invalid,
+
+    // The credentials were right and the account is banned: 403, not 401.
+    Banned,
     LoggedIn,
+}
+
+// Rotated is the only status that carries tokens; Banned is the ban gate on the refresh path.
+public enum AccountRefreshStatus
+{
+    Invalid,
+    Banned,
+    Rotated,
 }
 
 public enum ChangePasswordOutcome
@@ -45,9 +55,21 @@ public readonly record struct LoginOutcome(LoginStatus Status, TokenResponse? To
 {
     public static LoginOutcome Invalid { get; } = new(LoginStatus.Invalid, null, 0);
 
+    public static LoginOutcome Banned { get; } = new(LoginStatus.Banned, null, 0);
+
     public static LoginOutcome LockedFor(int retryAfterSeconds) => new(LoginStatus.Locked, null, retryAfterSeconds);
 
     public static LoginOutcome LoggedIn(TokenResponse tokens) => new(LoginStatus.LoggedIn, tokens, 0);
+}
+
+// Tokens is set only when Status is Rotated.
+public readonly record struct AccountRefreshOutcome(AccountRefreshStatus Status, TokenResponse? Tokens)
+{
+    public static AccountRefreshOutcome Invalid { get; } = new(AccountRefreshStatus.Invalid, null);
+
+    public static AccountRefreshOutcome Banned { get; } = new(AccountRefreshStatus.Banned, null);
+
+    public static AccountRefreshOutcome Rotated(TokenResponse tokens) => new(AccountRefreshStatus.Rotated, tokens);
 }
 
 public sealed class AccountService(
@@ -55,7 +77,6 @@ public sealed class AccountService(
     IPasswordHasher<User> hasher,
     TokenService tokens,
     LoginThrottle throttle,
-    RoomDirectory rooms,
     ILogger<AccountService> logger)
 {
     private static readonly User HashingSubject = new();
@@ -114,9 +135,10 @@ public sealed class AccountService(
             return RegisterOutcome.Rejected(RegisterStatus.UsernameTaken);
         }
 
-        // Inside the same transaction as the user row: an account that exists is always a member
-        // of general, which is the one room nobody may leave.
-        await rooms.EnsureGeneralMembershipAsync(db, user.Id);
+        // Inside the same transaction as the user row: an account that exists has a read cursor in
+        // every text channel, set to what was newest when it registered, so a new account starts
+        // read rather than owed every message it missed.
+        await Seed.EnsureReadRowsAsync(db, user.Id, CancellationToken.None);
 
         // Conditional claim rather than a write on the row we read: another registration may
         // have consumed the invite between the two statements.
@@ -176,23 +198,55 @@ public sealed class AccountService(
         }
 
         throttle.RecordSuccess(normalized);
+
+        // The credentials were right, so the throttle counts a success either way; a banned
+        // account simply gets no tokens for them.
+        if (await db.Bans.AnyAsync(b => b.UserId == user.Id))
+        {
+            return LoginOutcome.Banned;
+        }
+
         var refreshToken = tokens.IssueRefreshToken(db, user.Id, Guid.NewGuid(), now);
         await db.SaveChangesAsync();
         return LoginOutcome.LoggedIn(BuildTokens(user, refreshToken, now));
     }
 
-    // Null covers every failure: an unknown, expired, revoked or replayed token all answer 401.
-    public async Task<TokenResponse?> RefreshAsync(string? plaintext, DateTime now)
+    // Invalid covers every token failure: an unknown, expired, revoked or replayed token all
+    // answer 401. Banned is the account gate, which answers 403 instead.
+    public async Task<AccountRefreshOutcome> RefreshAsync(string? plaintext, DateTime now)
     {
         if (string.IsNullOrEmpty(plaintext))
         {
-            return null;
+            return AccountRefreshOutcome.Invalid;
+        }
+
+        await using var db = await contextFactory.CreateDbContextAsync();
+
+        // The ban is checked before the rotation, from the account the token row names, because
+        // banning revokes every refresh token the account has: a banned client therefore always
+        // presents a revoked token, which rotation reads as family reuse and reports as Invalid,
+        // so a check after it would never see the ban. The lookup spends nothing and a token no
+        // row carries falls through to Invalid below, so this tells a caller nothing it could not
+        // already learn.
+        if (await tokens.FindUserIdAsync(db, plaintext) is { } bearerId
+            && await db.Bans.AnyAsync(b => b.UserId == bearerId))
+        {
+            return AccountRefreshOutcome.Banned;
         }
 
         var outcome = await tokens.RefreshAsync(plaintext, now);
-        return outcome is { Status: RefreshStatus.Rotated, User: { } user, RefreshToken: { } refreshToken }
-            ? BuildTokens(user, refreshToken, now)
-            : null;
+        if (outcome is not { Status: RefreshStatus.Rotated, User: { } user, RefreshToken: { } refreshToken })
+        {
+            return AccountRefreshOutcome.Invalid;
+        }
+
+        // Again afterwards, in case a ban landed while the rotation was in flight.
+        if (await db.Bans.AnyAsync(b => b.UserId == user.Id))
+        {
+            return AccountRefreshOutcome.Banned;
+        }
+
+        return AccountRefreshOutcome.Rotated(BuildTokens(user, refreshToken, now));
     }
 
     public Task LogoutAsync(string? plaintext, DateTime now)
@@ -246,20 +300,6 @@ public sealed class AccountService(
         await tokens.RevokeAllAsync(db, userId, keepTokenId, now);
         logger.LogInformation("User {UserId} changed password; other sessions revoked", userId);
         return ChangePasswordOutcome.Changed;
-    }
-
-    public async Task<UserList> ListUsersAsync()
-    {
-        await using var db = await contextFactory.CreateDbContextAsync();
-        var users = await db.Users
-            .AsNoTracking()
-            .OrderBy(u => u.UsernameNormalized)
-            .Select(u => new { u.Id, u.Username })
-            .ToListAsync();
-
-        var list = new UserList();
-        list.Users.AddRange(users.Select(u => new Member { UserId = u.Id, Username = u.Username }));
-        return list;
     }
 
     private TokenResponse BuildTokens(User user, string refreshToken, DateTime now) => new()

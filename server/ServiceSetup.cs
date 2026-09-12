@@ -60,13 +60,19 @@ public static class ServiceSetup
         builder.Services.AddSingleton(attachments);
         builder.Services.AddSingleton<UpdateManifestStore>();
         builder.Services.AddSingleton<AttachmentStore>();
+        builder.Services.AddSingleton<ImageStore>();
         builder.Services.AddHostedService<AttachmentSweeper>();
 
         // One instance in both roles: the registry signals over the very relay the host runs.
         builder.Services.AddSingleton<VoiceRelay>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<VoiceRelay>());
         builder.Services.AddSingleton<ConnectionRegistry>();
-        builder.Services.AddSingleton<RoomDirectory>();
+
+        // The registry's mirror is built from these four and written back through them.
+        builder.Services.AddSingleton<ServerDirectory>();
+        builder.Services.AddSingleton<ChannelDirectory>();
+        builder.Services.AddSingleton<RoleDirectory>();
+        builder.Services.AddSingleton<MemberDirectory>();
         builder.Services.AddSingleton<MessageService>();
         builder.Services.AddSingleton<ChatSocketHandler>();
         builder.Services.AddSingleton<IPasswordHasher<User>>(
@@ -74,6 +80,7 @@ public static class ServiceSetup
         builder.Services.AddSingleton<TokenService>();
         builder.Services.AddSingleton<LoginThrottle>();
         builder.Services.AddSingleton<AccountService>();
+        builder.Services.AddSingleton<InviteService>();
 
         builder.Services
             .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)

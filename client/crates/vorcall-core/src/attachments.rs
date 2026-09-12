@@ -52,20 +52,21 @@ pub fn extension(content_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Uploads the raw bytes to `room_id`, answering with the stored attachment.
+/// Uploads the raw bytes to `channel_id`, answering with the stored attachment.
+///
+/// The body is the bytes themselves rather than protobuf, so this builds its own
+/// request instead of going through [`http::post_proto`].
 pub async fn upload(
     endpoints: &Endpoints,
     access_token: &str,
-    room_id: &str,
+    channel_id: i64,
     file_name: &str,
-    content_type: &str,
+    content_type: &'static str,
     bytes: Blob,
 ) -> Result<Attachment, ApiFailure> {
-    let mut url = endpoints
-        .http_base
-        .join("/api/attachments")
-        .map_err(|e| ApiFailure::Malformed(e.to_string()))?;
-    url.query_pairs_mut().append_pair("room", room_id);
+    let mut url = http::api_url(endpoints, "/api/attachments")?;
+    url.query_pairs_mut()
+        .append_pair("channel", &channel_id.to_string());
 
     let mut request = http::client()?
         .post(url)
@@ -104,10 +105,7 @@ pub async fn download(
     access_token: &str,
     id: i64,
 ) -> Result<Vec<u8>, ApiFailure> {
-    let url = endpoints
-        .http_base
-        .join(&format!("/api/attachments/{id}"))
-        .map_err(|e| ApiFailure::Malformed(e.to_string()))?;
+    let url = http::api_url(endpoints, &format!("/api/attachments/{id}"))?;
 
     // An 8 MiB image does not fit the shared client's total timeout.
     let response = http::download_client()?

@@ -1,16 +1,27 @@
 //! The HTTP half of the protocol: the one reqwest client every REST call shares,
-//! the TLS setup it must agree on with tokio-tungstenite, and how a non-success
-//! response is turned into an [`ApiFailure`] the connection loop can act on.
+//! the TLS setup it must agree on with tokio-tungstenite, the three verbs every
+//! REST module goes through, and how a non-success response is turned into an
+//! [`ApiFailure`] the connection loop can act on.
+//!
+//! Nothing here logs a body, a token or a URL's query: the bodies carry
+//! passwords, invite codes and image bytes.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use bytes::Bytes;
 use prost::Message as _;
-use reqwest::header::{HeaderMap, RETRY_AFTER, WWW_AUTHENTICATE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, RETRY_AFTER, WWW_AUTHENTICATE};
+use url::Url;
 use vorcall_proto::v1::ApiError;
+
+use crate::endpoints::Endpoints;
 
 /// The header carrying the pre-shared door key on every request.
 pub const KEY_HEADER: &str = "X-Vorcall-Key";
+
+/// What every protobuf request body declares.
+const PROTOBUF: &str = "application/x-protobuf";
 
 /// `PROTOCOL.md` promises `Retry-After` on every 429; a proxy that drops it
 /// must not turn into a retry storm.
@@ -86,6 +97,77 @@ pub fn download_client() -> Result<&'static reqwest::Client, ApiFailure> {
 
 pub fn bearer(access_token: &str) -> String {
     format!("Bearer {access_token}")
+}
+
+/// `path` resolved against the configured base. A failure here can only be a
+/// caller passing something that is not a path at all.
+pub fn api_url(endpoints: &Endpoints, path: &str) -> Result<Url, ApiFailure> {
+    endpoints
+        .http_base
+        .join(path)
+        .map_err(|e| ApiFailure::Malformed(e.to_string()))
+}
+
+/// A `GET` with the door key and, when given, a bearer; the body on success.
+pub async fn get_bytes(
+    endpoints: &Endpoints,
+    access_token: Option<&str>,
+    url: Url,
+) -> Result<Bytes, ApiFailure> {
+    send(with_key(client()?.get(url), endpoints, access_token)).await
+}
+
+/// A protobuf `POST`, answering with the body of the 2xx — empty for the
+/// endpoints that answer 204.
+pub async fn post_proto<M: prost::Message>(
+    endpoints: &Endpoints,
+    access_token: Option<&str>,
+    url: Url,
+    body: &M,
+) -> Result<Bytes, ApiFailure> {
+    let request = with_key(client()?.post(url), endpoints, access_token)
+        .header(CONTENT_TYPE, PROTOBUF)
+        .body(body.encode_to_vec());
+    send(request).await
+}
+
+/// A `DELETE`, whose 204 carries nothing worth reading.
+pub async fn delete(endpoints: &Endpoints, access_token: &str, url: Url) -> Result<(), ApiFailure> {
+    send(with_key(
+        client()?.delete(url),
+        endpoints,
+        Some(access_token),
+    ))
+    .await?;
+    Ok(())
+}
+
+fn with_key(
+    request: reqwest::RequestBuilder,
+    endpoints: &Endpoints,
+    access_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = request.header(KEY_HEADER, &endpoints.key);
+    match access_token {
+        Some(access_token) => request.header(AUTHORIZATION, bearer(access_token)),
+        None => request,
+    }
+}
+
+async fn send(request: reqwest::RequestBuilder) -> Result<Bytes, ApiFailure> {
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiFailure::Transport(e.to_string()))?;
+
+    if !response.status().is_success() {
+        return Err(failure_from(response).await);
+    }
+
+    response
+        .bytes()
+        .await
+        .map_err(|e| ApiFailure::Transport(e.to_string()))
 }
 
 /// The bearer gate of `PROTOCOL.md` refused the request.

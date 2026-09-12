@@ -9,6 +9,9 @@ public class Invite
 
     public DateTime CreatedAt { get; set; }
 
+    // Null for an invite the admin CLI minted, which has no account behind it.
+    public long? CreatedBy { get; set; }
+
     public DateTime ExpiresAt { get; set; }
 
     public DateTime? UsedAt { get; set; }

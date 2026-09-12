@@ -29,7 +29,6 @@ const PALETTE: Palette = Palette {
     danger: DANGER,
 };
 
-static THEME: LazyLock<Theme> = LazyLock::new(|| Theme::custom("Vorcall", PALETTE));
 /// The splash window keeps the same palette on a transparent ground, which is what the
 /// compositor clears it with.
 static SPLASH_THEME: LazyLock<Theme> = LazyLock::new(|| {
@@ -41,10 +40,6 @@ static SPLASH_THEME: LazyLock<Theme> = LazyLock::new(|| {
         },
     )
 });
-
-pub fn theme() -> Theme {
-    THEME.clone()
-}
 
 pub fn splash_theme() -> Theme {
     SPLASH_THEME.clone()

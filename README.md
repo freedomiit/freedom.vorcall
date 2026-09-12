@@ -1,29 +1,37 @@
 # Vorcall
 
-A private chat for a friend group: rooms and DMs, native Rust desktop client, .NET backend, protobuf over a WebSocket.
+A private chat for a friend group: channels, roles and DMs, native Rust desktop client, .NET backend, protobuf over a WebSocket.
 
 ## Status
 
-MVP. Present: invite-only accounts, a mandatory `general` room plus public rooms anyone can create or join and two-person DMs, a presence sidebar, live messages with reply/edit/delete and reactions, image attachments, unread and mention counts, older history, notifications, voice channels per room with push-to-talk (global per platform, with a window-focused fallback) or voice activation, input cleanup (echo cancellation, noise suppression and an optional automatic gain), per-user volume and mute, and screen sharing (a monitor or a window, with its audio, watched by other voice members through an H.264 stage rendered in the app).
+MVP, 0.5.0. Present: invite-only accounts; one server whose text and voice channels sit under categories, plus two-person DMs; roles with colours, icons and a hierarchy, carrying 21 granular permissions that can be overridden per channel and per member; profiles with avatars, banners, nicknames, descriptions and accent colours; kick and ban; invites and bans managed from inside the app; live messages with reply/edit/delete and reactions; image attachments; unread and mention counts with `@everyone`/`@here`; older history; notifications; a voice session in every voice channel and DM with push-to-talk (global per platform, with a window-focused fallback) or voice activation, input cleanup (echo cancellation, noise suppression and an optional automatic gain), per-user volume and mute, server mute/deafen, move and priority speaker; screen sharing (a monitor or a window, with its audio, watched by other voice members through an H.264 stage rendered in the app); and a rewritten client — themable (two presets plus custom JSON themes), with a quick switcher, context menus, rebindable keybinds and drag-and-drop server settings.
 
-Deliberately absent: private (invite-only) rooms, file attachments beyond images, OAuth/2FA.
+Deliberately absent: more than one server, private DMs beyond two people, role mentions, pins, message search, threads, custom status, file attachments beyond images, OAuth/2FA.
 
 ## Repository layout
 
 ```
 proto/vorcall.proto        shared schema; generated into both server and client at build time
-PROTOCOL.md                wire framing, state machines, limits
-server/                    ASP.NET Core (.NET 10) backend, Vorcall.Server.csproj (server/Voice/ is the voice UDP relay,
-                            server/Updates/ + server/Api/UpdatesEndpoints.cs serve /api/updates/*)
-client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall-core -> incl. the `update` module,
+PROTOCOL.md                wire framing, state machines, permission resolution, limits
+server/                    ASP.NET Core (.NET 10) backend, Vorcall.Server.csproj (server/Permissions/ is the pure
+                            permission engine, server/Chat/ the in-memory server model and the directories behind it,
+                            server/Voice/ the voice UDP relay, server/Updates/ + server/Api/UpdatesEndpoints.cs
+                            serve /api/updates/*)
+tests/                     Vorcall.Server.Tests, xunit (permission matrix, names, validation); outside server/ so
+                            the SDK's compile glob does not swallow it
+client/                    Cargo workspace (crates/vorcall-proto, crates/vorcall-core -> incl. permissions.rs, the
+                            mirror of the server engine, and the `update` module,
                             crates/vorcall-voice -> media engine, incl. video.rs (fragmentation/reassembly)
                             and stereo share audio, crates/vorcall-screen -> screen capture backends
                             (Windows/macOS/Linux) + the OpenH264 codec, no GUI or audio device,
+                            crates/vorcall-hotkey -> system-wide listener for several bindings at once,
                             crates/vorcall-probe -> headless voice probe binary, also carries the
                             check-update/apply-update oracle subcommands and the share/watch oracle,
                             crates/vorcall-release -> release-side signing tool, binary `vorcall-release`,
-                            crates/vorcall-app -> binary `vorcall`, incl. share.rs -> the share pipeline
-                            and decode threads, view/stage.rs -> the wgpu shader widget)
+                            crates/vorcall-app -> binary `vorcall`: app/ (state and update), theme/ (tokens and
+                            presets), view/ (incl. channels.rs, settings/, server_settings/, stage.rs -> the wgpu
+                            shader widget), workers/ (voice, share, images, notify, audio))
+assets/icons/              the UI icon set, generated by assets/brand/gen.py icons
 client/update-keys.pub     Ed25519 public keys the client trusts for release manifests; empty disables the updater
 deploy/                    nginx site configs and the host provisioning script
 scripts/                   client release build scripts (Linux, Windows cross-build), push-client.sh (build + push both to the host) and update-oracle.sh
@@ -31,7 +39,7 @@ releases/                  gitignored; local dir the dev server serves under /ap
 docker-compose.yml         local dev: Postgres only
 docker-compose.prod.yml    production stack: Postgres + backend, pulled from GHCR
 .env.production.example    template for the production .env (never commit the real one)
-.github/workflows/         ci.yml (format/lint/build), deploy.yml (build + deploy on push to main),
+.github/workflows/         ci.yml (format/lint/build + dotnet test), deploy.yml (build + deploy on push to main),
                             release.yml (build, sign and publish a client release)
 ```
 
@@ -108,7 +116,7 @@ VORCALL_SERVER_URL=http://localhost:5000 cargo run -p vorcall-app
 
 Set `RUST_LOG=vorcall_core=debug` to see the client's connection log.
 
-Client config on disk: `~/.config/vorcall/config.toml` on Linux (via `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`), keys `username`, `notifications` and `sound` (the old `nickname` key is still read). `notifications` (default on) and `sound` (default off) are also toggled by the two switches at the bottom of the sidebar. Session tokens are stored separately, next to it, in `session.toml` — see [Accounts](#accounts).
+Client config on disk: `~/.config/vorcall/config.toml` on Linux (via `directories::ProjectDirs::from("br.com", "freedomit", "vorcall")`). Besides `username`, `notifications` (default on) and `sound` (default off) it holds the voice and share settings, and the 0.5.0 additions: `theme` (`"vorcall-dark"`, `"vorcall-light"` or `"custom:<slug>"`), `density`, `font_scale`, `entrance`, `text_reactions`, `keybinds` (action id → binding), `muted_channels`, `suppress_everyone`, `collapsed_categories`, `show_members`, `sidebar_width`, `members_width`, `last_channel` and `hidden_dms`. `VORCALL_ENTRANCE` and `VORCALL_TEXT_REACTIONS` still override their config keys when set. Custom themes live beside it as `themes/<slug>.json`. Session tokens are stored separately, next to it, in `session.toml` — see [Accounts](#accounts).
 
 ## Accounts
 
@@ -135,7 +143,11 @@ users list                       # includes  client <version> <platform>  seen <
 users outdated [--min X.Y.Z]     # accounts below the floor; reads the manifest when --min is absent
 users revoke-sessions <username>
 users set-password <username>   # prompts for the new password
+server set-owner <username>      # hands the server to that account
+server show                      # the server's name, owner and general channel id
 ```
+
+`server set-owner` is how the real owner is picked after the first deploy of the channels release: the migration and the fresh-database seed both set `owner_id` to the lowest user id, which is rarely who should hold it. The owner bypasses every permission check, so there is exactly one; a banned account is refused. `server show` prints what is currently stored. Invites created by `invites new` go through the same service the in-app invites page uses and are listed there too, with no creator attached.
 
 `users list` shows each account's last-reported client version, platform and connection time (from the `Hello` frame — see [`PROTOCOL.md`](PROTOCOL.md#server-session-state-machine-per-connection)). `users outdated` lists accounts below `--min`, or below the version published in the current release manifest when `--min` is omitted (`Vorcall:ReleasesDir`, mounted read-only in the CLI container too); with neither a manifest nor `--min` it fails and says so.
 
@@ -153,23 +165,23 @@ Local:
 
 ## Voice
 
-One voice channel per text room. Join it from the sidebar; talk with push-to-talk (default Ctrl) or switch to voice activation; mute and deafen are separate switches. The sidebar shows who is in voice and highlights who is speaking. Media rides a direct UDP path to the server host — not Cloudflare, not nginx — encrypted per voice session.
+Voice lives in voice channels and in DMs; a text channel has none. Click a voice channel in the sidebar to join it (`CONNECT` is the permission; without `SPEAK` the session joins muted), talk with push-to-talk (default Ctrl) or switch to voice activation; mute and deafen are separate switches. The sidebar lists the occupants under the channel, rings whoever is speaking, and shows their muted, deafened and sharing badges. Media rides a direct UDP path to the server host — not Cloudflare, not nginx — encrypted per voice session.
 
-**Settings:** the "Settings" button in the header opens a full-screen page with the input device, the output device, the transmit mode, the three input-cleanup switches, and (for push-to-talk) the key or mouse button to bind ("Change", then press a key or click a mouse button; Esc cancels). These are stored in `config.toml` as `input_device`, `output_device`, `transmit_mode` (`"push_to_talk"` or `"voice_activation"`) and `ptt_key` (e.g. `"Control"`, `"F8"`, `"a"`, `"MouseBack"`) and the input-cleanup switches `noise_suppression`, `echo_cancellation` (both default `true`) and `auto_gain` (default `false`). A key bound by an earlier version that is not in the bindable list below (Enter or an arrow key, for example) keeps working while the window is focused, but system-wide capture needs one of the listed keys, so re-bind it in Settings.
+**Settings:** the gear in the user bar opens Settings, whose Voice tab holds the input device, the output device, the transmit mode and the three input-cleanup switches; the push-to-talk, mute and deafen keys live in the Keybinds tab (click an action, press the combination; Esc cancels, and a conflict is flagged on both rows). These are stored in `config.toml` as `input_device`, `output_device`, `transmit_mode` (`"push_to_talk"` or `"voice_activation"`), the input-cleanup switches `noise_suppression`, `echo_cancellation` (both default `true`) and `auto_gain` (default `false`), and `keybinds` (`push_to_talk` defaults to `Control`, `toggle_mute` to `Ctrl+Shift+M`, `toggle_deafen` to `Ctrl+Shift+D` — those three are the system-wide ones; the rest are in-window). A `ptt_key` written by an earlier version is migrated into `keybinds["push_to_talk"]` at load time. A key that is not in the bindable list below (Enter or an arrow key, for example) keeps working while the window is focused, but system-wide capture needs one of the listed keys, so re-bind it in Settings.
 
 **Transmit modes:** "Push to talk" (default) sends while the bound key or mouse button is held. "Voice activation" opens a noise gate instead — a threshold slider (−60 to −20 dBFS, default −45) plus a live input level meter showing whether the gate is open; a 20 ms frame opens the gate once its RMS reaches the threshold and closes it 300 ms after dropping 6 dB below threshold, with each reopen starting a new talk spurt. Mute and Deafen work the same in both modes. Bindable inputs: Ctrl, Alt, Shift, Super, Space, Tab, Caps Lock, Insert, Delete, Home, End, Page Up/Down, F1–F24, ASCII letters and digits, and mouse Back, Forward and Middle (character keys assume the US layout on macOS).
 
 **Input cleanup:** three switches in Settings run WebRTC's voice chain (through the pure-Rust `aec3` crate) on the microphone before the level meter, the threshold and the encoder ever see a frame, in both transmit modes and while muted, so the canceller stays converged between sentences. *Echo cancellation* (default on) subtracts what Vorcall plays from the voice channel through the speakers (the notification chime is not part of the reference), learning the delay by itself whatever the devices, so a laptop or desk speakers no longer feed the room back; audio from other applications is not part of the reference and still comes through. *Noise suppression* (default on) takes the fan, hum and hiss out — about 9 dB on steady noise, less on keyboard clicks. *Automatic gain* (default off) lifts a quiet talker towards a normal level and leaves a loud one alone. All three together cost about 2 % of one core while in voice. If the chain fails to build or crashes, the client falls back to the raw microphone for that session and says so in the notice line; toggling any switch retries. With `RUST_LOG=vorcall_app=debug` the canceller logs its delay estimate and echo return loss every 10 s.
 
-**Global capture:** push-to-talk listens system-wide, not only while the window is focused, through a per-platform backend: Windows low-level keyboard/mouse hooks, macOS a listen-only `CGEventTap` gated by the Input Monitoring permission, Linux X11 raw XInput2 events on the root window, and Linux Wayland the `org.freedesktop.portal.GlobalShortcuts` portal (KDE Plasma 5.27+, GNOME 48+, Hyprland — keyboard only, bound in the compositor's own dialog; `WAYLAND_DISPLAY` selects the portal backend over X11). When global capture is unavailable (no portal, permission denied, hook failure) the client silently falls back to window-focused push-to-talk; Settings shows the reason under the push-to-talk row with a Retry button, and the status line shows "PTT: window only".
+**Global capture:** push-to-talk listens system-wide, not only while the window is focused, through a per-platform backend: Windows low-level keyboard/mouse hooks, macOS a listen-only `CGEventTap` gated by the Input Monitoring permission, Linux X11 raw XInput2 events on the root window, and Linux Wayland the `org.freedesktop.portal.GlobalShortcuts` portal (KDE Plasma 5.27+, GNOME 48+, Hyprland — keyboard only, bound in the compositor's own dialog; `WAYLAND_DISPLAY` selects the portal backend over X11). When global capture is unavailable (no portal, permission denied, hook failure) the client silently falls back to window-focused push-to-talk; Settings → Voice spells the reason out under the push-to-talk row, in the warning colour, with a Retry button beside it while a voice session is live.
 
 **macOS caveat:** the app bundle is ad-hoc signed, so the Input Monitoring grant is tied to that specific build and must be re-granted in System Settings → Privacy & Security → Input Monitoring after every update — until then push-to-talk is window-only. Caps Lock cannot be a global push-to-talk key on macOS: it arrives as a modifier-flag change, not a key event. F21–F24 also have no macOS key code, so those bindings stay window-only there too.
 
-**Per-user volume and mute:** click another member in the voice list to expand a volume slider (0–200%) and a Mute button for them. Both are local only — the server never learns about it — persisted in `config.toml` under `[peer_audio.<user id>]` (`volume`, `muted`) and re-applied whenever that user rejoins voice.
+**Per-user volume and mute:** click another occupant under a voice channel to expand a volume slider (0–200%) and a mute-for-me button, indented beneath their row. Both are local only — the server never learns about it — persisted in `config.toml` under `[peer_audio.<user id>]` (`volume`, `muted`) and re-applied whenever that user rejoins voice.
 
 **Network:** media goes over UDP 5005 to the server host (`VoiceReady` tells the client the exact host and port). Production needs an ingress rule for UDP 5005 in the OCI VCN security list **and** the host firewall step of `deploy/provision-host.sh`. Server config keys: `Vorcall__VoiceEnabled`, `Vorcall__VoicePort`, `Vorcall__VoiceHost` (all optional, with defaults). Local dev needs nothing extra: the relay binds `0.0.0.0:5005` as soon as the server starts.
 
-**Status line:** "voice N ms · loss x%" is the healthy state (round-trip time and packet loss to the relay); "voice: connecting" means no pong has arrived yet; "voice: no media" means 15 s have passed without a pong — check the VCN rule or host firewall.
+**Voice card:** while in voice, a card above the user bar names the channel and its state — "Voice connected" with the last round-trip time to the relay (" · N ms"), "Connecting…" while no pong has arrived yet, "Not connected" once the media path is gone. A card stuck off "Voice connected" with no round-trip time means the VCN rule or the host firewall is blocking UDP 5005.
 
 **Probe (runtime oracle):** two headless probes exchanging tone are the way to verify the voice path end to end, locally or in production, without opening the GUI.
 
@@ -184,19 +196,21 @@ VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/deb
 VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/debug/vorcall-probe --username bob --send-seconds 10 --listen-seconds 14 --expect-peer --tone-hz 660
 ```
 
-Each probe prints one JSON line to stdout: `packets_sent`/`packets_received`, `decoded_seconds` and `tone_seconds` (how much of the peer's tone was actually decoded), `gaps`/`late`, `rtt_ms` (min/avg/max/last/samples), `link`, one `peers` entry per remote ssrc (received/lost/late/decoded_frames/decoder_resets), `speaking_events`, `frames_sent` (audio frames actually sent, excluding pings) and `frames_gated` (frames the voice-activation gate held back before encoding). Exit codes: `0` ran, `1` `--expect-peer` heard less than 1 s of tone or `--expect-silence` saw audio go out, `2` usage, sign-in, connection or media failure.
+`--channel <id>` or `--channel-name <name>` (case-insensitive, mutually exclusive) picks which voice channel or DM to join; with neither, the probe joins the voice channel named `General` — the one the seed creates. An id that names no channel the account can see, or one that is a text channel, is a usage error.
+
+Each probe prints one JSON line to stdout: `channel_id`/`channel_name` (the channel it actually joined), `packets_sent`/`packets_received`, `decoded_seconds` and `tone_seconds` (how much of the peer's tone was actually decoded), `gaps`/`late`, `rtt_ms` (min/avg/max/last/samples), `link`, one `peers` entry per remote ssrc (received/lost/late/decoded_frames/decoder_resets), `speaking_events`, `frames_sent` (audio frames actually sent, excluding pings) and `frames_gated` (frames the voice-activation gate held back before encoding). A probe that a moderator moves or disconnects prints an extra `{"moved_to": <channel id or 0>}` line and ends its run with the normal report. Exit codes: `0` ran, `1` `--expect-peer` heard less than 1 s of tone or `--expect-silence` saw audio go out, `2` usage, sign-in, connection or media failure.
 
 Voice-activation flags: `--vad` runs the tone through the same noise gate the app uses before encoding, `--vad-threshold <db>` sets its threshold (default −45), `--tone-amplitude <0..1>` sets the tone's amplitude (default 0.3; `0` is digital silence), and `--expect-silence` exits 1 if any audio frame went out. Oracle recipe: `--vad --tone-amplitude 0 --expect-silence` exits 0 with `frames_sent: 0` (the gate holds silence back); `--tone-amplitude 0 --expect-silence` without `--vad` exits 1 (negative control — without the gate, silence still goes out); two probes run with `--vad --tone-amplitude 0.3 --expect-peer` hear each other normally.
 
 Against production, run the same two-terminal recipe with the two test accounts kept in the gitignored `client/.env.probe` (`export PROBE_A_USER=… PROBE_A_PASS=… PROBE_B_USER=… PROBE_B_PASS=…`), `VORCALL_SERVER_URL` left at its default, and the real key in `VORCALL_SERVER_KEY`.
 
-**Limits worth knowing:** 20 ms Opus frames at 48 kbps CBR; one voice channel per room; echo cancellation covers only what Vorcall plays from the voice channel (the notification chime and music from another application still reach the microphone); mouse-button push-to-talk bindings are window-only on Wayland (the portal is keyboard-only).
+**Limits worth knowing:** 20 ms Opus frames at 48 kbps CBR; one voice session per voice channel or DM, and one per client at a time; echo cancellation covers only what Vorcall plays from the voice channel (the notification chime and music from another application still reach the microphone); mouse-button push-to-talk bindings are window-only on Wayland (the portal is keyboard-only).
 
 ## Screen share
 
-Any member of a room's voice channel can share a monitor or a window, with its audio, to the other members already in that channel; several members can share at once, and a viewer watches one share at a time. Video is H.264 (OpenH264, a pure-Rust-built BSD-2 port of Cisco's encoder/decoder, no cmake) fragmented over the same UDP session and key as voice, rendered through a wgpu texture in the app. A share ends the moment its voice session does.
+Anyone in a voice channel (or a DM's voice session) who holds `SHARE_SCREEN` there can share a monitor or a window, with its audio, to the other members already in that channel; several members can share at once, and a viewer watches one share at a time. Video is H.264 (OpenH264, a pure-Rust-built BSD-2 port of Cisco's encoder/decoder, no cmake) fragmented over the same UDP session and key as voice, rendered through a wgpu texture in the app. A share ends the moment its voice session does.
 
-**Settings:** the "Screen share" section of the full-screen Settings page holds `share_resolution` (`"source"`, `"720p"`, `"1080p"`, `"1440p"`, `"2160p"`; default `"720p"`), `share_fps` (15/30/60; default 30), an Auto/manual bitrate choice (`share_bitrate_kbps`, absent for Auto, otherwise 1000..30000 kbit/s), `share_audio` (default on) and `share_volume` for what is currently watched (0..200%, default 100%) — all in `config.toml`.
+**Settings:** what a share sends is read from `config.toml` — `share_resolution` (`"source"`, `"720p"`, `"1080p"`, `"1440p"`, `"2160p"`; default `"720p"`), `share_fps` (15/30/60; default 30), an Auto/manual bitrate choice (`share_bitrate_kbps`, absent for Auto, otherwise 1000..30000 kbit/s) and `share_audio` (default on). `share_volume` (0..200%, default 100%) is the volume of whatever is being watched and has its slider on the stage toolbar.
 
 **Quality:** the source is scaled down to fit inside the chosen resolution's box, aspect kept, never upscaled (a `"source"` share is capped at 3840×2160, the largest picture OpenH264 accepts). Auto bitrate reads a table by output size and frame rate (kbit/s): 720p 1500/2500/4000, 1080p 3000/4500/7000, 1440p 5000/8000/12000, 2160p 10000/15000/24000 for 15/30/60 fps; a manual value overrides it. The encoder skips frames rather than exceed the target rate, and the stage shows the rate actually achieved.
 
@@ -206,11 +220,11 @@ Any member of a room's voice channel can share a monitor or a window, with its a
 
 **Audio:** macOS excludes Vorcall's own playout from a share's audio natively (ScreenCaptureKit); Windows tries process-loopback capture (excluding this process, build 20348+) and falls back to plain loopback; Linux captures the default sink's monitor, which is always the whole desktop. Where the capture includes Vorcall's own voice audio, a second echo canceller (AEC3, echo cancellation only — no noise suppression, no automatic gain, since a share carries music and game sound as well as speech) subtracts it before encoding, so a watcher does not hear the room's own voices coming back through the share.
 
-**Watching:** "Share screen" in the voice controls opens Vorcall's own picker on Windows and macOS (a list of monitors and windows plus a share-audio checkbox) or goes straight to the desktop portal's dialog on Linux. A sharer shows a ▣ badge next to their name in the voice roster; clicking it, or "Watch" in the expanded member panel, opens the stage in the centre pane: a sharer picker (when more than one member is sharing), a volume slider when the share has audio, live stats, Pop out (its own window; closing it brings the stage back to the centre pane), Fullscreen (Esc exits) and Stop watching.
+**Watching:** the screen button on the voice card opens Vorcall's own picker — a list of monitors and windows plus a share-audio toggle — and on Linux the sources come from the desktop portal's own dialog, which the picker's Share button opens. A sharer carries a "LIVE" badge next to their name under the voice channel and in the member pane; pressing it (or "Watch screen" in their right-click menu) opens the stage in the chat column: a sharer picker (when more than one member is sharing), a volume slider when the share has audio, live stats, Pop out (its own window; closing it brings the stage back to the chat column), Fullscreen (Esc exits) and Stop watching.
 
-**Network:** share media rides the same UDP path as voice (see Network above), billed against its own byte budget rather than the packet-rate limit voice and pings use. Server options: `Vorcall__ShareEnabled` (default true, the kill switch), `Vorcall__ShareMaxKbps` (default 30000, the per-sharer ceiling), `Vorcall__MaxSharersPerRoom` (default 3). `deploy/provision-host.sh` raises the host's `net.core.rmem_max`/`wmem_max` to 16 MiB so the relay's 8 MiB socket buffers actually take; without that step the kernel clamps them silently. A room's worst-case bandwidth is sharers × watchers × `ShareMaxKbps`.
+**Network:** share media rides the same UDP path as voice (see Network above), billed against its own byte budget rather than the packet-rate limit voice and pings use. Server options: `Vorcall__ShareEnabled` (default true, the kill switch), `Vorcall__ShareMaxKbps` (default 30000, the per-sharer ceiling), `Vorcall__MaxSharersPerRoom` (default 3). `deploy/provision-host.sh` raises the host's `net.core.rmem_max`/`wmem_max` to 16 MiB so the relay's 8 MiB socket buffers actually take; without that step the kernel clamps them silently. `MaxSharersPerRoom` keeps its name but caps sharers per **channel**. A channel's worst-case bandwidth is sharers × watchers × `ShareMaxKbps`.
 
-**Status line:** " · sharing N kbit/s" is appended while a share is active, N being the encoder's currently achieved rate.
+**While sharing:** the voice card's share button turns into "Stop sharing · N watching". The stage a watcher sees carries the live numbers instead — resolution, frame rate and the rate actually achieved.
 
 **Probe (runtime oracle):** the same two-terminal idea as voice, one probe sharing a synthetic test pattern and the other watching it.
 
@@ -226,17 +240,27 @@ VORCALL_SERVER_URL=http://localhost:5000 VORCALL_PROBE_PASSWORD=... ./target/deb
 
 See [`PROTOCOL.md`](PROTOCOL.md#screen-share) for the signalling frames, audience rules and error codes, and § Media transport there for the datagram types and the limits table for the full set of numbers.
 
-## Rooms and messages
+## Channels and roles
 
-`general` is created for every account and cannot be left. Beyond it, rooms are public: anyone can browse the room list and join with `CreateRoom`/`JoinRoom`; a room's id is a slug of its name (`"Team  Chat_2"` → `team-chat-2`), and there is no rename or delete. A DM is a two-person room opened with `OpenDm` (id `dm-<lower user id>-<higher user id>`); it cannot be left either, but the client can hide one from the room list until the next message arrives in it. Each room, DMs included, has its own voice channel.
+There is exactly one server, with a name, a description, an icon and an owner. Everything else hangs off it: **categories** group **channels**, and every account is a member from registration on — there is nothing to join and nothing to leave.
 
-The room list pane shows a badge per room — grey for unread, red for a mention — kept by a server-persisted read cursor per user and room (`MarkRead`, debounced to one call per second); a room only counts as read while it is in view, at the bottom of the message list, in a focused window. History for a room loads on first view (`GET /api/messages?room=…`).
+A channel is a text channel (messages, history, read counters), a voice channel (a voice session and screen shares, no messages) or a DM (exactly two permanent members, no name). Text and voice channels sit under a category, or above the categories when they have none, ordered by positions the server assigns. Channel names are 1..32 characters and need not be unique. A DM is opened with `OpenDm` and never deleted; the client can hide one from the DM list until the next message arrives in it.
 
-Messages support a reply (`reply_to_id`, shown as a quoted excerpt of up to 120 characters), edit (author only) and delete (a tombstone: the row stays, its text/attachments/reactions are gone), and reactions from a fixed palette — 👍 ❤️ 😂 😮 😢 🔥 🎉 👀 — toggled per user and grouped by emoji. `VORCALL_TEXT_REACTIONS=1` renders that palette as text labels instead of emoji, for terminals or fonts that cannot draw them. Hovering a message in the app surfaces reply/react/edit/delete actions (delete asks for a second click). `<@id>` mention tokens are rendered as `@username` and autocompleted after typing `@`; a mention or a DM notifies unless that room is already in view in a focused window, and anything else notifies only when the window is unfocused. Message text is capped at 2000 characters; the client keeps at most 2000 messages per room in memory.
+Whether a member sees a channel is one question: does `VIEW_CHANNEL` resolve for it there? "Who is in this channel" is therefore "everyone who may view it", and the member pane lists exactly those. `general` — the text channel the server points at, not merely one named `general` — is the exception that is always visible: it cannot be deleted and its `VIEW_CHANNEL` cannot be denied to `@everyone`. A DM is visible to its two members and to nobody else.
 
-Attachments are images only (png, jpeg, gif, webp), up to 8 MiB each and 4 per message, picked with a file dialog (`rfd`) or dragged and dropped, downscaled to 1600 px on the longest side for display and cached under the platform cache directory (`vorcall/attachments`, pruned to 500 MiB at startup by oldest modification time). They upload as a raw body to `POST /api/attachments?room=<id>` ahead of the message that references them (rate limited to 20 uploads per minute per user) and are stored on the server under `Vorcall:AttachmentsDir` (env `Vorcall__AttachmentsDir`, default `/attachments`) up to a total quota `Vorcall:AttachmentsMaxBytes` (env `Vorcall__AttachmentsMaxBytes`, default 2 GiB — uploads are refused with `507` once it would be exceeded). An upload never linked to a message within 1 hour is swept (first sweep 1 minute after boot, then every 10 minutes). Deleting a message removes its attachment files with it.
+**Roles** carry the permissions. `@everyone` is the undeletable role at position 0 that every member holds; its defaults are view, send, attach, react, connect, speak, share screen and change own nickname. Beyond it a role has a name, a colour, an icon (an emoji or an image), a position in the hierarchy, a `hoist` flag and its own permission bits; a member's name is painted by their highest-positioned coloured role, and a hoisted role gets its own group in the member list. The owner bypasses every check, and a role can only be managed, or a member targeted, from strictly above it in the hierarchy. There are 21 permission bits, seven of them server-wide (manage server, manage roles, manage members, manage invites, kick, ban, change own nickname) and the rest per channel, where each can be allowed or denied by a **channel override** on a role or on a single member. Overrides resolve in order — `@everyone`, then the member's roles from the bottom up, then the member itself — so a higher role's decision wins a conflict; [`PROTOCOL.md`](PROTOCOL.md#roles-and-permissions) § Roles and permissions is the exact algorithm, and both the server and the client implement it from the same test matrix.
 
-See [`PROTOCOL.md`](PROTOCOL.md) § Rooms and presence, § Messages and § Attachments for the wire-level rules, and the limits table there for the full set of numbers.
+**Profiles** are per member: a nickname (shown instead of the username everywhere), a description, an accent colour, an avatar and a banner. Someone with manage-members may set another member's nickname; everything else is your own. Roles can carry an icon image too, and the server an icon of its own. Images go through a separate endpoint from attachments and are downscaled by the client before upload: avatars and the server icon to 512×512, banners to 1600×600, role icons to 128×128; the server caps bytes (8 MiB) and type, never dimensions, and sweeps an image nothing refers to after an hour.
+
+The channel list shows a badge per channel — grey for unread, red for a mention — kept by a server-persisted read cursor per member and channel (`MarkRead`, debounced to one call per second); a channel only counts as read while it is in view, at the bottom of the message list, in a focused window. A category rolls its children's unread state up when collapsed. History for a channel loads on first view (`GET /api/messages?channel=…`).
+
+Messages support a reply (`reply_to_id`, shown as a quoted excerpt of up to 120 characters), edit (author only), delete (a tombstone: the row stays, its text/attachments/reactions are gone — the author, or anyone with manage-messages in that channel) and reactions from a fixed palette — 👍 ❤️ 😂 😮 😢 🔥 🎉 👀 — toggled per user and grouped by emoji. Reactions as text labels instead of emoji is a setting (or `VORCALL_TEXT_REACTIONS=1`), for fonts that cannot draw them. Hovering a message surfaces reply/react/edit/delete actions (delete asks for a second click), and right-clicking one, a member or a channel opens a context menu with whatever that member is allowed to do. `<@id>` mention tokens render as the member's display name and autocomplete after typing `@`. `@everyone` and `@here` are plain words that only become mentions when the sender holds mention-everyone in that channel: `@everyone` notifies everybody who can see the channel, `@here` only those online, and only `@everyone` is counted in the unread mention badge. A mention or a DM notifies unless that channel is already in view in a focused window, and anything else notifies only when the window is unfocused; a channel can be muted and `@everyone` suppressed from Settings. Message text is capped at 2000 characters; the client keeps at most 2000 messages per channel in memory.
+
+Attachments are images only (png, jpeg, gif, webp), up to 8 MiB each and 4 per message, picked with a file dialog (`rfd`) or dragged and dropped, downscaled to 1600 px on the longest side for display and cached under the platform cache directory (`vorcall/attachments`, pruned to 500 MiB at startup by oldest modification time). They upload as a raw body to `POST /api/attachments?channel=<id>` ahead of the message that references them (rate limited to 20 uploads per minute per user, the same policy images use) and are stored on the server under `Vorcall:AttachmentsDir` (env `Vorcall__AttachmentsDir`, default `/attachments`) up to a total quota `Vorcall:AttachmentsMaxBytes` (env `Vorcall__AttachmentsMaxBytes`, default 2 GiB — uploads are refused with `507` once it would be exceeded). An upload never linked to a message within 1 hour is swept (first sweep 1 minute after boot, then every 10 minutes). Deleting a message removes its attachment files with it.
+
+**Moderation** is kick (the account stays, its sessions are revoked, it can sign in again), ban (a ban row with a reason, every message it ever sent tombstoned, and login, refresh and the WebSocket upgrade refused from then on; unbanning lets it back in but the tombstones stay), server mute and server deafen (moderator state the member cannot clear, enforced by the relay itself), moving someone between voice channels or disconnecting them, and priority speaker (every client ducks the other peers by 12 dB while one is talking). Invites and bans are managed from the server settings pages by whoever holds the bits, alongside the admin CLI.
+
+See [`PROTOCOL.md`](PROTOCOL.md) § Server, channels and categories, § Roles and permissions, § Messages, § Profiles and images, § Moderation and § Attachments for the wire-level rules, and the limits table there for the full set of numbers.
 
 ## Protocol
 
@@ -249,18 +273,18 @@ See [`PROTOCOL.md`](PROTOCOL.md) for framing, connection state machines and limi
 - Deploy pipeline (`.github/workflows/deploy.yml`): a push to `main` builds an arm64 backend image on GitHub Actions, pushes it to `ghcr.io/freedomiit/vorcall-backend`, then copies `docker-compose.prod.yml` to the host and runs `docker compose pull && up -d` over SSH. The backend applies its own EF Core migrations on boot. A push to `main` deploys production immediately; there is no separate approval step.
 - The pre-shared door key lives only in the host's `.env` (`Vorcall__ServerKey`) and must be baked into client builds as `VORCALL_SERVER_KEY`. Rotating it means: generate a new value, update the host `.env`, restart the backend, and rebuild/redistribute the client with the new key.
 - `Vorcall:JwtSigningKey` (env `Vorcall__JwtSigningKey`) is required — base64 of 32 random bytes; the server refuses to boot without it. `.env.production.example` carries a placeholder and `deploy/provision-host.sh` generates a real value for fresh hosts; on an existing host, append it by hand (`openssl rand -base64 32`). Rotating it signs every client out within 15 minutes (the access token lifetime).
-- Image attachments live on the host under `$APP_DIR/attachments`, bind-mounted read-write into the backend as `/attachments` (`docker-compose.prod.yml`); `deploy/provision-host.sh` creates the directory. nginx has a dedicated `location /api/attachments` (`client_max_body_size 9m`, unbuffered proxying, 300 s timeouts) alongside `location /api/updates/` — both are applied to an existing host by re-running `deploy/provision-host.sh` after copying `deploy/` there.
+- Image attachments live on the host under `$APP_DIR/attachments`, bind-mounted read-write into the backend as `/attachments` (`docker-compose.prod.yml`); `deploy/provision-host.sh` creates the directory. Profile and server images share that mount, under `attachments/images/`. nginx has a dedicated `location /api/attachments` and `location /api/images` (`client_max_body_size 9m`, unbuffered proxying, 300 s timeouts) alongside `location /api/updates/` — all are applied to an existing host by re-running `deploy/provision-host.sh` after copying `deploy/` there.
 
 ## Releases and updates
 
 ### How updates reach friends
 
-Vorcall checks for a newer build automatically: on the first successful connection after the app starts, and every 6 hours after that while connected and in the chat room. A manual check is also available from Settings ("Check for updates").
+Vorcall checks for a newer build automatically: on the first successful connection after the app starts, and every 6 hours after that while connected and in the chat. A manual check is also available from Settings ("Check for updates").
 
 A check fetches `/api/updates/manifest`, verifies its signature against the keys baked in at compile time from `client/update-keys.pub`, and — if there is something newer for the running platform — downloads the asset next to the running binary as `.vorcall-update-<version>`. Its size and SHA-256 are checked against the manifest before anything else happens with it.
 
-- **Optional update:** a banner appears under the header — "Vorcall {version} is ready." with "Restart now" and "Later". "Later" hides the banner until the next check finds something new; "Restart now" leaves the room and voice channel cleanly, then swaps the binary and relaunches.
-- **Required update:** when the manifest's `min_version` is above the running version, the chat screen is replaced by an "Update required" screen ("Vorcall {version} is needed to keep chatting.") that downloads and restarts on its own; a failure shows the error with a Retry button. The connection underneath is left alone, so a failed restart returns to a room that is still there.
+- **Optional update:** a banner appears under the header — "Vorcall {version} is ready." with "Restart now" and "Later". "Later" hides the banner until the next check finds something new; "Restart now" leaves the voice channel cleanly, then swaps the binary and relaunches.
+- **Required update:** when the manifest's `min_version` is above the running version, the chat screen is replaced by an "Update required" screen ("Vorcall {version} is needed to keep chatting.") that downloads and restarts on its own; a failure shows the error with a Retry button. The connection underneath is left alone, so a failed restart returns to a channel that is still there.
 - **Left for the next launch:** a verified download next to the binary that was never applied (the app was closed first) is re-verified from disk and installed at the next start, before the window opens. When the install directory is not writable, the download lands in the user's local data directory instead; that copy is never applied automatically — the UI says where it is and asks to install it by hand.
 - Settings also shows `Version {current} ({platform})` and, when the manifest carries notes, "What's new in {version}".
 
@@ -381,6 +405,34 @@ vorcall-probe apply-update --file PATH
 5. `git tag -a v0.4.0 -m "..."`, then `scripts/push-client.sh` (builds and pushes the Linux and Windows binaries to the host), then `git push origin v0.4.0` (see [Cutting a release](#cutting-a-release)).
 6. Rebuild and distribute clients as usual (see [First install per platform](#first-install-per-platform) for anyone not yet on the self-updater).
 
+## Rolling out the channels release
+
+0.5.0 replaces rooms with channels and adds categories, roles, permissions, profiles and moderation, on a rewritten client. `min_version` moves to 0.5.0: a 0.4.x client knows nothing of channels at all, so it is asked to update rather than left to misread every id.
+
+**Read step 1 before pushing anything.** The database migration is the only irreversible step in the project's history.
+
+1. **Back production up.** `ssh` to the host and `pg_dump` the database before the deploy:
+
+   ```
+   cd /opt/vorcall
+   docker compose -f docker-compose.prod.yml exec -T db \
+     sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > ~/vorcall-pre-0.5.0.sql
+   ```
+
+   The `ChannelsRolesProfiles` migration converts every public room into a category holding a text and a voice channel, rewrites every message, attachment and read cursor onto numeric channel ids, turns each `dm-<a>-<b>` room into a DM channel, seeds the `server` row and `@everyone`, and drops `rooms` and `room_members`. Its `Down()` throws: there is no migrating back. Restoring that dump is the only rollback.
+2. **Push `main`** — this deploys. The backend migrates, then seeds, then loads its model, all before Kestrel listens, so a failure in any of the three leaves the port closed rather than half-serving (`/health`, which the compose healthcheck polls, answers 200 only after that). The migration sets `owner_id` to the **lowest user id**, which is rarely the right account, so pick the real owner on the host straight away:
+
+   ```
+   docker compose -f docker-compose.prod.yml run --rm backend server set-owner <username>
+   docker compose -f docker-compose.prod.yml run --rm backend server show
+   ```
+
+   The owner bypasses every permission check; everyone else starts with `@everyone`'s defaults (view, send, attach, react, connect, speak, share screen, own nickname) and no further role. Hand out roles from the server settings pages afterwards.
+3. **Copy `deploy/` to the host and re-run `deploy/provision-host.sh`** — it installs the new nginx `location /api/images` (raw upload bodies, unbuffered, 9 MiB), without which avatars, banners and icons fail to upload behind nginx. Idempotent, like the earlier runs.
+4. **Cut and distribute 0.5.0.** `git tag -a v0.5.0 -m "..."`, then `scripts/push-client.sh`, then `git push origin v0.5.0` (see [Cutting a release](#cutting-a-release)). Every friend still on 0.4.x gets the "Update required" screen until they take it, since `min_version` is 0.5.0; `users outdated` lists who has not moved.
+5. **Run the oracles.** The proto changed, so regenerate the smoke suite's `vorcall_pb2.py` (see `CLAUDE.md` § Commands) and run `smoke.py full` — it covers the snapshot shape, channel and category CRUD, permission refusals, override-driven visibility, mention flags, kick and ban with tombstones, images, invites, bans and voice moderation. Then the two-probe voice oracle and the share oracle against production with `client/.env.probe`.
+6. **Walk each desktop.** This part no automated check covers: open the GUI on Linux, Windows and macOS and go through the channel list, a message with an attachment, a profile, the settings and server-settings pages (including a drag-and-drop reorder), the quick switcher and the theme picker; confirm the three global keybinds (push-to-talk, mute, deafen) fire while another window is focused — on Wayland that means accepting all three in the compositor's portal dialog, which is a new prompt; and on macOS re-grant Input Monitoring and Screen Recording after the update, then relaunch, because both grants are tied to the specific ad-hoc-signed build.
+
 ## Development gates
 
 ```
@@ -389,6 +441,7 @@ cd client && cargo fmt --all --check && cargo clippy --all-targets -- -D warning
 
 ```
 dotnet build server/Vorcall.Server.csproj -warnaserror
+dotnet test tests/Vorcall.Server.Tests
 ```
 
-There are no automated tests in the MVP outside `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app`, `vorcall-hotkey` and `vorcall-screen`'s unit tests. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph. `cargo xwin clippy --target x86_64-pc-windows-msvc -p vorcall-screen` (from `client/`) checks the Windows capture backend from Linux; the macOS backend compiles only on `release.yml`'s macOS runner, so a dry-run dispatch (see [Cutting a release](#cutting-a-release)) is the only way to check it without a Mac.
+The automated tests are `tests/Vorcall.Server.Tests` (the permission-engine matrix, the name grammar, validation — CI runs it too) and the unit tests of `vorcall-voice`, `vorcall-core`, `vorcall-release`, `vorcall-app`, `vorcall-hotkey` and `vorcall-screen`. `cargo tree -i aws-lc-rs` (run from `client/`) must report no match — the Windows cross build depends on `aws-lc-rs` staying out of the dependency graph. `cargo xwin clippy --target x86_64-pc-windows-msvc -p vorcall-screen` (from `client/`) checks the Windows capture backend from Linux; the macOS backend compiles only on `release.yml`'s macOS runner, so a dry-run dispatch (see [Cutting a release](#cutting-a-release)) is the only way to check it without a Mac.

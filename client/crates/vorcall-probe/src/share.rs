@@ -297,7 +297,7 @@ struct Decode {
 /// decode thread once the server confirms the watch.
 pub struct WatchPlan {
     pub user: String,
-    pub room_id: String,
+    pub channel_id: i64,
     /// The watch has to be confirmed by then, or the run has failed.
     pub confirm_by: Instant,
     user_id: Option<i64>,
@@ -308,10 +308,10 @@ pub struct WatchPlan {
 }
 
 impl WatchPlan {
-    pub fn new(user: String, room_id: String, confirm_by: Instant) -> Self {
+    pub fn new(user: String, channel_id: i64, confirm_by: Instant) -> Self {
         Self {
             user,
-            room_id,
+            channel_id,
             confirm_by,
             user_id: None,
             sharing: HashSet::new(),

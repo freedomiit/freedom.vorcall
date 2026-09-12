@@ -24,8 +24,8 @@ public sealed record AppendOutcome(AppendOutcome.Kind Status, ChatMessage? Messa
     public static AppendOutcome Appended(ChatMessage message) => new(Kind.Appended, message);
 }
 
-// RoomId is empty only when Status is Unknown; Message is set only when Status is Edited.
-public sealed record EditOutcome(EditOutcome.Kind Status, string RoomId, ChatMessage? Message)
+// ChannelId is 0 only when Status is Unknown; Message is set only when Status is Edited.
+public sealed record EditOutcome(EditOutcome.Kind Status, long ChannelId, ChatMessage? Message)
 {
     public enum Kind
     {
@@ -34,15 +34,15 @@ public sealed record EditOutcome(EditOutcome.Kind Status, string RoomId, ChatMes
         Forbidden,
     }
 
-    public static EditOutcome Unknown { get; } = new(Kind.Unknown, string.Empty, null);
+    public static EditOutcome Unknown { get; } = new(Kind.Unknown, 0, null);
 
-    public static EditOutcome Forbidden(string roomId) => new(Kind.Forbidden, roomId, null);
+    public static EditOutcome Forbidden(long channelId) => new(Kind.Forbidden, channelId, null);
 
-    public static EditOutcome Edited(string roomId, ChatMessage message) => new(Kind.Edited, roomId, message);
+    public static EditOutcome Edited(long channelId, ChatMessage message) => new(Kind.Edited, channelId, message);
 }
 
 // Attachments are the rows the delete removed, so the caller can delete their files.
-public sealed record DeleteOutcome(DeleteOutcome.Kind Status, string RoomId, IReadOnlyList<(long Id, string ContentType)> Attachments)
+public sealed record DeleteOutcome(DeleteOutcome.Kind Status, long ChannelId, IReadOnlyList<(long Id, string ContentType)> Attachments)
 {
     public enum Kind
     {
@@ -51,16 +51,16 @@ public sealed record DeleteOutcome(DeleteOutcome.Kind Status, string RoomId, IRe
         Forbidden,
     }
 
-    public static DeleteOutcome Unknown { get; } = new(Kind.Unknown, string.Empty, []);
+    public static DeleteOutcome Unknown { get; } = new(Kind.Unknown, 0, []);
 
-    public static DeleteOutcome Forbidden(string roomId) => new(Kind.Forbidden, roomId, []);
+    public static DeleteOutcome Forbidden(long channelId) => new(Kind.Forbidden, channelId, []);
 
-    public static DeleteOutcome Deleted(string roomId, IReadOnlyList<(long Id, string ContentType)> attachments)
-        => new(Kind.Deleted, roomId, attachments);
+    public static DeleteOutcome Deleted(long channelId, IReadOnlyList<(long Id, string ContentType)> attachments)
+        => new(Kind.Deleted, channelId, attachments);
 }
 
 // Reactions is the full grouped set for the message, which the broadcast carries as-is.
-public sealed record ReactOutcome(ReactOutcome.Kind Status, string RoomId, IReadOnlyList<Protocol.Reaction> Reactions)
+public sealed record ReactOutcome(ReactOutcome.Kind Status, long ChannelId, IReadOnlyList<Protocol.Reaction> Reactions)
 {
     public enum Kind
     {
@@ -68,31 +68,27 @@ public sealed record ReactOutcome(ReactOutcome.Kind Status, string RoomId, IRead
         Unknown,
     }
 
-    public static ReactOutcome Unknown { get; } = new(Kind.Unknown, string.Empty, []);
+    public static ReactOutcome Unknown { get; } = new(Kind.Unknown, 0, []);
 
-    public static ReactOutcome Changed(string roomId, IReadOnlyList<Protocol.Reaction> reactions)
-        => new(Kind.Changed, roomId, reactions);
+    public static ReactOutcome Changed(long channelId, IReadOnlyList<Protocol.Reaction> reactions)
+        => new(Kind.Changed, channelId, reactions);
 }
 
 public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactory)
 {
     private const int ExcerptMaxScalars = 120;
 
-    // The plain-text path, kept while the socket handler still calls it: without a reply and
-    // without attachments there is nothing an append can be rejected for.
-    public async Task<ChatMessage> AppendAsync(long userId, string author, string roomId, string text)
-    {
-        var outcome = await AppendAsync(userId, author, roomId, text, 0, []);
-        return outcome.Message!;
-    }
-
+    // mayMentionEveryone is MENTION_EVERYONE resolved for the sender in this channel: without it
+    // the literal words stay plain text and both flags are false, rather than the message being
+    // refused.
     public async Task<AppendOutcome> AppendAsync(
         long userId,
         string author,
-        string roomId,
+        long channelId,
         string text,
         long replyToId,
-        IReadOnlyList<long> attachmentIds)
+        IReadOnlyList<long> attachmentIds,
+        bool mayMentionEveryone)
     {
         // The handler checks both before it gets here; a service that trusts its caller is a
         // service that writes a message with someone else's file attached.
@@ -115,7 +111,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             // still resolve.
             replyTarget = await db.Messages
                 .AsNoTracking()
-                .Where(m => m.Id == replyToId && m.RoomId == roomId)
+                .Where(m => m.Id == replyToId && m.ChannelId == channelId)
                 .Select(m => new ReplyTarget(m.Id, m.Author, m.Text, m.DeletedAt != null))
                 .FirstOrDefaultAsync();
             if (replyTarget is null)
@@ -124,17 +120,26 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             }
         }
 
+        var mentionEveryone = false;
+        var mentionHere = false;
+        if (mayMentionEveryone)
+        {
+            (mentionEveryone, mentionHere) = Validation.MentionFlags(text);
+        }
+
         // Author is stored next to the id: the message keeps the name it was sent under even
         // if the account is renamed or deleted.
         var message = new Data.Message
         {
             UserId = userId,
             Author = author,
-            RoomId = roomId,
+            ChannelId = channelId,
             Text = text,
             SentAt = DateTime.UtcNow,
             ReplyToId = replyToId == 0 ? null : replyToId,
             MentionIds = await Mentions.ResolveAsync(db, text),
+            MentionEveryone = mentionEveryone,
+            MentionHere = mentionHere,
         };
 
         db.Messages.Add(message);
@@ -151,7 +156,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             // row that vanished under us out of the change tracker, where it would surface as a
             // DbUpdateConcurrencyException and take the socket down with it.
             var linked = await db.Attachments
-                .Where(a => ids.Contains(a.Id) && a.MessageId == null && a.UploaderId == userId && a.RoomId == roomId)
+                .Where(a => ids.Contains(a.Id) && a.MessageId == null && a.UploaderId == userId && a.ChannelId == channelId)
                 .ExecuteUpdateAsync(setters => setters.SetProperty(a => a.MessageId, message.Id));
             if (linked != attachmentIds.Count)
             {
@@ -176,7 +181,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         return AppendOutcome.Appended(ToProtocol(message, [], ordered, replyTarget));
     }
 
-    public async Task<EditOutcome> EditAsync(long id, long userId, string text)
+    public async Task<EditOutcome> EditAsync(long id, long userId, string text, bool mayMentionEveryone)
     {
         await using var db = await contextFactory.CreateDbContextAsync();
         var message = await db.Messages.FirstOrDefaultAsync(m => m.Id == id);
@@ -185,21 +190,32 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             return EditOutcome.Unknown;
         }
 
+        // MANAGE_MESSAGES does not grant editing someone else's text, so the author is the only
+        // one who gets past here.
         if (message.UserId != userId)
         {
-            return EditOutcome.Forbidden(message.RoomId);
+            return EditOutcome.Forbidden(message.ChannelId);
+        }
+
+        var mentionEveryone = false;
+        var mentionHere = false;
+        if (mayMentionEveryone)
+        {
+            (mentionEveryone, mentionHere) = Validation.MentionFlags(text);
         }
 
         message.Text = text;
         message.EditedAt = DateTime.UtcNow;
         message.MentionIds = await Mentions.ResolveAsync(db, text);
+        message.MentionEveryone = mentionEveryone;
+        message.MentionHere = mentionHere;
         await db.SaveChangesAsync();
 
         var reactions = await LoadReactionsAsync(db, [id]);
         var attachments = await LoadAttachmentsAsync(db, [id]);
         var replyTargets = await LoadReplyTargetsAsync(db, ReplyTargetIds([message]));
         return EditOutcome.Edited(
-            message.RoomId,
+            message.ChannelId,
             ToProtocol(
                 message,
                 reactions.GetValueOrDefault(id, []),
@@ -207,7 +223,9 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
                 ReplyTargetOf(message, replyTargets)));
     }
 
-    public async Task<DeleteOutcome> DeleteAsync(long id, long userId)
+    // canManage is MANAGE_MESSAGES resolved for the actor in the message's channel: the author
+    // may always delete its own, anyone else needs the bit.
+    public async Task<DeleteOutcome> DeleteAsync(long id, long actorId, bool canManage)
     {
         await using var db = await contextFactory.CreateDbContextAsync();
         await using var transaction = await db.Database.BeginTransactionAsync();
@@ -218,9 +236,9 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             return DeleteOutcome.Unknown;
         }
 
-        if (message.UserId != userId)
+        if (message.UserId != actorId && !canManage)
         {
-            return DeleteOutcome.Forbidden(message.RoomId);
+            return DeleteOutcome.Forbidden(message.ChannelId);
         }
 
         var attachments = await db.Attachments
@@ -230,18 +248,20 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             .Select(a => new { a.Id, a.ContentType })
             .ToListAsync();
 
-        // The row survives as a tombstone: its id, author and room are what a reply to it still
-        // resolves against. ReplyToId is kept for the same reason, from the other side.
+        // The row survives as a tombstone: its id, author and channel are what a reply to it
+        // still resolves against. ReplyToId is kept for the same reason, from the other side.
         message.DeletedAt = DateTime.UtcNow;
         message.Text = string.Empty;
         message.MentionIds = [];
+        message.MentionEveryone = false;
+        message.MentionHere = false;
         await db.SaveChangesAsync();
         await db.Reactions.Where(r => r.MessageId == id).ExecuteDeleteAsync();
         await db.Attachments.Where(a => a.MessageId == id).ExecuteDeleteAsync();
         await transaction.CommitAsync();
 
         return DeleteOutcome.Deleted(
-            message.RoomId,
+            message.ChannelId,
             attachments.Select(a => (a.Id, a.ContentType)).ToList());
     }
 
@@ -251,7 +271,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         var message = await db.Messages
             .AsNoTracking()
             .Where(m => m.Id == messageId)
-            .Select(m => new { m.RoomId, m.DeletedAt })
+            .Select(m => new { m.ChannelId, m.DeletedAt })
             .FirstOrDefaultAsync();
         if (message is null || message.DeletedAt is not null)
         {
@@ -286,10 +306,11 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         }
 
         var reactions = await LoadReactionsAsync(db, [messageId]);
-        return ReactOutcome.Changed(message.RoomId, reactions.GetValueOrDefault(messageId, []));
+        return ReactOutcome.Changed(message.ChannelId, reactions.GetValueOrDefault(messageId, []));
     }
 
-    // Ids are global, not per room: the latest id is what a client compares its history against.
+    // Ids are global, not per channel: the latest id is what a client compares its history
+    // against.
     public async Task<long> GetLatestIdAsync()
     {
         await using var db = await contextFactory.CreateDbContextAsync();
@@ -297,22 +318,22 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
     }
 
     // Null when the id names no message, which every caller answers as an unknown message.
-    public async Task<string?> RoomOfAsync(long messageId)
+    public async Task<long?> ChannelOfAsync(long messageId)
     {
         await using var db = await contextFactory.CreateDbContextAsync();
         return await db.Messages
             .AsNoTracking()
             .Where(m => m.Id == messageId)
-            .Select(m => m.RoomId)
+            .Select(m => (long?)m.ChannelId)
             .FirstOrDefaultAsync();
     }
 
-    public async Task<MessagePage> GetPageAsync(string roomId, int limit, long? before)
+    public async Task<MessagePage> GetPageAsync(long channelId, int limit, long? before)
     {
         await using var db = await contextFactory.CreateDbContextAsync();
 
         // Tombstones stay in the page: a history with holes would renumber what the client sees.
-        var query = db.Messages.AsNoTracking().Where(m => m.RoomId == roomId);
+        var query = db.Messages.AsNoTracking().Where(m => m.ChannelId == channelId);
         if (before is { } exclusiveUpperBound)
         {
             query = query.Where(m => m.Id < exclusiveUpperBound);
@@ -442,7 +463,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             Author = message.Author,
             Text = message.Text,
             SentAtUnixMs = new DateTimeOffset(message.SentAt).ToUnixTimeMilliseconds(),
-            RoomId = message.RoomId,
+            ChannelId = message.ChannelId,
 
             // 0 for the messages that predate accounts, as PROTOCOL.md promises.
             AuthorId = message.UserId ?? 0,
@@ -450,6 +471,8 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
                 ? new DateTimeOffset(editedAt).ToUnixTimeMilliseconds()
                 : 0,
             Deleted = message.DeletedAt is not null,
+            MentionEveryone = message.MentionEveryone,
+            MentionHere = message.MentionHere,
         };
 
         chatMessage.MentionIds.AddRange(message.MentionIds);

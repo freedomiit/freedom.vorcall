@@ -5,9 +5,10 @@
 //! low-level hook whose procedure takes too long, so the only work they do is
 //! a table lookup and a send on an unbounded channel.
 //!
-//! Hook procedures carry no user data, so the binding, the sender and the edge
-//! filter live in one process-wide slot — which is why only one listener can
-//! run at a time.
+//! Hook procedures carry no user data, so every binding, the sender and the
+//! edge filters live in one process-wide slot — which is why only one listener
+//! can run at a time. One pair of hooks serves them all; the modifiers a chord
+//! needs are tracked from the very same key events.
 
 use std::ptr;
 use std::sync::{Mutex, PoisonError, mpsc};
@@ -25,7 +26,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
 };
 
-use crate::{Backend, Binding, Edge, EdgeFilter, Listener, MouseButton, Stop, Unavailable, keymap};
+use crate::{
+    ActionId, Backend, Edge, Key, Listener, Modifier, ModifierKeys, MouseButton, Router, Shortcut,
+    Stop, Trigger, Unavailable, keymap,
+};
 
 /// How long `start` waits for each step of the thread's start-up.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -42,16 +46,28 @@ enum Started {
 static STATE: Mutex<Option<HookState>> = Mutex::new(None);
 
 struct HookState {
-    target: Target,
-    edges: UnboundedSender<Edge>,
-    filter: EdgeFilter,
+    modifiers: ModifierKeys<u16>,
+    router: Router<Target>,
 }
 
 impl HookState {
-    fn emit(&mut self, edge: Edge) {
-        if self.filter.admit(edge) {
-            let _ = self.edges.unbounded_send(edge);
-        }
+    /// A key event: it may be a trigger, a modifier, or both — a binding on a
+    /// bare `Control` is exactly that.
+    fn key(&mut self, vk: u16, edge: Edge) {
+        self.modifiers.note(&vk, edge);
+        let mods = self.modifiers.mods();
+        self.router.set_mods(mods);
+        self.router.trigger(
+            edge,
+            |target| matches!(target, Target::Keys(keys) if keys.contains(&vk)),
+        );
+    }
+
+    fn mouse(&mut self, button: MouseButton, edge: Edge) {
+        self.router.trigger(
+            edge,
+            |target| matches!(target, Target::Mouse(bound) if *bound == button),
+        );
     }
 }
 
@@ -63,28 +79,32 @@ enum Target {
 }
 
 pub(crate) fn start(
-    binding: Binding,
-    edges: UnboundedSender<Edge>,
+    bindings: Vec<Shortcut>,
+    edges: UnboundedSender<(ActionId, Edge)>,
 ) -> Result<Listener, Unavailable> {
-    let target = match binding {
-        Binding::Key(key) => Target::Keys(keymap::windows_vks(key)),
-        Binding::Mouse(button) => Target::Mouse(button),
+    let mut router = Router::new(edges);
+    for shortcut in &bindings {
+        let target = match shortcut.binding.trigger {
+            Trigger::Key(key) => Target::Keys(keymap::windows_vks(key)),
+            Trigger::Mouse(button) => Target::Mouse(button),
+        };
+        router.push(shortcut.action, shortcut.binding.mods(), target);
+    }
+    let state = HookState {
+        modifiers: ModifierKeys::new(modifier_keys()),
+        router,
     };
 
     // Claimed before the thread starts so two concurrent calls cannot both
     // think the slot is free.
     {
-        let mut state = lock_state();
-        if state.is_some() {
+        let mut slot = lock_state();
+        if slot.is_some() {
             return Err(Unavailable::Failed(
                 "a listener is already running".to_string(),
             ));
         }
-        *state = Some(HookState {
-            target,
-            edges,
-            filter: EdgeFilter::default(),
-        });
+        *slot = Some(state);
     }
 
     let (ready_tx, ready_rx) = mpsc::channel::<Started>();
@@ -111,7 +131,14 @@ pub(crate) fn start(
         thread: Some(thread),
     };
     match ready_rx.recv_timeout(INSTALL_TIMEOUT) {
-        Ok(Started::Hooked) => Ok(Listener::new(Backend::WindowsHook, None, Box::new(handle))),
+        // Every key and button of the grammar has a virtual key, so this backend
+        // never leaves a binding out.
+        Ok(Started::Hooked) => Ok(Listener::new(
+            Backend::WindowsHook,
+            Vec::new(),
+            Vec::new(),
+            Box::new(handle),
+        )),
         Ok(Started::Failed(err)) => {
             handle.stop();
             Err(err)
@@ -123,6 +150,23 @@ pub(crate) fn start(
             ))
         }
     }
+}
+
+/// Every virtual key that raises a modifier: both sides plus the side-agnostic
+/// code injected input carries.
+fn modifier_keys() -> Vec<(u16, Modifier)> {
+    [
+        (Key::Control, Modifier::Ctrl),
+        (Key::Shift, Modifier::Shift),
+        (Key::Alt, Modifier::Alt),
+    ]
+    .into_iter()
+    .flat_map(|(key, modifier)| {
+        keymap::windows_vks(key)
+            .into_iter()
+            .map(move |vk| (vk, modifier))
+    })
+    .collect()
 }
 
 fn run(ready: &mpsc::Sender<Started>) {
@@ -215,10 +259,8 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             // at a KBDLLHOOKSTRUCT that outlives this call.
             let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
             let key = info.vkCode as u16;
-            if let Some(state) = lock_state().as_mut()
-                && matches!(&state.target, Target::Keys(keys) if keys.contains(&key))
-            {
-                state.emit(edge);
+            if let Some(state) = lock_state().as_mut() {
+                state.key(key, edge);
             }
         }
     }
@@ -234,9 +276,8 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
         if let Some((button, edge)) = mouse_event(wparam as u32, info.mouseData)
             && let Some(state) = lock_state().as_mut()
-            && matches!(&state.target, Target::Mouse(bound) if *bound == button)
         {
-            state.emit(edge);
+            state.mouse(button, edge);
         }
     }
     // SAFETY: as in `keyboard_proc`.

@@ -17,8 +17,8 @@ use futures::channel::mpsc;
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::time::{MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 use tracing_subscriber::EnvFilter;
-use vorcall_core::connection::GENERAL_ROOM;
-use vorcall_core::{Command, Event, Session};
+use vorcall_core::connection::DisconnectReason;
+use vorcall_core::{Channel, ChannelKind, Command, Event, ServerSnapshot, Session};
 use vorcall_screen::preset::FrameRate;
 use vorcall_voice::codec::Encoder;
 use vorcall_voice::tone::{Tone, rms};
@@ -40,7 +40,7 @@ const TONE_RMS: f32 = 0.02;
 /// Opus at 48 kbit/s over 20 ms frames never comes near this.
 const MAX_PACKET: usize = 512;
 
-/// Sign-in, WebSocket, room join and the voice handshake all fit in this.
+/// Sign-in, WebSocket, channel join and the voice handshake all fit in this.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the sharer waits for the server to announce its own share.
@@ -60,7 +60,10 @@ vorcall-probe --username U (--password P | env VORCALL_PROBE_PASSWORD) [options]
 Options:
   --username <name>      account to sign in as (required)
   --password <secret>    password; defaults to $VORCALL_PROBE_PASSWORD
-  --room <id>            room to join (default: general)
+  --channel <id>         voice channel id to join (default: the voice channel
+                         named General, else the first voice channel)
+  --channel-name <name>  voice channel to join by name, case-insensitive
+                         (excludes --channel)
   --send-seconds <n>     seconds of tone to send (default: 10)
   --listen-seconds <n>   seconds to keep receiving, >= --send-seconds (default: 12)
   --tone-hz <hz>         tone frequency (default: 440)
@@ -90,7 +93,7 @@ alongside a second probe must hear the tone. Without --vad, --tone-amplitude 0
 still sends silent frames, so --expect-silence then exits 1 — that is the
 negative control.
 
-Screen-share oracle, two terminals against the same room:
+Screen-share oracle, two terminals against the same voice channel:
 
   vorcall-probe --username alice --share-seconds 10 --share-audio \
                 --listen-seconds 14
@@ -120,10 +123,18 @@ Update subcommands:
       Swaps PATH over this binary and starts it again. The relaunched process
       prints {\"relaunched\":true,...} and exits 0.";
 
+/// Which voice channel the run joins, resolved against the server snapshot.
+enum ChannelSelect {
+    Id(i64),
+    Name(String),
+    /// The voice channel named `General`, else the first voice channel.
+    Default,
+}
+
 struct Args {
     username: String,
     password: String,
-    room: String,
+    channel: ChannelSelect,
     send_seconds: u64,
     listen_seconds: u64,
     tone_hz: f32,
@@ -231,7 +242,7 @@ async fn probe(args: Args) -> i32 {
         &mut commands,
         &mut events,
         &mut names,
-        &args.room,
+        &args.channel,
         share_flow,
     )
     .await
@@ -263,7 +274,12 @@ async fn probe(args: Args) -> i32 {
         }
     };
     let started = Instant::now();
-    tracing::info!(ssrc = ready.ssrc, room = %ready.room_id, "voice connected");
+    tracing::info!(
+        ssrc = ready.ssrc,
+        channel_id = ready.channel_id,
+        channel = %ready.channel_name,
+        "voice connected"
+    );
 
     let plan = SendPlan {
         hz: args.tone_hz,
@@ -282,7 +298,7 @@ async fn probe(args: Args) -> i32 {
             &mut commands,
             &mut events,
             &mut names,
-            &ready.room_id,
+            ready.channel_id,
             self_id,
             args.share_audio,
         )
@@ -311,7 +327,7 @@ async fn probe(args: Args) -> i32 {
     let mut watching = args
         .watch
         .clone()
-        .map(|user| share::WatchPlan::new(user, ready.room_id.clone(), started + WATCH_TIMEOUT));
+        .map(|user| share::WatchPlan::new(user, ready.channel_id, started + WATCH_TIMEOUT));
 
     let heard = listen(
         &engine,
@@ -342,7 +358,7 @@ async fn probe(args: Args) -> i32 {
     if args.share_seconds.is_some() {
         let _ = commands
             .send(Command::StopShare {
-                room_id: ready.room_id.clone(),
+                channel_id: ready.channel_id,
             })
             .await;
     }
@@ -370,7 +386,7 @@ async fn probe(args: Args) -> i32 {
     if watch.is_some() {
         let _ = commands
             .send(Command::UnwatchShare {
-                room_id: ready.room_id.clone(),
+                channel_id: ready.channel_id,
             })
             .await;
     }
@@ -384,7 +400,7 @@ async fn probe(args: Args) -> i32 {
 
     let _ = commands
         .send(Command::LeaveVoice {
-            room_id: ready.room_id.clone(),
+            channel_id: ready.channel_id,
         })
         .await;
     let _ = timeout(Duration::from_secs(1), async {
@@ -399,6 +415,7 @@ async fn probe(args: Args) -> i32 {
     .await;
     engine.close().await;
 
+    let shut_out = heard.shut_out;
     let link = if heard.link_lost {
         "lost"
     } else {
@@ -411,7 +428,8 @@ async fn probe(args: Args) -> i32 {
     let report = Report {
         user: username,
         user_id: self_id,
-        room: ready.room_id,
+        channel_id: ready.channel_id,
+        channel_name: ready.channel_name,
         ssrc: ready.ssrc,
         packets_sent: stats.packets_sent,
         packets_received: stats.packets_received,
@@ -456,6 +474,10 @@ async fn probe(args: Args) -> i32 {
     println!("{}", report.render());
     let _ = std::io::stdout().flush();
 
+    if shut_out {
+        eprintln!("vorcall-probe: a moderator kicked or banned the account mid-run");
+        return 2;
+    }
     if args.expect_silence && report.frames_sent > 0 {
         tracing::error!(
             frames_sent = report.frames_sent,
@@ -496,20 +518,17 @@ async fn probe(args: Args) -> i32 {
 }
 
 /// Announces the local share and waits for the server to echo it back, which is
-/// what makes the room offer it to watchers.
+/// what makes the channel offer it to watchers.
 async fn start_share(
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
     names: &mut HashMap<u32, (i64, String)>,
-    room_id: &str,
+    channel_id: i64,
     self_id: i64,
     audio: bool,
 ) -> Result<(), String> {
     if commands
-        .send(Command::StartShare {
-            room_id: room_id.to_owned(),
-            audio,
-        })
+        .send(Command::StartShare { channel_id, audio })
         .await
         .is_err()
     {
@@ -549,21 +568,80 @@ async fn connection_loop(
 }
 
 struct VoiceReady {
-    room_id: String,
+    channel_id: i64,
+    channel_name: String,
     host: String,
     port: u16,
     key: [u8; 32],
     ssrc: u32,
 }
 
+/// Whether this channel can carry a voice session at all.
+fn joinable(channel: &Channel) -> bool {
+    channel.kind == ChannelKind::Voice as i32 || channel.kind == ChannelKind::Dm as i32
+}
+
+/// The sidebar order of one channel: its category's position, then its own.
+/// A channel in no category sorts above every category, like the UI shows it.
+fn sidebar_order(snapshot: &ServerSnapshot, channel: &Channel) -> (i32, i32) {
+    let category = snapshot
+        .categories
+        .iter()
+        .find(|category| category.id == channel.category_id)
+        .map_or(i32::MIN, |category| category.position);
+    (category, channel.position)
+}
+
+/// The channel the run joins, from the snapshot the server just sent. The error
+/// is a usage error: nothing the probe does later can make the channel appear.
+fn resolve_channel(
+    snapshot: &ServerSnapshot,
+    select: &ChannelSelect,
+) -> Result<(i64, String), String> {
+    let mut voice: Vec<&Channel> = snapshot
+        .channels
+        .iter()
+        .filter(|channel| channel.kind == ChannelKind::Voice as i32)
+        .collect();
+    voice.sort_by_key(|channel| sidebar_order(snapshot, channel));
+
+    match select {
+        ChannelSelect::Id(id) => {
+            let channel = snapshot
+                .channels
+                .iter()
+                .find(|channel| channel.id == *id)
+                .ok_or_else(|| format!("--channel {id} is not a channel this account can see"))?;
+            if !joinable(channel) {
+                return Err(format!("--channel {id} is not a voice channel or a DM"));
+            }
+            Ok((channel.id, channel.name.clone()))
+        }
+        ChannelSelect::Name(name) => voice
+            .iter()
+            .find(|channel| channel.name.eq_ignore_ascii_case(name))
+            .map(|channel| (channel.id, channel.name.clone()))
+            .ok_or_else(|| format!("--channel-name {name}: no such voice channel")),
+        ChannelSelect::Default => {
+            let channel = voice
+                .iter()
+                .find(|channel| channel.name.eq_ignore_ascii_case("General"))
+                .or_else(|| voice.first())
+                .ok_or("this server has no voice channel to join")?;
+            Ok((channel.id, channel.name.clone()))
+        }
+    }
+}
+
 async fn wait_for_voice(
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
     names: &mut HashMap<u32, (i64, String)>,
-    room: &str,
+    select: &ChannelSelect,
     share_flow: bool,
 ) -> Result<VoiceReady, String> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    let mut resolved: Option<(i64, String)> = None;
 
     loop {
         let event = match timeout_at(deadline, events.next()).await {
@@ -577,10 +655,15 @@ async fn wait_for_voice(
         match event {
             Event::Connected { username, .. } => {
                 tracing::info!(%username, "signed in on the WebSocket");
+            }
+            // The snapshot always follows Welcome, and it is the only place the
+            // channel the run asked for can be named.
+            Event::Snapshot(snapshot) => {
+                let (channel_id, name) = resolve_channel(&snapshot, select)?;
+                tracing::info!(channel_id, %name, "joining voice");
+                resolved = Some((channel_id, name));
                 if commands
-                    .send(Command::JoinVoice {
-                        room_id: room.to_owned(),
-                    })
+                    .send(Command::JoinVoice { channel_id })
                     .await
                     .is_err()
                 {
@@ -588,12 +671,15 @@ async fn wait_for_voice(
                 }
             }
             Event::Disconnected { reason, retry_in } => {
+                if let DisconnectReason::Kicked | DisconnectReason::Banned = reason {
+                    return Err(format!("the account was shut out: {reason}"));
+                }
                 tracing::warn!(%reason, ?retry_in, "disconnected before voice was ready");
             }
             // 15..=17 are the share refusals, fatal only to a run that is
             // about to share or watch.
             Event::ServerError { code, detail, .. }
-                if matches!(code, 5..=7) || (share_flow && matches!(code, 15..=17)) =>
+                if matches!(code, 5 | 7 | 20) || (share_flow && matches!(code, 15..=17)) =>
             {
                 return Err(format!(
                     "the server refused the voice join ({code}): {detail}"
@@ -607,14 +693,19 @@ async fn wait_for_voice(
                 tracing::warn!(code, %detail, fatal, "server error");
             }
             Event::VoiceReady {
-                room_id,
+                channel_id,
                 host,
                 port,
                 key,
                 ssrc,
             } => {
+                let channel_name = match resolved {
+                    Some((id, name)) if id == channel_id => name,
+                    _ => String::new(),
+                };
                 return Ok(VoiceReady {
-                    room_id,
+                    channel_id,
+                    channel_name,
                     host,
                     port,
                     key: key.0,
@@ -634,10 +725,12 @@ struct Heard {
     watchers_max: u32,
     speaking: Vec<SpeakingEvent>,
     link_lost: bool,
+    /// A moderator kicked or banned the account mid-run.
+    shut_out: bool,
 }
 
 /// Pulls a frame out of the playout every 20 ms — even while nobody speaks, so
-/// the jitter buffers keep draining — and follows the room in parallel. Under
+/// the jitter buffers keep draining — and follows the channel in parallel. Under
 /// `--watch` it also drives the watch: asks for the sharer's stream once they
 /// are known to be sharing, and starts decoding when the server confirms it.
 async fn listen(
@@ -714,10 +807,24 @@ async fn listen(
                             tracing::info!(user_id, ?ssrc, "the server confirmed the watch");
                         }
                     }
-                    Event::ServerError { code, detail, .. } if matches!(code, 15..=17) => {
-                        tracing::error!(code, %detail, "the server refused a share command");
+                    Event::ServerError { code, detail, .. } if matches!(code, 15..=17 | 20) => {
+                        tracing::error!(code, %detail, "the server refused a command");
+                    }
+                    // A moderator moved or disconnected this session; either
+                    // way the media key and ssrc are now stale and the probe
+                    // has no re-key path, so the run ends here.
+                    Event::VoiceMoved { channel_id } => {
+                        println!("{{\"moved_to\":{channel_id}}}");
+                        let _ = std::io::stdout().flush();
+                        tracing::info!(
+                            channel_id,
+                            "a moderator moved this session; ending the run"
+                        );
+                        break;
                     }
                     Event::Disconnected { reason, retry_in } => {
+                        heard.shut_out =
+                            matches!(reason, DisconnectReason::Kicked | DisconnectReason::Banned);
                         tracing::warn!(%reason, ?retry_in, "disconnected during the run");
                         heard.link_lost = true;
                         break;
@@ -728,9 +835,14 @@ async fn listen(
                 if let Some(plan) = watch.as_deref_mut()
                     && let Some(user_id) = plan.pending_request(names)
                 {
-                    let room_id = plan.room_id.clone();
+                    let channel_id = plan.channel_id;
                     tracing::info!(user_id, user = %plan.user, "asking to watch a share");
-                    let _ = commands.send(Command::WatchShare { room_id, user_id }).await;
+                    let _ = commands
+                        .send(Command::WatchShare {
+                            channel_id,
+                            user_id,
+                        })
+                        .await;
                 }
             }
         }
@@ -831,7 +943,8 @@ async fn send_tone(sender: FrameSender, plan: SendPlan, frames: u64) -> SendOutc
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let mut username = None;
     let mut password = None;
-    let mut room = GENERAL_ROOM.to_owned();
+    let mut channel_id = None;
+    let mut channel_name = None;
     let mut send_seconds = 10u64;
     let mut listen_seconds = 12u64;
     let mut tone_hz = 440.0f32;
@@ -886,7 +999,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
             "--vad" => vad = true,
             "--username" => username = Some(value(&flag, &mut args)?),
             "--password" => password = Some(value(&flag, &mut args)?),
-            "--room" => room = value(&flag, &mut args)?,
+            "--channel" => {
+                let raw = value(&flag, &mut args)?;
+                channel_id = Some(
+                    raw.parse::<i64>()
+                        .map_err(|_| format!("--channel wants a channel id, got {raw}"))?,
+                );
+            }
+            "--channel-name" => channel_name = Some(value(&flag, &mut args)?),
             "--send-seconds" => send_seconds = number(&flag, &mut args)?,
             "--listen-seconds" => listen_seconds = number(&flag, &mut args)?,
             "--tone-hz" => {
@@ -919,9 +1039,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
         .or_else(|| std::env::var("VORCALL_PROBE_PASSWORD").ok())
         .filter(|password| !password.is_empty())
         .ok_or("--password or VORCALL_PROBE_PASSWORD is required")?;
-    if room.is_empty() {
-        return Err("--room cannot be empty".to_owned());
-    }
+    let channel = match (channel_id, channel_name) {
+        (Some(_), Some(_)) => {
+            return Err("--channel and --channel-name cannot be used together".to_owned());
+        }
+        (Some(id), None) => ChannelSelect::Id(id),
+        (None, Some(name)) if name.is_empty() => {
+            return Err("--channel-name cannot be empty".to_owned());
+        }
+        (None, Some(name)) => ChannelSelect::Name(name),
+        (None, None) => ChannelSelect::Default,
+    };
     if listen_seconds < send_seconds {
         return Err("--listen-seconds cannot be shorter than --send-seconds".to_owned());
     }
@@ -938,7 +1066,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
     Ok(Some(Args {
         username,
         password,
-        room,
+        channel,
         send_seconds,
         listen_seconds,
         tone_hz,

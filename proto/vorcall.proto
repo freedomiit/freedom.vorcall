@@ -4,13 +4,15 @@ package vorcall.v1;
 
 option csharp_namespace = "Vorcall.Server.Protocol";
 
-// A persisted chat message. Ids are server-assigned and strictly increasing across all rooms.
+// A persisted chat message. Ids are server-assigned and strictly increasing across all channels.
 message ChatMessage {
+  reserved 5;                     // was room_id, before channels had numeric ids
+  reserved "room_id";
+
   int64 id = 1;
   string author = 2;              // username at the time of sending
   string text = 3;
   int64 sent_at_unix_ms = 4;
-  string room_id = 5;             // the room the message belongs to
   int64 author_id = 6;            // user id; 0 for messages that predate accounts
   int64 edited_at_unix_ms = 7;    // 0 = never edited
   bool deleted = 8;               // tombstone: text is empty, no attachments, no reactions
@@ -18,6 +20,9 @@ message ChatMessage {
   repeated int64 mention_ids = 10;      // users named by <@id> tokens in text, validated by the server
   repeated Reaction reactions = 11;     // grouped by emoji, user ids ascending
   repeated Attachment attachments = 12;
+  int64 channel_id = 13;          // the channel the message belongs to
+  bool mention_everyone = 14;     // @everyone by a sender holding MENTION_EVERYONE
+  bool mention_here = 15;         // @here, same rule; online members only
 }
 
 // A snapshot of the message a reply points at, resolved when the reply is read.
@@ -35,7 +40,7 @@ message Reaction {
 }
 
 // An image attached to a message.
-// REST: POST /api/attachments?room=<id> -> Attachment
+// REST: POST /api/attachments?channel=<id> -> Attachment
 // REST: GET /api/attachments/{id} -> the bytes
 message Attachment {
   int64 id = 1;
@@ -44,24 +49,112 @@ message Attachment {
   int64 size = 4;                 // bytes
 }
 
-enum RoomKind {
-  ROOM_KIND_UNSPECIFIED = 0;
-  ROOM_KIND_PUBLIC = 1;           // any account may see and join
-  ROOM_KIND_DM = 2;               // exactly two permanent members
+enum Permission {                        // bit masks; server-scoped bits never appear in an override
+  PERMISSION_UNSPECIFIED      = 0;
+  PERMISSION_MANAGE_SERVER    = 1;       // 1<<0  server-scoped
+  PERMISSION_MANAGE_CHANNELS  = 2;       // 1<<1  channel-scoped
+  PERMISSION_MANAGE_ROLES     = 4;       // 1<<2  server-scoped
+  PERMISSION_MANAGE_MEMBERS   = 8;       // 1<<3  server-scoped: others' nicknames, role assignment
+  PERMISSION_MANAGE_MESSAGES  = 16;      // 1<<4  channel-scoped: delete others' messages
+  PERMISSION_MANAGE_INVITES   = 32;      // 1<<5  server-scoped
+  PERMISSION_KICK_MEMBERS     = 64;      // 1<<6  server-scoped
+  PERMISSION_BAN_MEMBERS      = 128;     // 1<<7  server-scoped
+  PERMISSION_VIEW_CHANNEL     = 256;     // 1<<8  channel-scoped
+  PERMISSION_SEND_MESSAGES    = 512;     // 1<<9
+  PERMISSION_ATTACH_FILES     = 1024;    // 1<<10
+  PERMISSION_ADD_REACTIONS    = 2048;    // 1<<11
+  PERMISSION_MENTION_EVERYONE = 4096;    // 1<<12
+  PERMISSION_CONNECT          = 8192;    // 1<<13
+  PERMISSION_SPEAK            = 16384;   // 1<<14
+  PERMISSION_SHARE_SCREEN     = 32768;   // 1<<15
+  PERMISSION_MUTE_MEMBERS     = 65536;   // 1<<16
+  PERMISSION_DEAFEN_MEMBERS   = 131072;  // 1<<17
+  PERMISSION_MOVE_MEMBERS     = 262144;  // 1<<18
+  PERMISSION_PRIORITY_SPEAKER = 524288;  // 1<<19
+  PERMISSION_CHANGE_NICKNAME  = 1048576; // 1<<20 server-scoped: own nickname
+}
+// ALL = 0x1FFFFF. SERVER_SCOPED = MANAGE_SERVER|MANAGE_ROLES|MANAGE_MEMBERS|MANAGE_INVITES|KICK|BAN|CHANGE_NICKNAME.
+// EVERYONE_DEFAULT = VIEW|SEND|ATTACH|REACT|CONNECT|SPEAK|SHARE_SCREEN|CHANGE_NICKNAME (= 1109760).
+
+// The one server's shared facts.
+message Server {
+  string name = 1;                // 1..32 scalars after trim, no control characters
+  string description = 2;         // 0..256 scalars
+  int64 icon_image_id = 3;        // 0 = none
+  int64 owner_id = 4;             // the only account that bypasses every permission check
+  int64 general_channel_id = 5;   // the text channel that can neither be deleted nor hidden
 }
 
-// The shared facts about a room; counters are per reader and live in RoomEntry.
-message Room {
-  string room_id = 1;
-  RoomKind kind = 2;
-  string name = 3;                // display name; empty for DMs
-  repeated int64 member_ids = 4;  // persistent membership; "joined" is this list containing me
-  int64 created_by = 5;
+// A group of channels in the sidebar, ordered among its peers by position.
+message Category {
+  int64 id = 1;
+  string name = 2;                // 1..32 scalars after trim, no control characters
+  int32 position = 3;
 }
 
-// One room as it appears in RoomList, with the reader's own counters.
-message RoomEntry {
-  Room room = 1;
+enum ChannelKind {
+  CHANNEL_KIND_UNSPECIFIED = 0;
+  CHANNEL_KIND_TEXT = 1;
+  CHANNEL_KIND_VOICE = 2;
+  CHANNEL_KIND_DM = 3;            // exactly two permanent members
+}
+
+// One permission override on one channel, for a role or for a single member.
+message Override {
+  int64 role_id = 1;              // exactly one of role_id / user_id is non-zero
+  int64 user_id = 2;
+  uint64 allow = 3;               // channel-scoped Permission bits only; allow & deny == 0
+  uint64 deny = 4;
+}
+
+message Channel {
+  int64 id = 1;
+  ChannelKind kind = 2;
+  string name = 3;                // 1..32 scalars after trim, no control characters; empty for a DM; not unique
+  string topic = 4;               // 0..256 scalars
+  int64 category_id = 5;          // 0 = no category
+  int32 position = 6;             // among the channels of that category
+  repeated Override overrides = 7;
+  repeated int64 dm_member_ids = 8; // both users; DM channels only
+}
+
+// One row of ReorderChannels and ChannelOrder.
+message ChannelPosition {
+  int64 id = 1;
+  int64 category_id = 2;          // 0 = no category
+  int32 position = 3;
+}
+
+message Role {
+  int64 id = 1;
+  string name = 2;                // 1..32 scalars after trim, no control characters
+  uint32 color = 3;               // 0xRRGGBB; 0 = none
+  string icon_emoji = 4;          // at most 2 scalars
+  int64 icon_image_id = 5;        // 0 = none
+  int32 position = 6;             // higher outranks lower
+  uint64 permissions = 7;         // Permission bits
+  bool hoist = 8;                 // list its members as their own group
+  bool everyone = 9;              // the undeletable default role at position 0; only its permissions are editable
+}
+
+// A server member: the account plus everything shown about it.
+message Profile {
+  int64 user_id = 1;
+  string username = 2;            // canonical casing
+  string nickname = 3;            // empty = show the username
+  int64 avatar_image_id = 4;      // 0 = none
+  int64 banner_image_id = 5;      // 0 = none
+  string description = 6;         // 0..256 scalars
+  uint32 accent_color = 7;        // 0xRRGGBB; 0 = none
+  repeated int64 role_ids = 8;
+  bool online = 9;                // presence: the account has a live connection
+  bool server_muted = 10;
+  bool server_deafened = 11;
+}
+
+// The reader's own counters for one text or DM channel.
+message ReadState {
+  int64 channel_id = 1;
   int64 unread = 2;
   int64 mentions = 3;
   int64 last_message_id = 4;
@@ -69,15 +162,15 @@ message RoomEntry {
 
 // Client -> server. One ClientFrame per binary WebSocket message.
 message ClientFrame {
+  reserved 4, 5, 8;               // join_room, leave_room, create_room: rooms became channels in 0.5.0
+  reserved "join_room", "leave_room", "create_room";
+
   oneof payload {
     Hello hello = 1;
     SendMessage send = 2;
     Ping ping = 3;
-    JoinRoom join_room = 4;
-    LeaveRoom leave_room = 5;
     JoinVoice join_voice = 6;
     LeaveVoice leave_voice = 7;
-    CreateRoom create_room = 8;
     OpenDm open_dm = 9;
     MarkRead mark_read = 10;
     EditMessage edit_message = 11;
@@ -87,6 +180,28 @@ message ClientFrame {
     StopShare stop_share = 15;
     WatchShare watch_share = 16;
     UnwatchShare unwatch_share = 17;
+    CreateChannel create_channel = 18;
+    UpdateChannel update_channel = 19;
+    DeleteChannel delete_channel = 20;
+    CreateCategory create_category = 21;
+    UpdateCategory update_category = 22;
+    DeleteCategory delete_category = 23;
+    ReorderChannels reorder_channels = 24;
+    ReorderCategories reorder_categories = 25;
+    SetOverride set_override = 26;
+    CreateRole create_role = 27;
+    UpdateRole update_role = 28;
+    DeleteRole delete_role = 29;
+    ReorderRoles reorder_roles = 30;
+    SetMemberRoles set_member_roles = 31;
+    SetNickname set_nickname = 32;
+    KickMember kick_member = 33;
+    BanMember ban_member = 34;
+    UnbanMember unban_member = 35;
+    UpdateServer update_server = 36;
+    TransferOwnership transfer_ownership = 37;
+    VoiceModerate voice_moderate = 38;
+    UpdateProfile update_profile = 39;
   }
 }
 
@@ -100,33 +215,21 @@ message Hello {
 
 message SendMessage {
   string text = 1;                // trimmed, 1..2000 chars; may be empty only with attachments
-  string room_id = 2;             // empty means "general"
-  int64 reply_to_id = 3;          // 0 = not a reply; otherwise a message of the same room
-  repeated int64 attachment_ids = 4; // at most 4, uploaded by the sender to this room, not yet linked
+  int64 channel_id = 2;           // a text or DM channel; 0 is invalid
+  int64 reply_to_id = 3;          // 0 = not a reply; otherwise a message of the same channel
+  repeated int64 attachment_ids = 4; // at most 4, uploaded by the sender to this channel, not yet linked
 }
 
 message Ping {
   int64 sent_at_unix_ms = 1;
 }
 
-message JoinRoom {
-  string room_id = 1;
-}
-
-message LeaveRoom {
-  string room_id = 1;
-}
-
-message CreateRoom {
-  string name = 1;                // trimmed, 1..32 scalars; its slug becomes the room id
-}
-
 message OpenDm {
-  int64 user_id = 1;              // the other party; the DM is created on first use
+  int64 user_id = 1;              // the other party; the DM channel is created on first use
 }
 
 message MarkRead {
-  string room_id = 1;
+  int64 channel_id = 1;           // 0 is invalid
   int64 message_id = 2;           // the newest message the reader has seen
 }
 
@@ -146,30 +249,147 @@ message React {
 }
 
 message JoinVoice {
-  string room_id = 1;             // the text room whose voice channel to join; requires text membership
+  int64 channel_id = 1;           // a voice or DM channel; requires CONNECT (a DM member always may)
 }
 
 message LeaveVoice {
-  string room_id = 1;
+  int64 channel_id = 1;
+}
+
+message CreateChannel {
+  ChannelKind kind = 1;           // TEXT or VOICE; a DM is opened with OpenDm
+  string name = 2;
+  string topic = 3;
+  int64 category_id = 4;          // 0 = no category
+}
+
+message UpdateChannel {
+  int64 id = 1;
+  string name = 2;
+  string topic = 3;
+}
+
+message DeleteChannel {
+  int64 id = 1;
+}
+
+message CreateCategory {
+  string name = 1;
+}
+
+message UpdateCategory {
+  int64 id = 1;
+  string name = 2;
+}
+
+// Its channels move to "no category", their positions appended.
+message DeleteCategory {
+  int64 id = 1;
+}
+
+message ReorderChannels {
+  repeated ChannelPosition positions = 1; // the full list of non-DM channels
+}
+
+message ReorderCategories {
+  repeated int64 ids = 1;         // the full list; position = index
+}
+
+// Upserts one override; allow == deny == 0 deletes it.
+message SetOverride {
+  int64 channel_id = 1;
+  Override override = 2;
+}
+
+message CreateRole {
+  string name = 1;
+  uint32 color = 2;
+  string icon_emoji = 3;
+  int64 icon_image_id = 4;
+  uint64 permissions = 5;
+  bool hoist = 6;
+}
+
+// Replaces the role; position is ignored (see ReorderRoles). On the everyone role only permissions may change.
+message UpdateRole {
+  Role role = 1;
+}
+
+message DeleteRole {
+  int64 id = 1;
+}
+
+message ReorderRoles {
+  repeated int64 ids = 1;         // the full list, the everyone role excluded, bottom first; position = index + 1
+}
+
+message SetMemberRoles {
+  int64 user_id = 1;
+  repeated int64 role_ids = 2;    // replaces the member's roles
+}
+
+message SetNickname {
+  int64 user_id = 1;              // 0 = self
+  string nickname = 2;            // empty clears it
+}
+
+message KickMember {
+  int64 user_id = 1;
+}
+
+message BanMember {
+  int64 user_id = 1;
+  string reason = 2;              // 0..256 scalars
+}
+
+message UnbanMember {
+  int64 user_id = 1;
+}
+
+message UpdateServer {
+  string name = 1;
+  string description = 2;
+  int64 icon_image_id = 3;
+}
+
+message TransferOwnership {
+  int64 user_id = 1;
+}
+
+// Moderates one member's live voice session; each flag applies only when its set_* companion is true.
+message VoiceModerate {
+  int64 user_id = 1;
+  int64 channel_id = 2;           // the voice or DM channel the target is in
+  bool set_muted = 3;
+  bool muted = 4;
+  bool set_deafened = 5;
+  bool deafened = 6;
+  bool move = 7;
+  int64 move_to = 8;              // 0 = disconnect
+}
+
+message UpdateProfile {
+  string description = 1;
+  uint32 accent_color = 2;
+  int64 avatar_image_id = 3;      // 0 = keep, -1 = clear
+  int64 banner_image_id = 4;      // 0 = keep, -1 = clear
 }
 
 // Server -> client. One ServerFrame per binary WebSocket message.
 message ServerFrame {
+  reserved 5, 6, 7, 13, 14;       // room_state, member_joined, member_left, room_list, room_updated
+  reserved "room_state", "member_joined", "member_left", "room_list", "room_updated";
+
   oneof payload {
     Welcome welcome = 1;
     ChatMessage message = 2;
     Error error = 3;
     Pong pong = 4;
-    RoomState room_state = 5;
-    MemberJoined member_joined = 6;
-    MemberLeft member_left = 7;
     VoiceReady voice_ready = 8;
     VoiceState voice_state = 9;
     VoiceMemberJoined voice_member_joined = 10;
     VoiceMemberLeft voice_member_left = 11;
     Speaking speaking = 12;
-    RoomList room_list = 13;
-    RoomUpdated room_updated = 14;
     MessageEdited message_edited = 15;
     MessageDeleted message_deleted = 16;
     ReactionsChanged reactions_changed = 17;
@@ -177,12 +397,25 @@ message ServerFrame {
     ShareStopped share_stopped = 19;
     WatchState watch_state = 20;
     ShareWatchers share_watchers = 21;
+    ServerSnapshot server_snapshot = 22;
+    ServerUpdated server_updated = 23;
+    RoleUpserted role_upserted = 24;
+    RoleDeleted role_deleted = 25;
+    RoleOrder role_order = 26;
+    CategoryUpserted category_upserted = 27;
+    CategoryDeleted category_deleted = 28;
+    ChannelUpserted channel_upserted = 29;
+    ChannelDeleted channel_deleted = 30;
+    ChannelOrder channel_order = 31;
+    MemberUpdated member_updated = 32;
+    MemberRemoved member_removed = 33;
+    VoiceMoved voice_moved = 34;
   }
 }
 
 message Welcome {
   int64 latest_message_id = 1;    // 0 when no message exists yet
-  int64 member_id = 2;            // the connected user's id, as it appears in Member.user_id
+  int64 member_id = 2;            // the connected user's id, as it appears in Profile.user_id
   string username = 3;            // canonical casing
 }
 
@@ -190,122 +423,157 @@ message Pong {
   int64 sent_at_unix_ms = 1;      // echoed from the Ping
 }
 
-// A user, as listed by GET /api/users and as a room member.
-message Member {
+// The whole server as the reader may see it; sent right after Welcome.
+message ServerSnapshot {
+  Server server = 1;
+  repeated Role roles = 2;          // every role
+  repeated Category categories = 3; // every category
+  repeated Channel channels = 4;    // every non-DM channel the reader may view, overrides included, plus the reader's DMs
+  repeated Profile members = 5;     // every member of the server
+  repeated ReadState read_states = 6; // one per viewable text channel and DM
+}
+
+// Replaces what the client knows about the server's shared facts.
+message ServerUpdated {
+  Server server = 1;
+}
+
+message RoleUpserted {
+  Role role = 1;
+}
+
+message RoleDeleted {
+  int64 id = 1;
+}
+
+message RoleOrder {
+  repeated int64 ids = 1;         // the full list, the everyone role excluded, bottom first
+}
+
+message CategoryUpserted {
+  Category category = 1;
+}
+
+message CategoryDeleted {
+  int64 id = 1;
+}
+
+// Overrides included; this is also how a DM channel arrives.
+message ChannelUpserted {
+  Channel channel = 1;
+}
+
+// Also sent to one member alone when a channel stops being visible to them.
+message ChannelDeleted {
+  int64 id = 1;
+}
+
+message ChannelOrder {
+  repeated ChannelPosition positions = 1;
+}
+
+// Roles, nickname, profile, presence or server mute flags of one member changed.
+message MemberUpdated {
+  Profile member = 1;
+}
+
+// The member was banned.
+message MemberRemoved {
   int64 user_id = 1;
-  string username = 2;
 }
 
-// Full membership of one room; replaces whatever the client knew about that room.
-message RoomState {
-  string room_id = 1;
-  repeated Member members = 2;
+// Sent to the moved user only.
+message VoiceMoved {
+  int64 channel_id = 1;           // the channel to join; 0 = disconnected by a moderator
 }
 
-message MemberJoined {
-  string room_id = 1;
-  Member member = 2;
-}
-
-message MemberLeft {
-  string room_id = 1;
-  int64 user_id = 2;
-}
-
-// A user in a room's voice channel. ssrc identifies that user's media packets.
+// A user in a channel's voice session. ssrc identifies that user's media packets.
 message VoiceMember {
   int64 user_id = 1;
   string username = 2;
   uint32 ssrc = 3;                // non-zero, unique across live voice sessions
-  bool sharing = 4;               // the user is sharing their screen in this room
+  bool sharing = 4;               // the user is sharing their screen in this channel
   bool share_audio = 5;           // that share carries audio
+  bool server_muted = 6;
+  bool server_deafened = 7;
+  bool priority = 8;              // holds PRIORITY_SPEAKER in this channel
 }
 
 // Sent only to the joiner: where to send media and with which key.
 message VoiceReady {
-  string room_id = 1;
+  int64 channel_id = 1;
   string host = 2;                // empty means the host of the WebSocket URL
   uint32 port = 3;                // UDP
   bytes key = 4;                  // 32 bytes, ChaCha20-Poly1305, valid for this voice session only
   uint32 ssrc = 5;                // the joiner's own ssrc
 }
 
-// Full voice membership of one room; replaces whatever the client knew.
+// Full voice membership of one channel; replaces whatever the client knew.
 message VoiceState {
-  string room_id = 1;
+  int64 channel_id = 1;
   repeated VoiceMember members = 2;
 }
 
 message VoiceMemberJoined {
-  string room_id = 1;
+  int64 channel_id = 1;
   VoiceMember member = 2;
 }
 
 message VoiceMemberLeft {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 user_id = 2;
 }
 
-// Server-derived from media packets, sent to every member of the text room.
+// Server-derived from media packets, sent to everyone who may view the channel.
 message Speaking {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 user_id = 2;
   bool speaking = 3;
 }
 
-// Starts a screen share; requires a voice session in that room. Idempotent: repeating it re-sends the frames.
+// Starts a screen share; requires a voice session in that channel. Idempotent: repeating it re-sends the frames.
 message StartShare {
-  string room_id = 1;
+  int64 channel_id = 1;
   bool audio = 2;                 // the share carries audio as well as video
 }
 
 message StopShare {
-  string room_id = 1;
+  int64 channel_id = 1;
 }
 
-// Watch one sharer of that room; replaces a previous watch in any room.
+// Watch one sharer of that channel; replaces a previous watch in any channel.
 message WatchShare {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 user_id = 2;              // the sharer to watch; never the caller
 }
 
 message UnwatchShare {
-  string room_id = 1;
+  int64 channel_id = 1;
 }
 
-// Sent to every member of the text room, the sharer included.
+// Sent to everyone who may view the channel, the sharer included.
 message ShareStarted {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 user_id = 2;
   bool audio = 3;
 }
 
 // Same audience as ShareStarted.
 message ShareStopped {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 user_id = 2;
 }
 
 // Sent to the viewer only: which share it is watching now.
 message WatchState {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 user_id = 2;              // 0 = not watching
 }
 
 // Sent to the sharer only, on every change to its watcher count.
 message ShareWatchers {
-  string room_id = 1;
+  int64 channel_id = 1;
   uint32 count = 2;
-}
-
-// Every room the account can see: every public room plus its own DMs.
-message RoomList {
-  repeated RoomEntry rooms = 1;
-}
-
-// Replaces what the client knows about that room's shared facts; never carries counters.
-message RoomUpdated {
-  Room room = 1;
 }
 
 message MessageEdited {
@@ -313,36 +581,46 @@ message MessageEdited {
 }
 
 message MessageDeleted {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 id = 2;
 }
 
 // The full grouped reaction set of one message after a change.
 message ReactionsChanged {
-  string room_id = 1;
+  int64 channel_id = 1;
   int64 message_id = 2;
   repeated Reaction reactions = 3;
 }
 
 enum ErrorCode {
+  reserved 6, 10;                  // NOT_A_MEMBER, ROOM_EXISTS: channels have no membership and names need not be unique
+  reserved "ERROR_CODE_NOT_A_MEMBER", "ERROR_CODE_ROOM_EXISTS";
+
   ERROR_CODE_UNSPECIFIED = 0;
   ERROR_CODE_PROTOCOL = 1;         // malformed frame, wrong first frame, unsupported version, text frame
   ERROR_CODE_INVALID_NICKNAME = 2; // reserved: no longer sent since accounts exist
   ERROR_CODE_INVALID_MESSAGE = 3;  // empty or too long
   ERROR_CODE_SESSION_REPLACED = 4; // fatal: the same account connected again elsewhere
-  ERROR_CODE_UNKNOWN_ROOM = 5;     // non-fatal: room id invalid or unknown
-  ERROR_CODE_NOT_A_MEMBER = 6;     // non-fatal: the connection is not in that room
+  ERROR_CODE_UNKNOWN_CHANNEL = 5;  // non-fatal: channel id 0, unknown, or not visible to the caller
   ERROR_CODE_VOICE_UNAVAILABLE = 7; // non-fatal: the media relay is disabled or not running
-  ERROR_CODE_NOT_IN_VOICE = 8;      // non-fatal: LeaveVoice while not in that room's voice channel
-  ERROR_CODE_FORBIDDEN = 9;         // non-fatal: not allowed on that room or message
-  ERROR_CODE_ROOM_EXISTS = 10;      // non-fatal: the room name slugs to an id already taken
+  ERROR_CODE_NOT_IN_VOICE = 8;      // non-fatal: LeaveVoice while not in that channel's voice session
+  ERROR_CODE_FORBIDDEN = 9;         // non-fatal: owner-only operation, or the target is the owner/yourself
   ERROR_CODE_UNKNOWN_MESSAGE = 11;  // non-fatal: message id unknown, or a tombstone
-  ERROR_CODE_INVALID_ATTACHMENT = 12; // non-fatal: attachment unknown, foreign, wrong room or already linked
-  ERROR_CODE_INVALID_ROOM_NAME = 13; // non-fatal: the name is empty, too long or slugs to nothing usable
+  ERROR_CODE_INVALID_ATTACHMENT = 12; // non-fatal: attachment unknown, foreign, wrong channel or already linked
+  ERROR_CODE_INVALID_NAME = 13;     // non-fatal: a channel, category or role name is empty, too long or holds control characters
   ERROR_CODE_INVALID_REACTION = 14;  // non-fatal: emoji outside the accepted set
   ERROR_CODE_NOT_SHARING = 15;       // non-fatal: StopShare while not sharing, or WatchShare of someone who is not sharing (yourself included)
-  ERROR_CODE_SHARE_LIMIT = 16;       // non-fatal: the room already has the maximum number of sharers
+  ERROR_CODE_SHARE_LIMIT = 16;       // non-fatal: the channel already has the maximum number of sharers
   ERROR_CODE_SHARE_UNAVAILABLE = 17; // non-fatal: sharing is disabled on this server
+  ERROR_CODE_KICKED = 18;            // fatal: a moderator kicked the account
+  ERROR_CODE_BANNED = 19;            // fatal: a moderator banned the account
+  ERROR_CODE_PERMISSION_DENIED = 20; // non-fatal: detail is the missing permission's name, e.g. SEND_MESSAGES
+  ERROR_CODE_HIERARCHY = 21;         // non-fatal: the target member or role outranks the caller
+  ERROR_CODE_INVALID_ARGUMENT = 22;  // non-fatal: detail names the field
+  ERROR_CODE_UNKNOWN_USER = 23;      // non-fatal: user id unknown or banned
+  ERROR_CODE_UNKNOWN_ROLE = 24;      // non-fatal: role id unknown
+  ERROR_CODE_UNKNOWN_CATEGORY = 25;  // non-fatal: category id unknown
+  ERROR_CODE_UNKNOWN_IMAGE = 26;     // non-fatal: image id unknown, not the caller's, or of the wrong purpose
 }
 
 message Error {
@@ -351,15 +629,63 @@ message Error {
   bool fatal = 3;                  // true: the server closes the socket right after sending this
 }
 
-// REST: GET /api/messages?room=general&limit=100&before=<id>  (Content-Type: application/x-protobuf)
+// REST: GET /api/messages?channel=<id>&limit=100&before=<id>  (Content-Type: application/x-protobuf)
 message MessagePage {
   repeated ChatMessage messages = 1; // ascending by id
   bool has_more = 2;                 // older messages exist before messages[0]
 }
 
 // REST: GET /api/users
-message UserList {
-  repeated Member users = 1;         // every registered user, ordered by username (case-insensitive)
+message MemberList {
+  repeated Profile members = 1;      // every member, ordered by username (case-insensitive)
+}
+
+// An avatar, banner, server icon or role icon.
+// REST: POST /api/images?purpose=avatar|banner|server_icon|role_icon -> Image
+// REST: GET /api/images/{id} -> the bytes
+message Image {
+  int64 id = 1;
+  string content_type = 2;
+  int64 size = 3;                    // bytes
+}
+
+// REST: POST /api/invites
+message CreateInviteRequest {
+  uint32 days = 1;                   // validity, 1..365
+}
+
+// Body of the 201 on POST /api/invites; the code is shown once.
+message InviteCreated {
+  int64 id = 1;
+  string code = 2;
+  int64 expires_at_unix_ms = 3;
+}
+
+message Invite {
+  int64 id = 1;
+  int64 created_at_unix_ms = 2;
+  int64 expires_at_unix_ms = 3;
+  int64 used_by = 4;                 // 0 = still unused
+  string used_by_username = 5;
+  int64 created_by = 6;              // 0 = created outside the API, by the admin CLI
+}
+
+// REST: GET /api/invites
+message InviteList {
+  repeated Invite invites = 1;
+}
+
+message Ban {
+  int64 user_id = 1;
+  string username = 2;
+  string reason = 3;
+  int64 banned_by = 4;
+  int64 banned_at_unix_ms = 5;
+}
+
+// REST: GET /api/bans
+message BanList {
+  repeated Ban bans = 1;
 }
 
 // REST: POST /api/auth/register

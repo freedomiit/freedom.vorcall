@@ -60,7 +60,8 @@ pub struct Rtt {
 pub struct Report {
     pub user: String,
     pub user_id: i64,
-    pub room: String,
+    pub channel_id: i64,
+    pub channel_name: String,
     pub ssrc: u32,
     pub packets_sent: u64,
     pub packets_received: u64,
@@ -169,14 +170,15 @@ impl Report {
         });
 
         format!(
-            "{{\"user\":{},\"user_id\":{},\"room\":{},\"ssrc\":{},\
+            "{{\"user\":{},\"user_id\":{},\"channel_id\":{},\"channel_name\":{},\"ssrc\":{},\
 \"packets_sent\":{},\"packets_received\":{},\"bytes_sent\":{},\"bytes_received\":{},\"rejected\":{},\"send_failures\":{},\"frames_sent\":{},\"frames_gated\":{},\
 \"decoded_seconds\":{:.2},\"tone_seconds\":{:.2},\"gaps\":{},\"late\":{},\
 \"rtt_ms\":{{\"min\":{},\"avg\":{},\"max\":{},\"last\":{},\"samples\":{}}},\
 \"link\":{},\"peers\":[{}],\"speaking_events\":[{}]{}{}}}",
             quote(&self.user),
             self.user_id,
-            quote(&self.room),
+            self.channel_id,
+            quote(&self.channel_name),
             self.ssrc,
             self.packets_sent,
             self.packets_received,

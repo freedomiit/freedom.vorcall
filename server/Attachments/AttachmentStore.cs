@@ -34,15 +34,8 @@ public sealed class AttachmentStore(
 {
     public const int MaxFileNameLength = 128;
 
-    // Enough for the longest magic number the protocol's four types use (RIFF....WEBP).
-    private const int MagicLength = 12;
-
     private const int CopyBufferBytes = 64 * 1024;
     private const string PartSuffix = ".part";
-
-    private static ReadOnlySpan<byte> PngMagic => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-
-    private static ReadOnlySpan<byte> JpegMagic => [0xFF, 0xD8, 0xFF];
 
     public string PathFor(long id, string contentType)
     {
@@ -64,15 +57,18 @@ public sealed class AttachmentStore(
         return path;
     }
 
+    // Images share this quota (Vorcall:AttachmentsMaxBytes), so both tables count towards it.
     public async Task<long> TotalBytesAsync()
     {
         await using var db = await contexts.CreateDbContextAsync();
-        return await db.Attachments.SumAsync(a => (long?)a.Size) ?? 0;
+        var attachments = await db.Attachments.SumAsync(a => (long?)a.Size) ?? 0;
+        var images = await db.Images.SumAsync(i => (long?)i.Size) ?? 0;
+        return attachments + images;
     }
 
     public async Task<StoreOutcome> StoreAsync(
         long uploaderId,
-        string roomId,
+        long channelId,
         string contentType,
         string? fileName,
         long declaredLength,
@@ -106,7 +102,7 @@ public sealed class AttachmentStore(
         // The row is written first because the id names the file.
         var row = new Data.Attachment
         {
-            RoomId = roomId,
+            ChannelId = channelId,
             UploaderId = uploaderId,
             MessageId = null,
             FileName = SanitizeFileName(fileName, ext),
@@ -125,7 +121,7 @@ public sealed class AttachmentStore(
         {
             Directory.CreateDirectory(options.Dir);
 
-            var header = new byte[MagicLength];
+            var header = new byte[AttachmentsOptions.MagicLength];
             var headerLength = 0;
             var written = 0L;
 
@@ -168,7 +164,7 @@ public sealed class AttachmentStore(
                         var copied = Math.Min(header.Length - headerLength, read);
                         buffer.AsSpan(0, copied).CopyTo(header.AsSpan(headerLength));
                         headerLength += copied;
-                        if (headerLength == header.Length && !MatchesMagic(contentType, header))
+                        if (headerLength == header.Length && !AttachmentsOptions.MatchesMagic(contentType, header))
                         {
                             failure = StoreOutcome.Kind.NotAnImage;
                             break;
@@ -219,10 +215,10 @@ public sealed class AttachmentStore(
         }
 
         logger.LogDebug(
-            "Attachment {AttachmentId} stored for {UserId} in {RoomId} ({SizeBytes} bytes)",
+            "Attachment {AttachmentId} stored for {UserId} in {ChannelId} ({SizeBytes} bytes)",
             row.Id,
             uploaderId,
-            roomId,
+            channelId,
             row.Size);
         return StoreOutcome.Stored(new Protocol.Attachment
         {
@@ -234,7 +230,7 @@ public sealed class AttachmentStore(
     }
 
     // The entity rather than the protocol message: the download endpoint decides what a caller
-    // may see from MessageId, UploaderId and RoomId.
+    // may see from MessageId, UploaderId and ChannelId.
     public async Task<Data.Attachment?> FindAsync(long id)
     {
         await using var db = await contexts.CreateDbContextAsync();
@@ -243,8 +239,21 @@ public sealed class AttachmentStore(
 
     // Best effort by design: the rows are already gone, and a file left behind is disk to
     // reclaim, not a correctness problem.
-    public void DeleteFiles(IEnumerable<(long Id, string ContentType)> rows)
+    public void DeleteFiles(IEnumerable<(long Id, string ContentType)> rows) => DeleteFiles(PathsFor(rows));
+
+    public void DeleteFiles(IEnumerable<string> paths)
     {
+        foreach (var path in paths)
+        {
+            TryDeleteFile(path);
+        }
+    }
+
+    // The paths of rows whose database entries are about to go, or have just gone through a
+    // cascade: a caller that can no longer read a content type keeps the names instead.
+    public List<string> PathsFor(IEnumerable<(long Id, string ContentType)> rows)
+    {
+        var paths = new List<string>();
         foreach (var (id, contentType) in rows)
         {
             if (!AttachmentsOptions.TryExtension(contentType, out _))
@@ -252,8 +261,10 @@ public sealed class AttachmentStore(
                 continue;
             }
 
-            TryDeleteFile(PathFor(id, contentType));
+            paths.Add(PathFor(id, contentType));
         }
+
+        return paths;
     }
 
     public async Task<int> SweepUnlinkedAsync(DateTime olderThan)
@@ -317,15 +328,6 @@ public sealed class AttachmentStore(
         var name = builder.ToString().Trim();
         return name.Length == 0 ? fallback : name;
     }
-
-    private static bool MatchesMagic(string contentType, ReadOnlySpan<byte> header) => contentType switch
-    {
-        "image/png" => header.StartsWith(PngMagic),
-        "image/jpeg" => header.StartsWith(JpegMagic),
-        "image/gif" => header.StartsWith("GIF87a"u8) || header.StartsWith("GIF89a"u8),
-        "image/webp" => header.StartsWith("RIFF"u8) && header[8..12].SequenceEqual("WEBP"u8),
-        _ => false,
-    };
 
     private void TryDeleteFile(string path)
     {

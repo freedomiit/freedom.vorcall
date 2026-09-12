@@ -27,17 +27,23 @@ use tokio_tungstenite::tungstenite::{
     protocol::{CloseFrame, frame::coding::CloseCode},
 };
 use vorcall_proto::v1::{
-    Attachment, ChatMessage, ClientFrame, CreateRoom, DeleteMessage, EditMessage, ErrorCode, Hello,
-    JoinRoom, JoinVoice, LeaveRoom, LeaveVoice, MarkRead, Member, MessagePage, OpenDm, Ping, React,
-    Reaction, Room, RoomEntry, SendMessage, ServerFrame, StartShare, StopShare, UnwatchShare,
-    VoiceMember, WatchShare, client_frame, server_frame,
+    Attachment, Ban, BanMember, Category, Channel, ChannelKind, ChannelPosition, ChatMessage,
+    ClientFrame, CreateCategory, CreateChannel, CreateRole, DeleteCategory, DeleteChannel,
+    DeleteMessage, DeleteRole, EditMessage, ErrorCode, Hello, Image, Invite, InviteCreated,
+    JoinVoice, KickMember, LeaveVoice, MarkRead, MessagePage, OpenDm, Override, Ping, Profile,
+    React, Reaction, ReorderCategories, ReorderChannels, ReorderRoles, Role, SendMessage, Server,
+    ServerFrame, ServerSnapshot, SetMemberRoles, SetNickname, SetOverride, StartShare, StopShare,
+    TransferOwnership, UnbanMember, UnwatchShare, UpdateCategory, UpdateChannel, UpdateProfile,
+    UpdateRole, UpdateServer, VoiceMember, VoiceModerate, WatchShare, client_frame, server_frame,
 };
 
+use crate::admin;
 use crate::attachments;
 use crate::auth;
 use crate::endpoints::Endpoints;
 use crate::history;
 use crate::http::{self, ApiFailure};
+use crate::images::{self, ImagePurpose};
 use crate::session::{self, Session};
 use crate::update;
 
@@ -55,43 +61,31 @@ const HISTORY_LIMIT: u32 = 100;
 const GAP_FILL_MAX_PAGES: usize = 5;
 const BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 const BACKOFF_JITTER: f64 = 0.20;
-/// Attachment transfers this loop runs at once; the rest wait their turn.
+/// Attachment and image transfers this loop runs at once; the rest wait.
 const TRANSFER_SLOTS: usize = 2;
-
-/// The room every account belongs to from registration on; it cannot be left.
-pub const GENERAL_ROOM: &str = "general";
 
 #[derive(Debug, Clone)]
 pub enum Command {
     Send {
-        room_id: String,
+        channel_id: i64,
         text: String,
         /// The message this one answers; `None` when it answers nothing.
         reply_to_id: Option<i64>,
         attachment_ids: Vec<i64>,
     },
-    /// The newest page of a room, asked for when the UI first opens it.
+    /// The newest page of a channel, asked for when the UI first opens it.
     LoadHistory {
-        room_id: String,
+        channel_id: i64,
     },
     LoadOlder {
-        room_id: String,
+        channel_id: i64,
         before: i64,
-    },
-    JoinRoom {
-        room_id: String,
-    },
-    LeaveRoom {
-        room_id: String,
-    },
-    CreateRoom {
-        name: String,
     },
     OpenDm {
         user_id: i64,
     },
     MarkRead {
-        room_id: String,
+        channel_id: i64,
         message_id: i64,
     },
     Edit {
@@ -110,7 +104,7 @@ pub enum Command {
     /// answers it carries the same number back.
     UploadAttachment {
         request_id: u64,
-        room_id: String,
+        channel_id: i64,
         file_name: String,
         content_type: &'static str,
         bytes: Blob,
@@ -119,28 +113,246 @@ pub enum Command {
         request_id: u64,
         id: i64,
     },
+    UploadImage {
+        request_id: u64,
+        purpose: ImagePurpose,
+        content_type: &'static str,
+        bytes: Blob,
+    },
+    FetchImage {
+        request_id: u64,
+        id: i64,
+    },
     JoinVoice {
-        room_id: String,
+        channel_id: i64,
     },
     LeaveVoice {
-        room_id: String,
+        channel_id: i64,
     },
     /// Sent once the local capture is running; idempotent server-side.
     StartShare {
-        room_id: String,
+        channel_id: i64,
         audio: bool,
     },
     StopShare {
-        room_id: String,
+        channel_id: i64,
     },
     /// Replaces any previous watch.
     WatchShare {
-        room_id: String,
+        channel_id: i64,
         user_id: i64,
     },
     UnwatchShare {
-        room_id: String,
+        channel_id: i64,
     },
+    /// One management frame. Nothing is awaited: the server answers with an
+    /// `Error` or with the delta the change produced.
+    Admin(AdminCommand),
+    /// One REST request, answered by [`Event::RestResult`].
+    Rest(RestRequest),
+}
+
+impl Command {
+    /// The variant's name, for log lines — never the payload (message text,
+    /// ban reasons, file names).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Send { .. } => "Send",
+            Self::LoadHistory { .. } => "LoadHistory",
+            Self::LoadOlder { .. } => "LoadOlder",
+            Self::OpenDm { .. } => "OpenDm",
+            Self::MarkRead { .. } => "MarkRead",
+            Self::Edit { .. } => "Edit",
+            Self::Delete { .. } => "Delete",
+            Self::React { .. } => "React",
+            Self::UploadAttachment { .. } => "UploadAttachment",
+            Self::FetchAttachment { .. } => "FetchAttachment",
+            Self::UploadImage { .. } => "UploadImage",
+            Self::FetchImage { .. } => "FetchImage",
+            Self::JoinVoice { .. } => "JoinVoice",
+            Self::LeaveVoice { .. } => "LeaveVoice",
+            Self::StartShare { .. } => "StartShare",
+            Self::StopShare { .. } => "StopShare",
+            Self::WatchShare { .. } => "WatchShare",
+            Self::UnwatchShare { .. } => "UnwatchShare",
+            Self::Admin(inner) => inner.kind_name(),
+            Self::Rest(_) => "Rest",
+        }
+    }
+}
+
+/// The management frames of `PROTOCOL.md`, one variant each, their fields
+/// mirroring the schema.
+#[derive(Debug, Clone)]
+pub enum AdminCommand {
+    CreateChannel {
+        kind: ChannelKind,
+        name: String,
+        topic: String,
+        category_id: i64,
+    },
+    UpdateChannel {
+        id: i64,
+        name: String,
+        topic: String,
+    },
+    DeleteChannel {
+        id: i64,
+    },
+    CreateCategory {
+        name: String,
+    },
+    UpdateCategory {
+        id: i64,
+        name: String,
+    },
+    DeleteCategory {
+        id: i64,
+    },
+    ReorderChannels {
+        positions: Vec<ChannelPosition>,
+    },
+    ReorderCategories {
+        ids: Vec<i64>,
+    },
+    /// `allow == deny == 0` deletes the override.
+    SetOverride {
+        channel_id: i64,
+        override_: Override,
+    },
+    CreateRole {
+        name: String,
+        color: u32,
+        icon_emoji: String,
+        icon_image_id: i64,
+        permissions: u64,
+        hoist: bool,
+    },
+    UpdateRole {
+        role: Role,
+    },
+    DeleteRole {
+        id: i64,
+    },
+    ReorderRoles {
+        ids: Vec<i64>,
+    },
+    SetMemberRoles {
+        user_id: i64,
+        role_ids: Vec<i64>,
+    },
+    /// `user_id` 0 is the caller's own nickname; an empty one clears it.
+    SetNickname {
+        user_id: i64,
+        nickname: String,
+    },
+    KickMember {
+        user_id: i64,
+    },
+    BanMember {
+        user_id: i64,
+        reason: String,
+    },
+    UnbanMember {
+        user_id: i64,
+    },
+    UpdateServer {
+        name: String,
+        description: String,
+        icon_image_id: i64,
+    },
+    TransferOwnership {
+        user_id: i64,
+    },
+    /// Each flag travels only when the UI actually set it; a `move_to` of
+    /// `Some(0)` disconnects the target instead of moving it.
+    VoiceModerate {
+        user_id: i64,
+        channel_id: i64,
+        muted: Option<bool>,
+        deafened: Option<bool>,
+        move_to: Option<i64>,
+    },
+    UpdateProfile {
+        description: String,
+        accent_color: u32,
+        avatar_image_id: i64,
+        banner_image_id: i64,
+    },
+}
+
+impl AdminCommand {
+    /// The frame's name, for log lines and for [`Event::AdminDropped`].
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::CreateChannel { .. } => "CreateChannel",
+            Self::UpdateChannel { .. } => "UpdateChannel",
+            Self::DeleteChannel { .. } => "DeleteChannel",
+            Self::CreateCategory { .. } => "CreateCategory",
+            Self::UpdateCategory { .. } => "UpdateCategory",
+            Self::DeleteCategory { .. } => "DeleteCategory",
+            Self::ReorderChannels { .. } => "ReorderChannels",
+            Self::ReorderCategories { .. } => "ReorderCategories",
+            Self::SetOverride { .. } => "SetOverride",
+            Self::CreateRole { .. } => "CreateRole",
+            Self::UpdateRole { .. } => "UpdateRole",
+            Self::DeleteRole { .. } => "DeleteRole",
+            Self::ReorderRoles { .. } => "ReorderRoles",
+            Self::SetMemberRoles { .. } => "SetMemberRoles",
+            Self::SetNickname { .. } => "SetNickname",
+            Self::KickMember { .. } => "KickMember",
+            Self::BanMember { .. } => "BanMember",
+            Self::UnbanMember { .. } => "UnbanMember",
+            Self::UpdateServer { .. } => "UpdateServer",
+            Self::TransferOwnership { .. } => "TransferOwnership",
+            Self::VoiceModerate { .. } => "VoiceModerate",
+            Self::UpdateProfile { .. } => "UpdateProfile",
+        }
+    }
+}
+
+/// One REST request the UI is waiting on; `request_id` is its handle on it.
+#[derive(Debug, Clone)]
+pub struct RestRequest {
+    pub request_id: u64,
+    pub kind: RestKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum RestKind {
+    ListInvites,
+    CreateInvite { days: u32 },
+    RevokeInvite { id: i64 },
+    ListBans,
+    ListMembers,
+}
+
+/// What one finished [`RestRequest`] hands back.
+#[derive(Clone)]
+pub enum RestOutcome {
+    Invites(Vec<Invite>),
+    InviteCreated(InviteCreated),
+    InviteRevoked { id: i64 },
+    Bans(Vec<Ban>),
+    Members(Vec<Profile>),
+}
+
+impl fmt::Debug for RestOutcome {
+    /// A fresh invite code is a credential, and every [`Event`] is printed
+    /// whole in a log line: this one variant hides it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invites(invites) => f.debug_tuple("Invites").field(invites).finish(),
+            Self::InviteCreated(created) => write!(
+                f,
+                "InviteCreated {{ id: {}, code: <redacted>, expires_at_unix_ms: {} }}",
+                created.id, created.expires_at_unix_ms
+            ),
+            Self::InviteRevoked { id } => f.debug_struct("InviteRevoked").field("id", id).finish(),
+            Self::Bans(bans) => f.debug_tuple("Bans").field(bans).finish(),
+            Self::Members(members) => f.debug_tuple("Members").field(members).finish(),
+        }
+    }
 }
 
 /// The per-session media key from `VoiceReady`. Debug never prints it.
@@ -153,9 +365,10 @@ impl fmt::Debug for MediaKey {
     }
 }
 
-/// One attachment's bytes, shared rather than copied: a retry re-reads the very
-/// same buffer, and so does the request body. Debug prints only the size —
-/// every [`Command`] and [`Event`] is printed whole in a log line.
+/// One attachment's or image's bytes, shared rather than copied: a retry
+/// re-reads the very same buffer, and so does the request body. Debug prints
+/// only the size — every [`Command`] and [`Event`] is printed whole in a log
+/// line.
 #[derive(Clone)]
 pub struct Blob(pub Arc<Vec<u8>>);
 
@@ -198,6 +411,10 @@ pub enum DisconnectReason {
     /// The tokens are gone for good; the UI has to ask for a sign-in.
     AuthRequired(String),
     SessionReplaced,
+    /// A moderator kicked the account; it may sign in again at once.
+    Kicked,
+    /// A moderator banned the account; nothing this client does helps.
+    Banned,
     ServerClosed {
         code: Option<u16>,
         reason: String,
@@ -213,6 +430,8 @@ impl fmt::Display for DisconnectReason {
             Self::Unauthorized => f.write_str("unauthorized"),
             Self::AuthRequired(detail) => write!(f, "sign in again: {detail}"),
             Self::SessionReplaced => f.write_str("this account connected from another device"),
+            Self::Kicked => f.write_str("kicked from the server"),
+            Self::Banned => f.write_str("banned from the server"),
             Self::ServerClosed { code, reason } => match code {
                 Some(code) if !reason.is_empty() => write!(f, "server closed ({code}): {reason}"),
                 Some(code) => write!(f, "server closed ({code})"),
@@ -240,52 +459,71 @@ pub enum Event {
         /// The delay this loop is actually about to sleep; `None` when it stops.
         retry_in: Option<Duration>,
     },
-    /// The newest page of one room plus whatever gap-fill added, ascending.
+    /// A rotated token pair, already persisted by this loop.
+    SessionUpdated(Session),
+    ServerError {
+        code: i32,
+        detail: String,
+        fatal: bool,
+    },
+    /// The whole server as this account may see it; replaces what the UI knows.
+    Snapshot(ServerSnapshot),
+    ServerUpdated(Server),
+    RoleUpserted(Role),
+    RoleDeleted {
+        id: i64,
+    },
+    RoleOrder {
+        ids: Vec<i64>,
+    },
+    CategoryUpserted(Category),
+    CategoryDeleted {
+        id: i64,
+    },
+    ChannelUpserted(Channel),
+    ChannelDeleted {
+        id: i64,
+    },
+    ChannelOrder {
+        positions: Vec<ChannelPosition>,
+    },
+    MemberUpdated(Profile),
+    MemberRemoved {
+        user_id: i64,
+    },
+    /// A moderator moved this account; `channel_id` 0 means disconnected.
+    VoiceMoved {
+        channel_id: i64,
+    },
+    Message(ChatMessage),
+    MessageEdited(ChatMessage),
+    MessageDeleted {
+        channel_id: i64,
+        id: i64,
+    },
+    ReactionsChanged {
+        channel_id: i64,
+        message_id: i64,
+        reactions: Vec<Reaction>,
+    },
+    /// The newest page of one channel plus whatever gap-fill added, ascending.
     History {
-        room_id: String,
+        channel_id: i64,
         messages: Vec<ChatMessage>,
         has_more: bool,
     },
     HistoryFailed {
-        room_id: String,
+        channel_id: i64,
         error: String,
     },
     OlderPage {
-        room_id: String,
+        channel_id: i64,
         messages: Vec<ChatMessage>,
         has_more: bool,
     },
     OlderFailed {
-        room_id: String,
+        channel_id: i64,
         error: String,
-    },
-    Users(Vec<Member>),
-    UsersFailed(String),
-    RoomState {
-        room_id: String,
-        members: Vec<Member>,
-    },
-    MemberJoined {
-        room_id: String,
-        member: Member,
-    },
-    MemberLeft {
-        room_id: String,
-        user_id: i64,
-    },
-    Message(ChatMessage),
-    /// Every room the account can see, each with the reader's own counters.
-    RoomList(Vec<RoomEntry>),
-    RoomUpdated(Room),
-    MessageEdited(ChatMessage),
-    MessageDeleted {
-        room_id: String,
-        id: i64,
-    },
-    ReactionsChanged {
-        room_id: String,
-        message_id: i64,
-        reactions: Vec<Reaction>,
     },
     AttachmentUploaded {
         request_id: u64,
@@ -305,56 +543,75 @@ pub enum Event {
         id: i64,
         error: String,
     },
-    ServerError {
-        code: i32,
-        detail: String,
-        fatal: bool,
+    ImageUploaded {
+        request_id: u64,
+        image: Image,
     },
-    SendDropped,
-    /// A rotated token pair, already persisted by this loop.
-    SessionUpdated(Session),
+    ImageUploadFailed {
+        request_id: u64,
+        error: String,
+    },
+    ImageFetched {
+        request_id: u64,
+        id: i64,
+        bytes: Blob,
+    },
+    ImageFetchFailed {
+        request_id: u64,
+        id: i64,
+        error: String,
+    },
+    RestResult {
+        request_id: u64,
+        outcome: Result<RestOutcome, String>,
+    },
     VoiceReady {
-        room_id: String,
+        channel_id: i64,
         host: String,
         port: u16,
         key: MediaKey,
         ssrc: u32,
     },
     VoiceState {
-        room_id: String,
+        channel_id: i64,
         members: Vec<VoiceMember>,
     },
     VoiceMemberJoined {
-        room_id: String,
+        channel_id: i64,
         member: VoiceMember,
     },
     VoiceMemberLeft {
-        room_id: String,
+        channel_id: i64,
         user_id: i64,
     },
     Speaking {
-        room_id: String,
+        channel_id: i64,
         user_id: i64,
         speaking: bool,
     },
     ShareStarted {
-        room_id: String,
+        channel_id: i64,
         user_id: i64,
         audio: bool,
     },
     ShareStopped {
-        room_id: String,
+        channel_id: i64,
         user_id: i64,
     },
     /// Which share this client is watching now; `None` means none.
     WatchState {
-        room_id: String,
+        channel_id: i64,
         user_id: Option<i64>,
     },
     /// How many peers are watching the local share.
     ShareWatchers {
-        room_id: String,
+        channel_id: i64,
         count: u32,
+    },
+    SendDropped,
+    /// A management frame the loop could not send, named by its kind.
+    AdminDropped {
+        kind: &'static str,
     },
 }
 
@@ -368,15 +625,217 @@ fn watch_target(user_id: i64) -> Option<i64> {
 fn describe(frame: &ServerFrame) -> String {
     match &frame.payload {
         Some(server_frame::Payload::VoiceReady(ready)) => {
-            let room_id = &ready.room_id;
+            let channel_id = ready.channel_id;
             let host = &ready.host;
             let port = ready.port;
             let ssrc = ready.ssrc;
             format!(
-                "VoiceReady {{ room_id: {room_id:?}, host: {host:?}, port: {port}, ssrc: {ssrc}, key: <redacted> }}"
+                "VoiceReady {{ channel_id: {channel_id}, host: {host:?}, port: {port}, ssrc: {ssrc}, key: <redacted> }}"
             )
         }
         _ => format!("{frame:?}"),
+    }
+}
+
+/// What one frame that arrived before `Welcome` means.
+#[derive(Debug)]
+enum FirstFrame {
+    Welcome(vorcall_proto::v1::Welcome),
+    Error(vorcall_proto::v1::Error),
+    /// A payload that cannot precede `Welcome`, named for the log line.
+    Ignore(&'static str),
+    /// No payload at all: a newer server may add frames without a version bump.
+    Unknown,
+}
+
+/// Sorts one payload received before `Welcome`. Every payload of the schema has
+/// an arm, so a frame out of order costs an ignored log line rather than the
+/// whole attempt, and a new frame can never become a "known but unhandled" one.
+fn classify_first_frame(payload: Option<server_frame::Payload>) -> FirstFrame {
+    match payload {
+        Some(server_frame::Payload::Welcome(welcome)) => FirstFrame::Welcome(welcome),
+        Some(server_frame::Payload::Error(error)) => FirstFrame::Error(error),
+        Some(server_frame::Payload::Message(_)) => FirstFrame::Ignore("Message"),
+        Some(server_frame::Payload::Pong(_)) => FirstFrame::Ignore("Pong"),
+        Some(server_frame::Payload::VoiceReady(_)) => FirstFrame::Ignore("VoiceReady"),
+        Some(server_frame::Payload::VoiceState(_)) => FirstFrame::Ignore("VoiceState"),
+        Some(server_frame::Payload::VoiceMemberJoined(_)) => {
+            FirstFrame::Ignore("VoiceMemberJoined")
+        }
+        Some(server_frame::Payload::VoiceMemberLeft(_)) => FirstFrame::Ignore("VoiceMemberLeft"),
+        Some(server_frame::Payload::Speaking(_)) => FirstFrame::Ignore("Speaking"),
+        Some(server_frame::Payload::MessageEdited(_)) => FirstFrame::Ignore("MessageEdited"),
+        Some(server_frame::Payload::MessageDeleted(_)) => FirstFrame::Ignore("MessageDeleted"),
+        Some(server_frame::Payload::ReactionsChanged(_)) => FirstFrame::Ignore("ReactionsChanged"),
+        Some(server_frame::Payload::ShareStarted(_)) => FirstFrame::Ignore("ShareStarted"),
+        Some(server_frame::Payload::ShareStopped(_)) => FirstFrame::Ignore("ShareStopped"),
+        Some(server_frame::Payload::WatchState(_)) => FirstFrame::Ignore("WatchState"),
+        Some(server_frame::Payload::ShareWatchers(_)) => FirstFrame::Ignore("ShareWatchers"),
+        Some(server_frame::Payload::ServerSnapshot(_)) => FirstFrame::Ignore("ServerSnapshot"),
+        Some(server_frame::Payload::ServerUpdated(_)) => FirstFrame::Ignore("ServerUpdated"),
+        Some(server_frame::Payload::RoleUpserted(_)) => FirstFrame::Ignore("RoleUpserted"),
+        Some(server_frame::Payload::RoleDeleted(_)) => FirstFrame::Ignore("RoleDeleted"),
+        Some(server_frame::Payload::RoleOrder(_)) => FirstFrame::Ignore("RoleOrder"),
+        Some(server_frame::Payload::CategoryUpserted(_)) => FirstFrame::Ignore("CategoryUpserted"),
+        Some(server_frame::Payload::CategoryDeleted(_)) => FirstFrame::Ignore("CategoryDeleted"),
+        Some(server_frame::Payload::ChannelUpserted(_)) => FirstFrame::Ignore("ChannelUpserted"),
+        Some(server_frame::Payload::ChannelDeleted(_)) => FirstFrame::Ignore("ChannelDeleted"),
+        Some(server_frame::Payload::ChannelOrder(_)) => FirstFrame::Ignore("ChannelOrder"),
+        Some(server_frame::Payload::MemberUpdated(_)) => FirstFrame::Ignore("MemberUpdated"),
+        Some(server_frame::Payload::MemberRemoved(_)) => FirstFrame::Ignore("MemberRemoved"),
+        Some(server_frame::Payload::VoiceMoved(_)) => FirstFrame::Ignore("VoiceMoved"),
+        None => FirstFrame::Unknown,
+    }
+}
+
+/// The client frame one management command encodes into.
+fn admin_payload(command: AdminCommand) -> client_frame::Payload {
+    match command {
+        AdminCommand::CreateChannel {
+            kind,
+            name,
+            topic,
+            category_id,
+        } => client_frame::Payload::CreateChannel(CreateChannel {
+            kind: kind.into(),
+            name,
+            topic,
+            category_id,
+        }),
+        AdminCommand::UpdateChannel { id, name, topic } => {
+            client_frame::Payload::UpdateChannel(UpdateChannel { id, name, topic })
+        }
+        AdminCommand::DeleteChannel { id } => {
+            client_frame::Payload::DeleteChannel(DeleteChannel { id })
+        }
+        AdminCommand::CreateCategory { name } => {
+            client_frame::Payload::CreateCategory(CreateCategory { name })
+        }
+        AdminCommand::UpdateCategory { id, name } => {
+            client_frame::Payload::UpdateCategory(UpdateCategory { id, name })
+        }
+        AdminCommand::DeleteCategory { id } => {
+            client_frame::Payload::DeleteCategory(DeleteCategory { id })
+        }
+        AdminCommand::ReorderChannels { positions } => {
+            client_frame::Payload::ReorderChannels(ReorderChannels { positions })
+        }
+        AdminCommand::ReorderCategories { ids } => {
+            client_frame::Payload::ReorderCategories(ReorderCategories { ids })
+        }
+        AdminCommand::SetOverride {
+            channel_id,
+            override_,
+        } => client_frame::Payload::SetOverride(SetOverride {
+            channel_id,
+            r#override: Some(override_),
+        }),
+        AdminCommand::CreateRole {
+            name,
+            color,
+            icon_emoji,
+            icon_image_id,
+            permissions,
+            hoist,
+        } => client_frame::Payload::CreateRole(CreateRole {
+            name,
+            color,
+            icon_emoji,
+            icon_image_id,
+            permissions,
+            hoist,
+        }),
+        AdminCommand::UpdateRole { role } => {
+            client_frame::Payload::UpdateRole(UpdateRole { role: Some(role) })
+        }
+        AdminCommand::DeleteRole { id } => client_frame::Payload::DeleteRole(DeleteRole { id }),
+        AdminCommand::ReorderRoles { ids } => {
+            client_frame::Payload::ReorderRoles(ReorderRoles { ids })
+        }
+        AdminCommand::SetMemberRoles { user_id, role_ids } => {
+            client_frame::Payload::SetMemberRoles(SetMemberRoles { user_id, role_ids })
+        }
+        AdminCommand::SetNickname { user_id, nickname } => {
+            client_frame::Payload::SetNickname(SetNickname { user_id, nickname })
+        }
+        AdminCommand::KickMember { user_id } => {
+            client_frame::Payload::KickMember(KickMember { user_id })
+        }
+        AdminCommand::BanMember { user_id, reason } => {
+            client_frame::Payload::BanMember(BanMember { user_id, reason })
+        }
+        AdminCommand::UnbanMember { user_id } => {
+            client_frame::Payload::UnbanMember(UnbanMember { user_id })
+        }
+        AdminCommand::UpdateServer {
+            name,
+            description,
+            icon_image_id,
+        } => client_frame::Payload::UpdateServer(UpdateServer {
+            name,
+            description,
+            icon_image_id,
+        }),
+        AdminCommand::TransferOwnership { user_id } => {
+            client_frame::Payload::TransferOwnership(TransferOwnership { user_id })
+        }
+        // Each `set_*` flag is what tells the server the companion value was
+        // meant; an unset one leaves that part of the session alone.
+        AdminCommand::VoiceModerate {
+            user_id,
+            channel_id,
+            muted,
+            deafened,
+            move_to,
+        } => client_frame::Payload::VoiceModerate(VoiceModerate {
+            user_id,
+            channel_id,
+            set_muted: muted.is_some(),
+            muted: muted.unwrap_or_default(),
+            set_deafened: deafened.is_some(),
+            deafened: deafened.unwrap_or_default(),
+            r#move: move_to.is_some(),
+            move_to: move_to.unwrap_or_default(),
+        }),
+        AdminCommand::UpdateProfile {
+            description,
+            accent_color,
+            avatar_image_id,
+            banner_image_id,
+        } => client_frame::Payload::UpdateProfile(UpdateProfile {
+            description,
+            accent_color,
+            avatar_image_id,
+            banner_image_id,
+        }),
+    }
+}
+
+/// The fatal errors retrying cannot fix: the account is live elsewhere, or a
+/// moderator closed the door on it. Every other fatal error is followed by the
+/// server closing the socket, which the backoff already handles.
+fn terminal_reason(error: &vorcall_proto::v1::Error) -> Option<DisconnectReason> {
+    if !error.fatal {
+        return None;
+    }
+
+    match ErrorCode::try_from(error.code) {
+        Ok(ErrorCode::SessionReplaced) => Some(DisconnectReason::SessionReplaced),
+        Ok(ErrorCode::Kicked) => Some(DisconnectReason::Kicked),
+        Ok(ErrorCode::Banned) => Some(DisconnectReason::Banned),
+        _ => None,
+    }
+}
+
+/// What an `Error` received instead of `Welcome` leads to: the attempt is over
+/// either way, the question is only whether the loop may try again.
+fn fatal_outcome(error: &vorcall_proto::v1::Error) -> AfterAttempt {
+    match terminal_reason(error) {
+        Some(reason) => AfterAttempt::Stop(Some(reason)),
+        None => AfterAttempt::Reconnect {
+            reason: DisconnectReason::ProtocolError(error.detail.clone()),
+            after: Retry::Backoff,
+        },
     }
 }
 
@@ -404,6 +863,8 @@ enum Refreshed {
     Ok,
     /// The refresh token itself was refused: signing in again is the only cure.
     AuthRequired(String),
+    /// The account is banned; no token will ever be issued again.
+    Banned,
     Failed(ApiFailure),
     /// The UI is gone.
     UiGone,
@@ -418,8 +879,8 @@ pub async fn run(
     mut events: mpsc::Sender<Event>,
 ) {
     let mut backoff = Backoff::default();
-    // Survives every attempt: per room, what a reconnect gap-fills against.
-    let mut newest_delivered: HashMap<String, i64> = HashMap::new();
+    // Survives every attempt: per channel, what a reconnect gap-fills against.
+    let mut newest_delivered: HashMap<i64, i64> = HashMap::new();
 
     loop {
         if events.send(Event::Connecting).await.is_err() {
@@ -520,6 +981,7 @@ async fn ensure_fresh(
         Refreshed::AuthRequired(detail) => Err(AfterAttempt::Stop(Some(
             DisconnectReason::AuthRequired(detail),
         ))),
+        Refreshed::Banned => Err(AfterAttempt::Stop(Some(DisconnectReason::Banned))),
         Refreshed::Failed(failure) => Err(refresh_failure_outcome(&failure)),
         Refreshed::UiGone => Err(AfterAttempt::Stop(None)),
     }
@@ -547,6 +1009,13 @@ async fn refresh_session(
                 return Refreshed::UiGone;
             }
             Refreshed::Ok
+        }
+        // `PROTOCOL.md` § Moderation: a banned account is a 403 with detail
+        // "banned" — the detail, not the status alone, is what identifies it,
+        // since a proxy/WAF 403 must fall through to the generic failure arm.
+        Err(ApiFailure::Status(403, detail)) if detail == "banned" => {
+            tracing::warn!("the account is banned; stopping the connection loop");
+            Refreshed::Banned
         }
         Err(ApiFailure::AuthChallenge(detail) | ApiFailure::Status(401, detail)) => {
             tracing::warn!("the refresh token was refused; the user must sign in again");
@@ -588,21 +1057,25 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
             );
             events.send(Event::SendDropped).await.is_ok()
         }
-        Command::LoadHistory { room_id } => {
-            tracing::debug!(%room_id, "cannot load history while disconnected");
+        Command::LoadHistory { channel_id } => {
+            tracing::debug!(channel_id, "cannot load history while disconnected");
             events
                 .send(Event::HistoryFailed {
-                    room_id,
+                    channel_id,
                     error: "not connected".to_owned(),
                 })
                 .await
                 .is_ok()
         }
-        Command::LoadOlder { room_id, before } => {
-            tracing::debug!(%room_id, before, "cannot load older messages while disconnected");
+        Command::LoadOlder { channel_id, before } => {
+            tracing::debug!(
+                channel_id,
+                before,
+                "cannot load older messages while disconnected"
+            );
             events
                 .send(Event::OlderFailed {
-                    room_id,
+                    channel_id,
                     error: "not connected".to_owned(),
                 })
                 .await
@@ -610,10 +1083,14 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
         }
         Command::UploadAttachment {
             request_id,
-            room_id,
+            channel_id,
             ..
         } => {
-            tracing::debug!(request_id, %room_id, "cannot upload an attachment while disconnected");
+            tracing::debug!(
+                request_id,
+                channel_id,
+                "cannot upload an attachment while disconnected"
+            );
             events
                 .send(Event::UploadFailed {
                     request_id,
@@ -637,29 +1114,69 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
                 .await
                 .is_ok()
         }
+        Command::UploadImage { request_id, .. } => {
+            tracing::debug!(request_id, "cannot upload an image while disconnected");
+            events
+                .send(Event::ImageUploadFailed {
+                    request_id,
+                    error: "not connected".to_owned(),
+                })
+                .await
+                .is_ok()
+        }
+        Command::FetchImage { request_id, id } => {
+            tracing::debug!(request_id, id, "cannot fetch an image while disconnected");
+            events
+                .send(Event::ImageFetchFailed {
+                    request_id,
+                    id,
+                    error: "not connected".to_owned(),
+                })
+                .await
+                .is_ok()
+        }
+        Command::Rest(request) => {
+            tracing::debug!(
+                request_id = request.request_id,
+                kind = ?request.kind,
+                "cannot run a REST request while disconnected"
+            );
+            events
+                .send(Event::RestResult {
+                    request_id: request.request_id,
+                    outcome: Err("not connected".to_owned()),
+                })
+                .await
+                .is_ok()
+        }
+        Command::Admin(admin) => {
+            let kind = admin.kind_name();
+            tracing::debug!(kind, "cannot manage the server while disconnected");
+            events.send(Event::AdminDropped { kind }).await.is_ok()
+        }
         // No event: the UI re-sends JoinVoice after every Connected.
-        Command::JoinVoice { room_id } | Command::LeaveVoice { room_id } => {
-            tracing::debug!(%room_id, "cannot change voice membership while disconnected");
+        Command::JoinVoice { channel_id } | Command::LeaveVoice { channel_id } => {
+            tracing::debug!(
+                channel_id,
+                "cannot change voice membership while disconnected"
+            );
             true
         }
         // No event: the UI re-asserts the share state after the next VoiceReady.
-        Command::StartShare { room_id, .. }
-        | Command::StopShare { room_id }
-        | Command::WatchShare { room_id, .. }
-        | Command::UnwatchShare { room_id } => {
-            tracing::debug!(%room_id, "cannot change screen share while disconnected");
+        Command::StartShare { channel_id, .. }
+        | Command::StopShare { channel_id }
+        | Command::WatchShare { channel_id, .. }
+        | Command::UnwatchShare { channel_id } => {
+            tracing::debug!(channel_id, "cannot change screen share while disconnected");
             true
         }
         // No event either: the UI disables these while disconnected.
-        Command::JoinRoom { .. }
-        | Command::LeaveRoom { .. }
-        | Command::CreateRoom { .. }
-        | Command::OpenDm { .. }
+        Command::OpenDm { .. }
         | Command::MarkRead { .. }
         | Command::Edit { .. }
         | Command::Delete { .. }
         | Command::React { .. } => {
-            tracing::debug!("dropping a room command queued while disconnected");
+            tracing::debug!("dropping a chat command queued while disconnected");
             true
         }
     }
@@ -742,7 +1259,7 @@ macro_rules! emit_or_break {
 
 /// Sends one client frame, ending the attempt when the socket refuses it.
 macro_rules! send_or_break {
-    ($label:lifetime, $sink:expr, $what:literal, $payload:expr) => {
+    ($label:lifetime, $sink:expr, $what:expr, $payload:expr) => {
         if let Err(e) = send_frame($sink, $payload).await {
             tracing::warn!(error = %e, frame = $what, "cannot send a frame");
             break $label AfterAttempt::Reconnect {
@@ -756,7 +1273,7 @@ macro_rules! send_or_break {
 async fn attempt(
     endpoints: &Endpoints,
     session: &mut Session,
-    newest_delivered: &mut HashMap<String, i64>,
+    newest_delivered: &mut HashMap<i64, i64>,
     commands: &mut mpsc::Receiver<Command>,
     events: &mut mpsc::Sender<Event>,
 ) -> AfterAttempt {
@@ -772,6 +1289,14 @@ async fn attempt(
 
         match tokio_tungstenite::connect_async(request).await {
             Ok((socket, _response)) => break socket,
+            // `PROTOCOL.md` § Moderation: the upgrade answers 403 for a banned
+            // account and for nothing else.
+            Err(tungstenite::Error::Http(response))
+                if response.status() == StatusCode::FORBIDDEN =>
+            {
+                tracing::warn!("the upgrade was refused with a 403; the account is banned");
+                return AfterAttempt::Stop(Some(DisconnectReason::Banned));
+            }
             Err(tungstenite::Error::Http(response))
                 if response.status() == StatusCode::UNAUTHORIZED =>
             {
@@ -806,6 +1331,9 @@ async fn attempt(
                     Refreshed::Ok => continue,
                     Refreshed::AuthRequired(detail) => {
                         return AfterAttempt::Stop(Some(DisconnectReason::AuthRequired(detail)));
+                    }
+                    Refreshed::Banned => {
+                        return AfterAttempt::Stop(Some(DisconnectReason::Banned));
                     }
                     Refreshed::Failed(failure) => return refresh_failure_outcome(&failure),
                     Refreshed::UiGone => return AfterAttempt::Stop(None),
@@ -952,9 +1480,9 @@ where
                 };
                 tracing::debug!(frame = %describe(&server_frame), "received");
 
-                match server_frame.payload {
-                    Some(server_frame::Payload::Welcome(welcome)) => return Ok(welcome),
-                    Some(server_frame::Payload::Error(error)) => {
+                match classify_first_frame(server_frame.payload) {
+                    FirstFrame::Welcome(welcome) => return Ok(welcome),
+                    FirstFrame::Error(error) => {
                         if events
                             .send(Event::ServerError {
                                 code: error.code,
@@ -968,73 +1496,16 @@ where
                         }
                         return Err(fatal_outcome(&error));
                     }
-                    // Voice frames cannot precede Welcome, but ignoring one is
-                    // cheaper than tearing down an otherwise healthy attempt.
-                    Some(server_frame::Payload::VoiceReady(ready)) => {
-                        tracing::debug!(room = %ready.room_id, "ignoring a voice frame before Welcome");
-                    }
-                    Some(server_frame::Payload::VoiceState(state)) => {
-                        tracing::debug!(room = %state.room_id, "ignoring a voice frame before Welcome");
-                    }
-                    Some(server_frame::Payload::VoiceMemberJoined(joined)) => {
-                        tracing::debug!(room = %joined.room_id, "ignoring a voice frame before Welcome");
-                    }
-                    Some(server_frame::Payload::VoiceMemberLeft(left)) => {
-                        tracing::debug!(room = %left.room_id, "ignoring a voice frame before Welcome");
-                    }
-                    Some(server_frame::Payload::Speaking(speaking)) => {
-                        tracing::debug!(room = %speaking.room_id, "ignoring a voice frame before Welcome");
-                    }
-                    // Share frames cannot precede Welcome either.
-                    Some(server_frame::Payload::ShareStarted(started)) => {
-                        tracing::debug!(room = %started.room_id, "ignoring a share frame before Welcome");
-                    }
-                    Some(server_frame::Payload::ShareStopped(stopped)) => {
-                        tracing::debug!(room = %stopped.room_id, "ignoring a share frame before Welcome");
-                    }
-                    Some(server_frame::Payload::WatchState(state)) => {
-                        tracing::debug!(room = %state.room_id, "ignoring a share frame before Welcome");
-                    }
-                    Some(server_frame::Payload::ShareWatchers(watchers)) => {
-                        tracing::debug!(room = %watchers.room_id, "ignoring a share frame before Welcome");
-                    }
-                    // Room and message frames cannot precede Welcome either.
-                    Some(server_frame::Payload::RoomList(list)) => {
-                        tracing::debug!(
-                            rooms = list.rooms.len(),
-                            "ignoring a room frame before Welcome"
-                        );
-                    }
-                    Some(server_frame::Payload::RoomUpdated(updated)) => {
-                        let room = updated.room.map(|room| room.room_id).unwrap_or_default();
-                        tracing::debug!(%room, "ignoring a room frame before Welcome");
-                    }
-                    Some(server_frame::Payload::MessageEdited(edited)) => {
-                        let id = edited.message.map(|message| message.id).unwrap_or_default();
-                        tracing::debug!(id, "ignoring a message frame before Welcome");
-                    }
-                    Some(server_frame::Payload::MessageDeleted(deleted)) => {
-                        tracing::debug!(room = %deleted.room_id, id = deleted.id, "ignoring a message frame before Welcome");
-                    }
-                    Some(server_frame::Payload::ReactionsChanged(changed)) => {
-                        tracing::debug!(
-                            room = %changed.room_id,
-                            id = changed.message_id,
-                            "ignoring a message frame before Welcome"
-                        );
+                    // Nothing but Welcome may precede Welcome, but ignoring a
+                    // stray frame is cheaper than tearing down an otherwise
+                    // healthy attempt.
+                    FirstFrame::Ignore(payload) => {
+                        tracing::debug!(payload, "ignoring a frame that arrived before Welcome");
                     }
                     // A payload this build does not know: a newer server may add
                     // frames without a version bump.
-                    None => {
-                        tracing::warn!(frame = ?server_frame, "ignoring unknown server frame");
-                    }
-                    other => {
-                        return Err(AfterAttempt::Reconnect {
-                            reason: DisconnectReason::ProtocolError(format!(
-                                "expected Welcome, got {other:?}"
-                            )),
-                            after: Retry::Backoff,
-                        });
+                    FirstFrame::Unknown => {
+                        tracing::warn!("ignoring a server frame with no payload this build knows");
                     }
                 }
             }
@@ -1083,7 +1554,7 @@ impl<'a, T> Fetch<'a, T> {
 /// A "load older" fetch, kept whole so a refresh can re-issue the same request.
 struct OlderFetch<'a> {
     fetch: Fetch<'a, MessagePage>,
-    room_id: String,
+    channel_id: i64,
     before: i64,
 }
 
@@ -1189,52 +1660,53 @@ async fn recover_fetch(
         Refreshed::AuthRequired(reason) => FetchRecovery::Stop(AfterAttempt::Stop(Some(
             DisconnectReason::AuthRequired(reason),
         ))),
+        Refreshed::Banned => {
+            FetchRecovery::Stop(AfterAttempt::Stop(Some(DisconnectReason::Banned)))
+        }
         Refreshed::Failed(_) => FetchRecovery::Report(detail),
         Refreshed::UiGone => FetchRecovery::Stop(AfterAttempt::Stop(None)),
     }
 }
 
-/// The rooms waiting for their newest page. One fetch runs at a time, and a
-/// room already queued or in flight is never asked for twice: the UI may open
-/// the same room again long before the first answer arrives.
+/// The channels waiting for their newest page. One fetch runs at a time, and a
+/// channel already queued or in flight is never asked for twice: the UI may
+/// open the same channel again long before the first answer arrives.
 #[derive(Default)]
 struct HistoryQueue {
-    in_flight: Option<String>,
-    waiting: VecDeque<String>,
+    in_flight: Option<i64>,
+    waiting: VecDeque<i64>,
 }
 
 impl HistoryQueue {
-    /// `false` when that room is already queued or in flight.
-    fn enqueue(&mut self, room_id: String) -> bool {
-        if self.in_flight.as_deref() == Some(room_id.as_str())
-            || self.waiting.iter().any(|queued| *queued == room_id)
-        {
+    /// `false` when that channel is already queued or in flight.
+    fn enqueue(&mut self, channel_id: i64) -> bool {
+        if self.in_flight == Some(channel_id) || self.waiting.contains(&channel_id) {
             return false;
         }
-        self.waiting.push_back(room_id);
+        self.waiting.push_back(channel_id);
         true
     }
 
-    /// The next room to fetch, or `None` while one is already in flight.
-    fn start(&mut self) -> Option<String> {
+    /// The next channel to fetch, or `None` while one is already in flight.
+    fn start(&mut self) -> Option<i64> {
         if self.in_flight.is_some() {
             return None;
         }
-        let room_id = self.waiting.pop_front()?;
-        self.in_flight = Some(room_id.clone());
-        Some(room_id)
+        let channel_id = self.waiting.pop_front()?;
+        self.in_flight = Some(channel_id);
+        Some(channel_id)
     }
 
-    fn in_flight(&self) -> Option<&str> {
-        self.in_flight.as_deref()
+    fn in_flight(&self) -> Option<i64> {
+        self.in_flight
     }
 
     fn finish(&mut self) {
         self.in_flight = None;
     }
 
-    /// Every room still expecting a page, so a disconnect can answer them all.
-    fn abandon(&mut self) -> Vec<String> {
+    /// Every channel still expecting a page, so a disconnect can answer them all.
+    fn abandon(&mut self) -> Vec<i64> {
         self.in_flight
             .take()
             .into_iter()
@@ -1243,12 +1715,12 @@ impl HistoryQueue {
     }
 }
 
-/// One attachment transfer the UI asked for.
+/// One attachment or image transfer the UI asked for.
 #[derive(Clone)]
 enum Transfer {
     Upload {
         request_id: u64,
-        room_id: String,
+        channel_id: i64,
         file_name: String,
         content_type: &'static str,
         bytes: Blob,
@@ -1257,19 +1729,32 @@ enum Transfer {
         request_id: u64,
         id: i64,
     },
+    UploadImage {
+        request_id: u64,
+        purpose: ImagePurpose,
+        content_type: &'static str,
+        bytes: Blob,
+    },
+    FetchImage {
+        request_id: u64,
+        id: i64,
+    },
 }
 
 impl Transfer {
     fn request_id(&self) -> u64 {
         match self {
-            Self::Upload { request_id, .. } | Self::Fetch { request_id, .. } => *request_id,
+            Self::Upload { request_id, .. }
+            | Self::Fetch { request_id, .. }
+            | Self::UploadImage { request_id, .. }
+            | Self::FetchImage { request_id, .. } => *request_id,
         }
     }
 }
 
-/// The attachment transfers, in the order the UI asked for them.
-/// [`TRANSFER_SLOTS`] of them run at once, so one 8 MiB upload cannot hold up
-/// every thumbnail behind it.
+/// The transfers, in the order the UI asked for them. [`TRANSFER_SLOTS`] of
+/// them run at once, so one 8 MiB upload cannot hold up every thumbnail behind
+/// it; attachments and images share the queue.
 #[derive(Default)]
 struct TransferQueue {
     waiting: VecDeque<Transfer>,
@@ -1334,7 +1819,7 @@ async fn run_transfer(
     match request {
         Transfer::Upload {
             request_id,
-            room_id,
+            channel_id,
             file_name,
             content_type,
             bytes,
@@ -1342,7 +1827,7 @@ async fn run_transfer(
             let attachment = attachments::upload(
                 endpoints,
                 &access_token,
-                &room_id,
+                channel_id,
                 &file_name,
                 content_type,
                 bytes,
@@ -1350,7 +1835,7 @@ async fn run_transfer(
             .await?;
             tracing::info!(
                 request_id,
-                room = %room_id,
+                channel_id,
                 id = attachment.id,
                 size = attachment.size,
                 "attachment uploaded"
@@ -1369,6 +1854,32 @@ async fn run_transfer(
                 bytes: Blob::from(bytes),
             })
         }
+        Transfer::UploadImage {
+            request_id,
+            purpose,
+            content_type,
+            bytes,
+        } => {
+            let image =
+                images::upload(endpoints, &access_token, purpose, content_type, bytes).await?;
+            tracing::info!(
+                request_id,
+                ?purpose,
+                id = image.id,
+                size = image.size,
+                "image uploaded"
+            );
+            Ok(Event::ImageUploaded { request_id, image })
+        }
+        Transfer::FetchImage { request_id, id } => {
+            let bytes = images::download(endpoints, &access_token, id).await?;
+            tracing::debug!(request_id, id, size = bytes.len(), "image fetched");
+            Ok(Event::ImageFetched {
+                request_id,
+                id,
+                bytes: Blob::from(bytes),
+            })
+        }
     }
 }
 
@@ -1380,6 +1891,15 @@ fn transfer_failed(request: &Transfer, error: String) -> Event {
             error,
         },
         Transfer::Fetch { request_id, id } => Event::FetchFailed {
+            request_id: *request_id,
+            id: *id,
+            error,
+        },
+        Transfer::UploadImage { request_id, .. } => Event::ImageUploadFailed {
+            request_id: *request_id,
+            error,
+        },
+        Transfer::FetchImage { request_id, id } => Event::ImageFetchFailed {
             request_id: *request_id,
             id: *id,
             error,
@@ -1409,7 +1929,7 @@ async fn settle_transfer<'a>(
             tracing::warn!(
                 request_id = request.request_id(),
                 %error,
-                "an attachment transfer failed"
+                "a transfer failed"
             );
             Transferred::Emit(Box::new(transfer_failed(&request, error)))
         }
@@ -1417,26 +1937,107 @@ async fn settle_transfer<'a>(
     }
 }
 
-/// Starts the next queued room's newest page when nothing is in flight.
+/// The REST requests the UI asked for, in order. One runs at a time: these are
+/// the admin panes' list fetches, never on the critical path.
+#[derive(Default)]
+struct RestQueue {
+    waiting: VecDeque<RestRequest>,
+    running: bool,
+}
+
+impl RestQueue {
+    fn push(&mut self, request: RestRequest) {
+        self.waiting.push_back(request);
+    }
+
+    /// The next request to start, or `None` while one is still running.
+    fn start(&mut self) -> Option<RestRequest> {
+        if self.running {
+            return None;
+        }
+        let request = self.waiting.pop_front()?;
+        self.running = true;
+        Some(request)
+    }
+
+    fn finish(&mut self) {
+        self.running = false;
+    }
+
+    /// What never started, so a disconnect can answer it.
+    fn abandon(&mut self) -> Vec<RestRequest> {
+        self.waiting.drain(..).collect()
+    }
+}
+
+/// One in-flight REST request, kept whole so a refresh can re-issue it.
+struct RestJob<'a> {
+    fetch: Fetch<'a, RestOutcome>,
+    request: RestRequest,
+}
+
+impl<'a> FetchSlot<'a, RestOutcome> for RestJob<'a> {
+    fn fetch(&mut self) -> &mut Fetch<'a, RestOutcome> {
+        &mut self.fetch
+    }
+}
+
+/// Runs one REST request to the outcome that answers it.
+async fn run_rest(
+    endpoints: &Endpoints,
+    access_token: String,
+    kind: RestKind,
+) -> Result<RestOutcome, ApiFailure> {
+    match kind {
+        RestKind::ListInvites => {
+            let invites = admin::list_invites(endpoints, &access_token).await?;
+            tracing::debug!(count = invites.len(), "invite list fetched");
+            Ok(RestOutcome::Invites(invites))
+        }
+        RestKind::CreateInvite { days } => {
+            let created = admin::create_invite(endpoints, &access_token, days).await?;
+            // The code is a credential; only the id of the row is log-safe.
+            tracing::info!(id = created.id, days, "invite created");
+            Ok(RestOutcome::InviteCreated(created))
+        }
+        RestKind::RevokeInvite { id } => {
+            admin::revoke_invite(endpoints, &access_token, id).await?;
+            tracing::info!(id, "invite revoked");
+            Ok(RestOutcome::InviteRevoked { id })
+        }
+        RestKind::ListBans => {
+            let bans = admin::list_bans(endpoints, &access_token).await?;
+            tracing::debug!(count = bans.len(), "ban list fetched");
+            Ok(RestOutcome::Bans(bans))
+        }
+        RestKind::ListMembers => {
+            let members = admin::list_members(endpoints, &access_token).await?;
+            tracing::debug!(count = members.len(), "member list fetched");
+            Ok(RestOutcome::Members(members))
+        }
+    }
+}
+
+/// Starts the next queued channel's newest page when nothing is in flight.
 fn start_history<'a>(
     queue: &mut HistoryQueue,
     slot: &mut Option<Fetch<'a, (Vec<ChatMessage>, bool)>>,
     endpoints: &'a Endpoints,
     access_token: &str,
-    newest_delivered: &HashMap<String, i64>,
+    newest_delivered: &HashMap<i64, i64>,
 ) {
     if slot.is_some() {
         return;
     }
-    let Some(room_id) = queue.start() else {
+    let Some(channel_id) = queue.start() else {
         return;
     };
 
-    let newest = newest_delivered.get(&room_id).copied();
+    let newest = newest_delivered.get(&channel_id).copied();
     *slot = Some(Fetch::new(initial_history(
         endpoints,
         access_token.to_owned(),
-        room_id,
+        channel_id,
         newest,
     )));
 }
@@ -1466,15 +2067,40 @@ fn start_transfers<'a>(
     }
 }
 
-/// The newest page of one room, plus the pages a reconnect needs to close the
-/// gap between what the UI already has there and what the server kept.
+/// Starts the next queued REST request when the one slot is free.
+fn start_rest<'a>(
+    queue: &mut RestQueue,
+    slot: &mut Option<RestJob<'a>>,
+    endpoints: &'a Endpoints,
+    access_token: &str,
+) {
+    if slot.is_some() {
+        return;
+    }
+    let Some(request) = queue.start() else {
+        return;
+    };
+
+    *slot = Some(RestJob {
+        fetch: Fetch::new(run_rest(
+            endpoints,
+            access_token.to_owned(),
+            request.kind.clone(),
+        )),
+        request,
+    });
+}
+
+/// The newest page of one channel, plus the pages a reconnect needs to close
+/// the gap between what the UI already has there and what the server kept.
 async fn initial_history(
     endpoints: &Endpoints,
     access_token: String,
-    room_id: String,
+    channel_id: i64,
     newest_delivered: Option<i64>,
 ) -> Result<(Vec<ChatMessage>, bool), ApiFailure> {
-    let page = history::fetch_page(endpoints, &access_token, &room_id, HISTORY_LIMIT, None).await?;
+    let page =
+        history::fetch_page(endpoints, &access_token, channel_id, HISTORY_LIMIT, None).await?;
     let mut messages = page.messages;
     let mut has_more = page.has_more;
     let mut pages = 1;
@@ -1492,7 +2118,7 @@ async fn initial_history(
         let older = history::fetch_page(
             endpoints,
             &access_token,
-            &room_id,
+            channel_id,
             HISTORY_LIMIT,
             Some(oldest),
         )
@@ -1513,7 +2139,7 @@ async fn initial_history(
     messages.dedup_by_key(|message| message.id);
 
     tracing::info!(
-        room = %room_id,
+        channel_id,
         count = messages.len(),
         pages,
         has_more,
@@ -1527,31 +2153,24 @@ async fn initial_history(
 async fn older_page(
     endpoints: &Endpoints,
     access_token: String,
-    room_id: String,
+    channel_id: i64,
     before: i64,
 ) -> Result<MessagePage, ApiFailure> {
     history::fetch_page(
         endpoints,
         &access_token,
-        &room_id,
+        channel_id,
         HISTORY_LIMIT,
         Some(before),
     )
     .await
 }
 
-async fn user_list(endpoints: &Endpoints, access_token: String) -> Result<Vec<Member>, ApiFailure> {
-    history::fetch_users(endpoints, &access_token).await
-}
-
-/// Remembers the newest id the UI has been handed in a room, so the next page
-/// there knows where its gap starts.
-fn note_newest(newest_delivered: &mut HashMap<String, i64>, room_id: &str, id: i64) {
-    if let Some(newest) = newest_delivered.get_mut(room_id) {
-        *newest = (*newest).max(id);
-    } else {
-        newest_delivered.insert(room_id.to_owned(), id);
-    }
+/// Remembers the newest id the UI has been handed in a channel, so the next
+/// page there knows where its gap starts.
+fn note_newest(newest_delivered: &mut HashMap<i64, i64>, channel_id: i64, id: i64) {
+    let newest = newest_delivered.entry(channel_id).or_insert(id);
+    *newest = (*newest).max(id);
 }
 
 /// Encodes and sends one client frame. `Err` carries the transport error.
@@ -1571,7 +2190,7 @@ where
 async fn live_loop<Si, St>(
     endpoints: &Endpoints,
     session: &mut Session,
-    newest_delivered: &mut HashMap<String, i64>,
+    newest_delivered: &mut HashMap<i64, i64>,
     sink: &mut Si,
     stream: &mut St,
     commands: &mut mpsc::Receiver<Command>,
@@ -1582,19 +2201,17 @@ where
     Si::Error: fmt::Display,
     St: Stream<Item = Result<WsMessage, tungstenite::Error>> + Unpin,
 {
-    // History is per room and on demand: nothing is fetched until the UI opens
-    // a room and asks for it.
+    // History is per channel and on demand: nothing is fetched until the UI
+    // opens a channel and asks for it. The snapshot carried everything else.
     let mut history = HistoryQueue::default();
     let mut history_fetch: Option<Fetch<'_, (Vec<ChatMessage>, bool)>> = None;
-    let mut users_fetch = Some(Fetch::new(user_list(
-        endpoints,
-        session.access_token.clone(),
-    )));
     let mut older_fetch: Option<OlderFetch<'_>> = None;
     let mut transfers = TransferQueue::default();
     // Two named slots rather than an array: each needs its own `select!` arm.
     let mut first_transfer: Option<TransferFetch<'_>> = None;
     let mut second_transfer: Option<TransferFetch<'_>> = None;
+    let mut rest = RestQueue::default();
+    let mut rest_job: Option<RestJob<'_>> = None;
 
     // Skip the immediate first tick: we have just finished a handshake.
     let mut ping = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
@@ -1635,51 +2252,17 @@ where
                             Some(server_frame::Payload::Message(message)) => {
                                 tracing::debug!(
                                     id = message.id,
-                                    room = %message.room_id,
+                                    channel_id = message.channel_id,
                                     author = %message.author,
                                     "message"
                                 );
-                                note_newest(newest_delivered, &message.room_id, message.id);
+                                note_newest(newest_delivered, message.channel_id, message.id);
                                 emit_or_break!('live, events, Event::Message(message));
-                            }
-                            Some(server_frame::Payload::RoomState(state)) => {
-                                emit_or_break!('live, events, Event::RoomState {
-                                    room_id: state.room_id,
-                                    members: state.members,
-                                });
-                            }
-                            Some(server_frame::Payload::MemberJoined(joined)) => {
-                                match joined.member {
-                                    Some(member) => emit_or_break!('live, events, Event::MemberJoined {
-                                        room_id: joined.room_id,
-                                        member,
-                                    }),
-                                    None => tracing::warn!(
-                                        room = %joined.room_id,
-                                        "ignoring a MemberJoined without a member"
-                                    ),
-                                }
-                            }
-                            Some(server_frame::Payload::MemberLeft(left)) => {
-                                emit_or_break!('live, events, Event::MemberLeft {
-                                    room_id: left.room_id,
-                                    user_id: left.user_id,
-                                });
-                            }
-                            Some(server_frame::Payload::RoomList(list)) => {
-                                tracing::debug!(rooms = list.rooms.len(), "room list");
-                                emit_or_break!('live, events, Event::RoomList(list.rooms));
-                            }
-                            Some(server_frame::Payload::RoomUpdated(updated)) => {
-                                match updated.room {
-                                    Some(room) => emit_or_break!('live, events, Event::RoomUpdated(room)),
-                                    None => tracing::warn!("ignoring a RoomUpdated without a room"),
-                                }
                             }
                             Some(server_frame::Payload::MessageEdited(edited)) => {
                                 match edited.message {
                                     Some(message) => {
-                                        note_newest(newest_delivered, &message.room_id, message.id);
+                                        note_newest(newest_delivered, message.channel_id, message.id);
                                         emit_or_break!('live, events, Event::MessageEdited(message));
                                     }
                                     None => tracing::warn!("ignoring a MessageEdited without a message"),
@@ -1687,16 +2270,78 @@ where
                             }
                             Some(server_frame::Payload::MessageDeleted(deleted)) => {
                                 emit_or_break!('live, events, Event::MessageDeleted {
-                                    room_id: deleted.room_id,
+                                    channel_id: deleted.channel_id,
                                     id: deleted.id,
                                 });
                             }
                             Some(server_frame::Payload::ReactionsChanged(changed)) => {
                                 emit_or_break!('live, events, Event::ReactionsChanged {
-                                    room_id: changed.room_id,
+                                    channel_id: changed.channel_id,
                                     message_id: changed.message_id,
                                     reactions: changed.reactions,
                                 });
+                            }
+                            Some(server_frame::Payload::ServerSnapshot(snapshot)) => {
+                                tracing::info!(
+                                    roles = snapshot.roles.len(),
+                                    categories = snapshot.categories.len(),
+                                    channels = snapshot.channels.len(),
+                                    members = snapshot.members.len(),
+                                    "server snapshot"
+                                );
+                                emit_or_break!('live, events, Event::Snapshot(snapshot));
+                            }
+                            Some(server_frame::Payload::ServerUpdated(updated)) => {
+                                match updated.server {
+                                    Some(server) => emit_or_break!('live, events, Event::ServerUpdated(server)),
+                                    None => tracing::warn!("ignoring a ServerUpdated without a server"),
+                                }
+                            }
+                            Some(server_frame::Payload::RoleUpserted(upserted)) => {
+                                match upserted.role {
+                                    Some(role) => emit_or_break!('live, events, Event::RoleUpserted(role)),
+                                    None => tracing::warn!("ignoring a RoleUpserted without a role"),
+                                }
+                            }
+                            Some(server_frame::Payload::RoleDeleted(deleted)) => {
+                                emit_or_break!('live, events, Event::RoleDeleted { id: deleted.id });
+                            }
+                            Some(server_frame::Payload::RoleOrder(order)) => {
+                                emit_or_break!('live, events, Event::RoleOrder { ids: order.ids });
+                            }
+                            Some(server_frame::Payload::CategoryUpserted(upserted)) => {
+                                match upserted.category {
+                                    Some(category) => emit_or_break!('live, events, Event::CategoryUpserted(category)),
+                                    None => tracing::warn!("ignoring a CategoryUpserted without a category"),
+                                }
+                            }
+                            Some(server_frame::Payload::CategoryDeleted(deleted)) => {
+                                emit_or_break!('live, events, Event::CategoryDeleted { id: deleted.id });
+                            }
+                            Some(server_frame::Payload::ChannelUpserted(upserted)) => {
+                                match upserted.channel {
+                                    Some(channel) => emit_or_break!('live, events, Event::ChannelUpserted(channel)),
+                                    None => tracing::warn!("ignoring a ChannelUpserted without a channel"),
+                                }
+                            }
+                            Some(server_frame::Payload::ChannelDeleted(deleted)) => {
+                                emit_or_break!('live, events, Event::ChannelDeleted { id: deleted.id });
+                            }
+                            Some(server_frame::Payload::ChannelOrder(order)) => {
+                                emit_or_break!('live, events, Event::ChannelOrder { positions: order.positions });
+                            }
+                            Some(server_frame::Payload::MemberUpdated(updated)) => {
+                                match updated.member {
+                                    Some(member) => emit_or_break!('live, events, Event::MemberUpdated(member)),
+                                    None => tracing::warn!("ignoring a MemberUpdated without a member"),
+                                }
+                            }
+                            Some(server_frame::Payload::MemberRemoved(removed)) => {
+                                emit_or_break!('live, events, Event::MemberRemoved { user_id: removed.user_id });
+                            }
+                            Some(server_frame::Payload::VoiceMoved(moved)) => {
+                                tracing::info!(channel_id = moved.channel_id, "moved by a moderator");
+                                emit_or_break!('live, events, Event::VoiceMoved { channel_id: moved.channel_id });
                             }
                             Some(server_frame::Payload::Error(error)) => {
                                 tracing::warn!(
@@ -1711,15 +2356,15 @@ where
                                     fatal: error.fatal,
                                 });
                                 // Other fatal errors are followed by the server
-                                // closing; this one has to stop the loop for good.
-                                if is_session_replaced(&error) {
-                                    break AfterAttempt::Stop(Some(DisconnectReason::SessionReplaced));
+                                // closing; these have to stop the loop for good.
+                                if let Some(reason) = terminal_reason(&error) {
+                                    break AfterAttempt::Stop(Some(reason));
                                 }
                             }
                             Some(server_frame::Payload::VoiceReady(ready)) => {
                                 let Ok(key) = <[u8; 32]>::try_from(ready.key.as_slice()) else {
                                     tracing::warn!(
-                                        room = %ready.room_id,
+                                        channel_id = ready.channel_id,
                                         len = ready.key.len(),
                                         "ignoring a VoiceReady whose key is not 32 bytes"
                                     );
@@ -1727,14 +2372,14 @@ where
                                 };
                                 let Ok(port) = u16::try_from(ready.port) else {
                                     tracing::warn!(
-                                        room = %ready.room_id,
+                                        channel_id = ready.channel_id,
                                         port = ready.port,
                                         "ignoring a VoiceReady with an out-of-range port"
                                     );
                                     continue;
                                 };
                                 emit_or_break!('live, events, Event::VoiceReady {
-                                    room_id: ready.room_id,
+                                    channel_id: ready.channel_id,
                                     host: ready.host,
                                     port,
                                     key: MediaKey(key),
@@ -1743,69 +2388,71 @@ where
                             }
                             Some(server_frame::Payload::VoiceState(state)) => {
                                 emit_or_break!('live, events, Event::VoiceState {
-                                    room_id: state.room_id,
+                                    channel_id: state.channel_id,
                                     members: state.members,
                                 });
                             }
                             Some(server_frame::Payload::VoiceMemberJoined(joined)) => {
                                 match joined.member {
                                     Some(member) => emit_or_break!('live, events, Event::VoiceMemberJoined {
-                                        room_id: joined.room_id,
+                                        channel_id: joined.channel_id,
                                         member,
                                     }),
                                     None => tracing::warn!(
-                                        room = %joined.room_id,
+                                        channel_id = joined.channel_id,
                                         "ignoring a VoiceMemberJoined without a member"
                                     ),
                                 }
                             }
                             Some(server_frame::Payload::VoiceMemberLeft(left)) => {
                                 emit_or_break!('live, events, Event::VoiceMemberLeft {
-                                    room_id: left.room_id,
+                                    channel_id: left.channel_id,
                                     user_id: left.user_id,
                                 });
                             }
                             Some(server_frame::Payload::Speaking(speaking)) => {
                                 emit_or_break!('live, events, Event::Speaking {
-                                    room_id: speaking.room_id,
+                                    channel_id: speaking.channel_id,
                                     user_id: speaking.user_id,
                                     speaking: speaking.speaking,
                                 });
                             }
                             Some(server_frame::Payload::ShareStarted(started)) => {
                                 emit_or_break!('live, events, Event::ShareStarted {
-                                    room_id: started.room_id,
+                                    channel_id: started.channel_id,
                                     user_id: started.user_id,
                                     audio: started.audio,
                                 });
                             }
                             Some(server_frame::Payload::ShareStopped(stopped)) => {
                                 emit_or_break!('live, events, Event::ShareStopped {
-                                    room_id: stopped.room_id,
+                                    channel_id: stopped.channel_id,
                                     user_id: stopped.user_id,
                                 });
                             }
                             Some(server_frame::Payload::WatchState(state)) => {
                                 emit_or_break!('live, events, Event::WatchState {
-                                    room_id: state.room_id,
+                                    channel_id: state.channel_id,
                                     user_id: watch_target(state.user_id),
                                 });
                             }
                             Some(server_frame::Payload::ShareWatchers(watchers)) => {
                                 emit_or_break!('live, events, Event::ShareWatchers {
-                                    room_id: watchers.room_id,
+                                    channel_id: watchers.channel_id,
                                     count: watchers.count,
                                 });
                             }
                             // A Pong only had to reach the watchdog above.
                             Some(server_frame::Payload::Pong(_)) => {}
-                            // A payload this build does not know: a newer server
-                            // may add frames without a version bump.
-                            None => tracing::warn!(frame = ?server_frame, "ignoring unknown server frame"),
-                            other => break AfterAttempt::Reconnect {
-                                reason: DisconnectReason::ProtocolError(format!("unexpected frame {other:?}")),
+                            // The handshake is over: a second Welcome means the
+                            // peer is not the server this build speaks to.
+                            Some(server_frame::Payload::Welcome(_)) => break AfterAttempt::Reconnect {
+                                reason: DisconnectReason::ProtocolError("a second Welcome".to_owned()),
                                 after: Retry::BackoffAfterSession,
                             },
+                            // A payload this build does not know: a newer server
+                            // may add frames without a version bump.
+                            None => tracing::warn!("ignoring a server frame with no payload this build knows"),
                         }
                     }
                     WsMessage::Text(_) => break AfterAttempt::Reconnect {
@@ -1823,29 +2470,26 @@ where
             result = pending(history_fetch.as_mut()), if history_fetch.is_some() => {
                 // Copied out before `settle` takes the slot, so a refresh can
                 // re-issue the very same request.
-                let Some(room_id) = history.in_flight().map(str::to_owned) else {
+                let Some(channel_id) = history.in_flight() else {
                     continue;
                 };
-                let newest = newest_delivered.get(&room_id).copied();
-                let reissue = {
-                    let room_id = room_id.clone();
-                    move |token| -> Boxed<'_, _> {
-                        Box::pin(initial_history(endpoints, token, room_id, newest))
-                    }
+                let newest = newest_delivered.get(&channel_id).copied();
+                let reissue = move |token| -> Boxed<'_, _> {
+                    Box::pin(initial_history(endpoints, token, channel_id, newest))
                 };
                 match settle(&mut history_fetch, result, reissue, endpoints, session, events).await {
                     Settled::Done((messages, has_more)) => {
                         history.finish();
                         if let Some(last) = messages.last() {
-                            note_newest(newest_delivered, &room_id, last.id);
+                            note_newest(newest_delivered, channel_id, last.id);
                         }
-                        emit_or_break!('live, events, Event::History { room_id, messages, has_more });
+                        emit_or_break!('live, events, Event::History { channel_id, messages, has_more });
                     }
                     Settled::Retried => {}
                     Settled::Report(error) => {
                         history.finish();
-                        tracing::warn!(room = %room_id, %error, "history fetch failed");
-                        emit_or_break!('live, events, Event::HistoryFailed { room_id, error });
+                        tracing::warn!(channel_id, %error, "history fetch failed");
+                        emit_or_break!('live, events, Event::HistoryFailed { channel_id, error });
                     }
                     Settled::Stop(outcome) => break outcome,
                 }
@@ -1858,53 +2502,33 @@ where
                 );
             }
 
-            result = pending(users_fetch.as_mut()), if users_fetch.is_some() => {
-                let reissue = |token| -> Boxed<'_, _> {
-                    Box::pin(user_list(endpoints, token))
-                };
-                match settle(&mut users_fetch, result, reissue, endpoints, session, events).await {
-                    Settled::Done(members) => {
-                        emit_or_break!('live, events, Event::Users(members));
-                    }
-                    Settled::Retried => {}
-                    Settled::Report(detail) => {
-                        tracing::warn!(%detail, "user list fetch failed");
-                        emit_or_break!('live, events, Event::UsersFailed(detail));
-                    }
-                    Settled::Stop(outcome) => break outcome,
-                }
-            }
-
             result = pending(older_fetch.as_mut().map(|older| &mut older.fetch)), if older_fetch.is_some() => {
                 // Copied out before `settle` takes the slot, so a refresh can
                 // re-issue the very same request.
-                let Some((room_id, before)) = older_fetch
+                let Some((channel_id, before)) = older_fetch
                     .as_ref()
-                    .map(|older| (older.room_id.clone(), older.before))
+                    .map(|older| (older.channel_id, older.before))
                 else {
                     continue;
                 };
-                let reissue = {
-                    let room_id = room_id.clone();
-                    move |token| -> Boxed<'_, _> {
-                        Box::pin(older_page(endpoints, token, room_id, before))
-                    }
+                let reissue = move |token| -> Boxed<'_, _> {
+                    Box::pin(older_page(endpoints, token, channel_id, before))
                 };
                 match settle(&mut older_fetch, result, reissue, endpoints, session, events).await {
                     Settled::Done(page) => {
                         if let Some(last) = page.messages.last() {
-                            note_newest(newest_delivered, &room_id, last.id);
+                            note_newest(newest_delivered, channel_id, last.id);
                         }
                         emit_or_break!('live, events, Event::OlderPage {
-                            room_id,
+                            channel_id,
                             messages: page.messages,
                             has_more: page.has_more,
                         });
                     }
                     Settled::Retried => {}
                     Settled::Report(error) => {
-                        tracing::warn!(room = %room_id, %error, "older page fetch failed");
-                        emit_or_break!('live, events, Event::OlderFailed { room_id, error });
+                        tracing::warn!(channel_id, %error, "older page fetch failed");
+                        emit_or_break!('live, events, Event::OlderFailed { channel_id, error });
                     }
                     Settled::Stop(outcome) => break outcome,
                 }
@@ -1950,17 +2574,51 @@ where
                 );
             }
 
+            result = pending(rest_job.as_mut().map(|job| &mut job.fetch)), if rest_job.is_some() => {
+                // Copied out before `settle` takes the slot, so a refresh can
+                // re-issue the very same request.
+                let Some(request) = rest_job.as_ref().map(|job| job.request.clone()) else {
+                    continue;
+                };
+                let request_id = request.request_id;
+                let reissue = {
+                    let kind = request.kind.clone();
+                    move |token| -> Boxed<'_, _> { Box::pin(run_rest(endpoints, token, kind)) }
+                };
+                match settle(&mut rest_job, result, reissue, endpoints, session, events).await {
+                    Settled::Done(outcome) => {
+                        rest.finish();
+                        emit_or_break!('live, events, Event::RestResult {
+                            request_id,
+                            outcome: Ok(outcome),
+                        });
+                    }
+                    Settled::Retried => {}
+                    Settled::Report(error) => {
+                        rest.finish();
+                        tracing::warn!(request_id, kind = ?request.kind, %error, "a REST request failed");
+                        emit_or_break!('live, events, Event::RestResult {
+                            request_id,
+                            outcome: Err(error),
+                        });
+                    }
+                    Settled::Stop(outcome) => break outcome,
+                }
+                start_rest(&mut rest, &mut rest_job, endpoints, &session.access_token);
+            }
+
             command = commands.next() => {
                 let Some(command) = command else {
                     tracing::info!("UI dropped the command channel; closing");
                     break 'live AfterAttempt::Stop(None);
                 };
+                tracing::debug!(kind = command.kind_name(), "command");
 
                 match command {
-                    Command::Send { room_id, text, reply_to_id, attachment_ids } => {
+                    Command::Send { channel_id, text, reply_to_id, attachment_ids } => {
                         let payload = client_frame::Payload::Send(SendMessage {
                             text,
-                            room_id,
+                            channel_id,
                             reply_to_id: reply_to_id.unwrap_or_default(),
                             attachment_ids,
                         });
@@ -1973,25 +2631,13 @@ where
                             };
                         }
                     }
-                    Command::JoinRoom { room_id } => send_or_break!(
-                        'live, sink, "JoinRoom",
-                        client_frame::Payload::JoinRoom(JoinRoom { room_id })
-                    ),
-                    Command::LeaveRoom { room_id } => send_or_break!(
-                        'live, sink, "LeaveRoom",
-                        client_frame::Payload::LeaveRoom(LeaveRoom { room_id })
-                    ),
-                    Command::CreateRoom { name } => send_or_break!(
-                        'live, sink, "CreateRoom",
-                        client_frame::Payload::CreateRoom(CreateRoom { name })
-                    ),
                     Command::OpenDm { user_id } => send_or_break!(
                         'live, sink, "OpenDm",
                         client_frame::Payload::OpenDm(OpenDm { user_id })
                     ),
-                    Command::MarkRead { room_id, message_id } => send_or_break!(
+                    Command::MarkRead { channel_id, message_id } => send_or_break!(
                         'live, sink, "MarkRead",
-                        client_frame::Payload::MarkRead(MarkRead { room_id, message_id })
+                        client_frame::Payload::MarkRead(MarkRead { channel_id, message_id })
                     ),
                     Command::Edit { id, text } => send_or_break!(
                         'live, sink, "EditMessage",
@@ -2005,32 +2651,38 @@ where
                         'live, sink, "React",
                         client_frame::Payload::React(React { message_id, emoji, remove })
                     ),
-                    Command::JoinVoice { room_id } => send_or_break!(
+                    Command::JoinVoice { channel_id } => send_or_break!(
                         'live, sink, "JoinVoice",
-                        client_frame::Payload::JoinVoice(JoinVoice { room_id })
+                        client_frame::Payload::JoinVoice(JoinVoice { channel_id })
                     ),
-                    Command::LeaveVoice { room_id } => send_or_break!(
+                    Command::LeaveVoice { channel_id } => send_or_break!(
                         'live, sink, "LeaveVoice",
-                        client_frame::Payload::LeaveVoice(LeaveVoice { room_id })
+                        client_frame::Payload::LeaveVoice(LeaveVoice { channel_id })
                     ),
-                    Command::StartShare { room_id, audio } => send_or_break!(
+                    Command::StartShare { channel_id, audio } => send_or_break!(
                         'live, sink, "StartShare",
-                        client_frame::Payload::StartShare(StartShare { room_id, audio })
+                        client_frame::Payload::StartShare(StartShare { channel_id, audio })
                     ),
-                    Command::StopShare { room_id } => send_or_break!(
+                    Command::StopShare { channel_id } => send_or_break!(
                         'live, sink, "StopShare",
-                        client_frame::Payload::StopShare(StopShare { room_id })
+                        client_frame::Payload::StopShare(StopShare { channel_id })
                     ),
-                    Command::WatchShare { room_id, user_id } => send_or_break!(
+                    Command::WatchShare { channel_id, user_id } => send_or_break!(
                         'live, sink, "WatchShare",
-                        client_frame::Payload::WatchShare(WatchShare { room_id, user_id })
+                        client_frame::Payload::WatchShare(WatchShare { channel_id, user_id })
                     ),
-                    Command::UnwatchShare { room_id } => send_or_break!(
+                    Command::UnwatchShare { channel_id } => send_or_break!(
                         'live, sink, "UnwatchShare",
-                        client_frame::Payload::UnwatchShare(UnwatchShare { room_id })
+                        client_frame::Payload::UnwatchShare(UnwatchShare { channel_id })
                     ),
-                    Command::LoadHistory { room_id } => {
-                        if history.enqueue(room_id.clone()) {
+                    // Fire and forget: the server answers with an `Error` or
+                    // with the delta the change produced.
+                    Command::Admin(admin) => {
+                        let kind = admin.kind_name();
+                        send_or_break!('live, sink, kind, admin_payload(admin));
+                    }
+                    Command::LoadHistory { channel_id } => {
+                        if history.enqueue(channel_id) {
                             start_history(
                                 &mut history,
                                 &mut history_fetch,
@@ -2039,31 +2691,31 @@ where
                                 newest_delivered,
                             );
                         } else {
-                            tracing::debug!(%room_id, "that room's history is already loading");
+                            tracing::debug!(channel_id, "that channel's history is already loading");
                         }
                     }
-                    Command::LoadOlder { room_id, before } => {
+                    Command::LoadOlder { channel_id, before } => {
                         if older_fetch.is_some() {
-                            tracing::debug!(%room_id, before, "an older page is already loading");
+                            tracing::debug!(channel_id, before, "an older page is already loading");
                         } else {
                             let request = older_page(
                                 endpoints,
                                 session.access_token.clone(),
-                                room_id.clone(),
+                                channel_id,
                                 before,
                             );
                             older_fetch = Some(OlderFetch {
                                 fetch: Fetch::new(request),
-                                room_id,
+                                channel_id,
                                 before,
                             });
                         }
                     }
-                    Command::UploadAttachment { request_id, room_id, file_name, content_type, bytes } => {
-                        tracing::info!(request_id, %room_id, size = bytes.len(), "attachment upload queued");
+                    Command::UploadAttachment { request_id, channel_id, file_name, content_type, bytes } => {
+                        tracing::info!(request_id, channel_id, size = bytes.len(), "attachment upload queued");
                         transfers.push(Transfer::Upload {
                             request_id,
-                            room_id,
+                            channel_id,
                             file_name,
                             content_type,
                             bytes,
@@ -2084,6 +2736,36 @@ where
                             endpoints,
                             &session.access_token,
                         );
+                    }
+                    Command::UploadImage { request_id, purpose, content_type, bytes } => {
+                        tracing::info!(request_id, ?purpose, size = bytes.len(), "image upload queued");
+                        transfers.push(Transfer::UploadImage {
+                            request_id,
+                            purpose,
+                            content_type,
+                            bytes,
+                        });
+                        start_transfers(
+                            &mut transfers,
+                            [&mut first_transfer, &mut second_transfer],
+                            endpoints,
+                            &session.access_token,
+                        );
+                    }
+                    Command::FetchImage { request_id, id } => {
+                        tracing::debug!(request_id, id, "image fetch queued");
+                        transfers.push(Transfer::FetchImage { request_id, id });
+                        start_transfers(
+                            &mut transfers,
+                            [&mut first_transfer, &mut second_transfer],
+                            endpoints,
+                            &session.access_token,
+                        );
+                    }
+                    Command::Rest(request) => {
+                        tracing::debug!(request_id = request.request_id, kind = ?request.kind, "REST request queued");
+                        rest.push(request);
+                        start_rest(&mut rest, &mut rest_job, endpoints, &session.access_token);
                     }
                 }
             }
@@ -2106,14 +2788,14 @@ where
         }
     };
 
-    // The UI keeps a "loading" flag per room and per transfer until each of
+    // The UI keeps a "loading" flag per channel and per request until each of
     // these answers, and the socket is about to go: answer them here so nothing
     // spins for ever. Nothing is replayed into the next session; the UI asks
     // again once it is connected.
-    for room_id in history.abandon() {
+    for channel_id in history.abandon() {
         let _ = events
             .send(Event::HistoryFailed {
-                room_id,
+                channel_id,
                 error: "disconnected".to_owned(),
             })
             .await;
@@ -2121,7 +2803,7 @@ where
     if let Some(older) = older_fetch {
         let _ = events
             .send(Event::OlderFailed {
-                room_id: older.room_id,
+                channel_id: older.channel_id,
                 error: "disconnected".to_owned(),
             })
             .await;
@@ -2136,25 +2818,21 @@ where
             .send(transfer_failed(&request, "disconnected".to_owned()))
             .await;
     }
+    let abandoned = rest_job
+        .into_iter()
+        .map(|job| job.request)
+        .chain(rest.abandon());
+    for request in abandoned {
+        let _ = events
+            .send(Event::RestResult {
+                request_id: request.request_id,
+                outcome: Err("disconnected".to_owned()),
+            })
+            .await;
+    }
 
     close_gracefully(sink).await;
     outcome
-}
-
-fn is_session_replaced(error: &vorcall_proto::v1::Error) -> bool {
-    error.fatal && ErrorCode::try_from(error.code) == Ok(ErrorCode::SessionReplaced)
-}
-
-/// A replaced session is the one error retrying cannot fix: the account is live
-/// somewhere else, so the loop stops instead of fighting the other client.
-fn fatal_outcome(error: &vorcall_proto::v1::Error) -> AfterAttempt {
-    if is_session_replaced(error) {
-        return AfterAttempt::Stop(Some(DisconnectReason::SessionReplaced));
-    }
-    AfterAttempt::Reconnect {
-        reason: DisconnectReason::ProtocolError(error.detail.clone()),
-        after: Retry::Backoff,
-    }
 }
 
 fn closed_reason(frame: Option<&CloseFrame>) -> DisconnectReason {
@@ -2214,6 +2892,9 @@ impl Backoff {
 mod tests {
     use super::*;
 
+    const GENERAL: i64 = 1;
+    const MUSIC: i64 = 2;
+
     fn transfer(request_id: u64) -> Transfer {
         Transfer::Fetch {
             request_id,
@@ -2223,6 +2904,21 @@ mod tests {
 
     fn request_ids(requests: &[Transfer]) -> Vec<u64> {
         requests.iter().map(Transfer::request_id).collect()
+    }
+
+    fn rest_request(request_id: u64) -> RestRequest {
+        RestRequest {
+            request_id,
+            kind: RestKind::ListInvites,
+        }
+    }
+
+    fn error(code: ErrorCode, fatal: bool) -> vorcall_proto::v1::Error {
+        vorcall_proto::v1::Error {
+            code: code.into(),
+            detail: String::new(),
+            fatal,
+        }
     }
 
     /// A `Command` or an `Event` carrying one reaches a log line whole.
@@ -2235,41 +2931,71 @@ mod tests {
         assert!(!printed.contains('2'), "{printed}");
     }
 
+    /// `Event::VoiceReady` is printed whole by the UI's own event trace.
     #[test]
-    fn an_older_id_never_lowers_a_room_s_newest_one() {
-        let mut newest = HashMap::new();
+    fn a_media_key_never_prints_its_bytes() {
+        let printed = format!("{:?}", MediaKey([7; 32]));
 
-        note_newest(&mut newest, GENERAL_ROOM, 7);
-        note_newest(&mut newest, GENERAL_ROOM, 12);
-        note_newest(&mut newest, GENERAL_ROOM, 4);
-
-        assert_eq!(newest.get(GENERAL_ROOM).copied(), Some(12));
+        assert_eq!(printed, "MediaKey(<redacted>)");
+        assert!(!printed.contains('7'), "{printed}");
     }
 
     #[test]
-    fn each_room_keeps_its_own_newest_id() {
-        let mut newest = HashMap::new();
+    fn an_invite_created_outcome_redacts_the_code() {
+        let outcome = RestOutcome::InviteCreated(InviteCreated {
+            id: 3,
+            code: "SWORDFISH".to_owned(),
+            expires_at_unix_ms: 42,
+        });
 
-        note_newest(&mut newest, GENERAL_ROOM, 9);
-        note_newest(&mut newest, "dm-1-2", 3);
+        let printed = format!("{outcome:?}");
+        assert!(printed.contains("code: <redacted>"), "{printed}");
+        assert!(printed.contains("id: 3"), "{printed}");
+        assert!(!printed.contains("SWORDFISH"), "{printed}");
 
-        assert_eq!(newest.get(GENERAL_ROOM).copied(), Some(9));
-        assert_eq!(newest.get("dm-1-2").copied(), Some(3));
-        assert_eq!(newest.get("music").copied(), None);
+        // The UI logs whole events, so the redaction has to survive nesting.
+        let event = Event::RestResult {
+            request_id: 1,
+            outcome: Ok(outcome),
+        };
+        assert!(!format!("{event:?}").contains("SWORDFISH"), "{event:?}");
     }
 
     #[test]
-    fn the_history_queue_serves_one_room_at_a_time_in_order() {
+    fn an_older_id_never_lowers_a_channel_s_newest_one() {
+        let mut newest = HashMap::new();
+
+        note_newest(&mut newest, GENERAL, 7);
+        note_newest(&mut newest, GENERAL, 12);
+        note_newest(&mut newest, GENERAL, 4);
+
+        assert_eq!(newest.get(&GENERAL).copied(), Some(12));
+    }
+
+    #[test]
+    fn each_channel_keeps_its_own_newest_id() {
+        let mut newest = HashMap::new();
+
+        note_newest(&mut newest, GENERAL, 9);
+        note_newest(&mut newest, MUSIC, 3);
+
+        assert_eq!(newest.get(&GENERAL).copied(), Some(9));
+        assert_eq!(newest.get(&MUSIC).copied(), Some(3));
+        assert_eq!(newest.get(&7).copied(), None);
+    }
+
+    #[test]
+    fn the_history_queue_serves_one_channel_at_a_time_in_order() {
         let mut queue = HistoryQueue::default();
-        assert!(queue.enqueue(GENERAL_ROOM.to_owned()));
-        assert!(queue.enqueue("music".to_owned()));
+        assert!(queue.enqueue(GENERAL));
+        assert!(queue.enqueue(MUSIC));
 
-        assert_eq!(queue.start().as_deref(), Some(GENERAL_ROOM));
-        assert_eq!(queue.in_flight(), Some(GENERAL_ROOM));
+        assert_eq!(queue.start(), Some(GENERAL));
+        assert_eq!(queue.in_flight(), Some(GENERAL));
         assert_eq!(queue.start(), None);
 
         queue.finish();
-        assert_eq!(queue.start().as_deref(), Some("music"));
+        assert_eq!(queue.start(), Some(MUSIC));
 
         queue.finish();
         assert_eq!(queue.start(), None);
@@ -2277,32 +3003,29 @@ mod tests {
     }
 
     #[test]
-    fn the_history_queue_ignores_a_room_already_queued_or_in_flight() {
+    fn the_history_queue_ignores_a_channel_already_queued_or_in_flight() {
         let mut queue = HistoryQueue::default();
-        assert!(queue.enqueue(GENERAL_ROOM.to_owned()));
-        assert!(!queue.enqueue(GENERAL_ROOM.to_owned()));
+        assert!(queue.enqueue(GENERAL));
+        assert!(!queue.enqueue(GENERAL));
 
-        assert_eq!(queue.start().as_deref(), Some(GENERAL_ROOM));
-        assert!(!queue.enqueue(GENERAL_ROOM.to_owned()));
-        assert!(queue.enqueue("music".to_owned()));
+        assert_eq!(queue.start(), Some(GENERAL));
+        assert!(!queue.enqueue(GENERAL));
+        assert!(queue.enqueue(MUSIC));
 
         queue.finish();
-        assert_eq!(queue.start().as_deref(), Some("music"));
+        assert_eq!(queue.start(), Some(MUSIC));
         queue.finish();
         assert_eq!(queue.start(), None);
     }
 
     #[test]
-    fn a_disconnect_abandons_the_room_in_flight_and_the_ones_waiting() {
+    fn a_disconnect_abandons_the_channel_in_flight_and_the_ones_waiting() {
         let mut queue = HistoryQueue::default();
-        queue.enqueue(GENERAL_ROOM.to_owned());
-        queue.enqueue("music".to_owned());
+        queue.enqueue(GENERAL);
+        queue.enqueue(MUSIC);
         queue.start();
 
-        assert_eq!(
-            queue.abandon(),
-            vec![GENERAL_ROOM.to_owned(), "music".to_owned()]
-        );
+        assert_eq!(queue.abandon(), vec![GENERAL, MUSIC]);
         assert_eq!(queue.start(), None);
     }
 
@@ -2349,11 +3072,38 @@ mod tests {
         assert!(queue.abandon().is_empty());
     }
 
+    /// One REST request at a time: the settings panes never race each other.
+    #[test]
+    fn a_rest_queue_runs_one_request_at_a_time() {
+        let mut queue = RestQueue::default();
+        for request_id in 1..=3 {
+            queue.push(rest_request(request_id));
+        }
+
+        assert_eq!(
+            queue.start().map(|request| request.request_id),
+            Some(1),
+            "the first request starts at once"
+        );
+        assert!(queue.start().is_none(), "the second waits its turn");
+
+        queue.finish();
+        assert_eq!(queue.start().map(|request| request.request_id), Some(2));
+
+        let abandoned: Vec<u64> = queue
+            .abandon()
+            .iter()
+            .map(|request| request.request_id)
+            .collect();
+        assert_eq!(abandoned, vec![3]);
+        assert!(queue.abandon().is_empty());
+    }
+
     #[test]
     fn a_failed_transfer_names_what_the_ui_asked_for() {
         let upload = Transfer::Upload {
             request_id: 4,
-            room_id: GENERAL_ROOM.to_owned(),
+            channel_id: GENERAL,
             file_name: "shot.png".to_owned(),
             content_type: "image/png",
             bytes: Blob::from(vec![0; 8]),
@@ -2379,11 +3129,168 @@ mod tests {
             }
             other => panic!("expected a FetchFailed, got {other:?}"),
         }
+
+        let fetch_image = Transfer::FetchImage {
+            request_id: 6,
+            id: 11,
+        };
+        match transfer_failed(&fetch_image, "boom".to_owned()) {
+            Event::ImageFetchFailed {
+                request_id,
+                id,
+                error,
+            } => {
+                assert_eq!(request_id, 6);
+                assert_eq!(id, 11);
+                assert_eq!(error, "boom");
+            }
+            other => panic!("expected an ImageFetchFailed, got {other:?}"),
+        }
     }
 
     #[test]
     fn a_watch_state_of_zero_means_nobody() {
         assert_eq!(watch_target(0), None);
         assert_eq!(watch_target(7), Some(7));
+    }
+
+    #[test]
+    fn a_session_replaced_error_is_terminal() {
+        let reason = terminal_reason(&error(ErrorCode::SessionReplaced, true))
+            .expect("a replaced session stops the loop");
+
+        assert!(
+            matches!(reason, DisconnectReason::SessionReplaced),
+            "{reason}"
+        );
+        assert!(matches!(
+            fatal_outcome(&error(ErrorCode::SessionReplaced, true)),
+            AfterAttempt::Stop(Some(DisconnectReason::SessionReplaced))
+        ));
+    }
+
+    #[test]
+    fn a_fatal_kicked_error_is_terminal() {
+        let reason =
+            terminal_reason(&error(ErrorCode::Kicked, true)).expect("a kick stops the loop");
+
+        assert!(matches!(reason, DisconnectReason::Kicked), "{reason}");
+        assert_eq!(reason.to_string(), "kicked from the server");
+        // Only the fatal flag closes the door; a non-fatal code is the server
+        // being chatty, and the loop reconnects.
+        assert!(terminal_reason(&error(ErrorCode::Kicked, false)).is_none());
+    }
+
+    #[test]
+    fn a_fatal_banned_error_is_terminal() {
+        let reason =
+            terminal_reason(&error(ErrorCode::Banned, true)).expect("a ban stops the loop");
+
+        assert!(matches!(reason, DisconnectReason::Banned), "{reason}");
+        assert_eq!(reason.to_string(), "banned from the server");
+        assert!(terminal_reason(&error(ErrorCode::Banned, false)).is_none());
+    }
+
+    /// Every other fatal error is followed by the server closing the socket, so
+    /// the loop backs off instead of giving up.
+    #[test]
+    fn another_fatal_error_only_costs_the_attempt() {
+        assert!(terminal_reason(&error(ErrorCode::Protocol, true)).is_none());
+        assert!(matches!(
+            fatal_outcome(&error(ErrorCode::Protocol, true)),
+            AfterAttempt::Reconnect { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_admin_command_dropped_names_its_kind() {
+        let (mut events, mut received) = mpsc::channel(1);
+
+        assert!(
+            drop_command(
+                Command::Admin(AdminCommand::BanMember {
+                    user_id: 9,
+                    reason: "spam".to_owned(),
+                }),
+                &mut events,
+            )
+            .await
+        );
+
+        match received.try_recv() {
+            Ok(Event::AdminDropped { kind }) => assert_eq!(kind, "BanMember"),
+            other => panic!("expected an AdminDropped, got {other:?}"),
+        }
+        assert_eq!(
+            AdminCommand::CreateChannel {
+                kind: ChannelKind::Text,
+                name: "music".to_owned(),
+                topic: String::new(),
+                category_id: 0,
+            }
+            .kind_name(),
+            "CreateChannel"
+        );
+    }
+
+    /// Nothing the server can send before `Welcome` may reach the
+    /// "known but unhandled" path: every payload of the schema is named here.
+    #[test]
+    fn every_server_payload_has_a_welcome_arm() {
+        let ignored = [
+            server_frame::Payload::Message(Default::default()),
+            server_frame::Payload::Pong(Default::default()),
+            server_frame::Payload::VoiceReady(Default::default()),
+            server_frame::Payload::VoiceState(Default::default()),
+            server_frame::Payload::VoiceMemberJoined(Default::default()),
+            server_frame::Payload::VoiceMemberLeft(Default::default()),
+            server_frame::Payload::Speaking(Default::default()),
+            server_frame::Payload::MessageEdited(Default::default()),
+            server_frame::Payload::MessageDeleted(Default::default()),
+            server_frame::Payload::ReactionsChanged(Default::default()),
+            server_frame::Payload::ShareStarted(Default::default()),
+            server_frame::Payload::ShareStopped(Default::default()),
+            server_frame::Payload::WatchState(Default::default()),
+            server_frame::Payload::ShareWatchers(Default::default()),
+            server_frame::Payload::ServerSnapshot(Default::default()),
+            server_frame::Payload::ServerUpdated(Default::default()),
+            server_frame::Payload::RoleUpserted(Default::default()),
+            server_frame::Payload::RoleDeleted(Default::default()),
+            server_frame::Payload::RoleOrder(Default::default()),
+            server_frame::Payload::CategoryUpserted(Default::default()),
+            server_frame::Payload::CategoryDeleted(Default::default()),
+            server_frame::Payload::ChannelUpserted(Default::default()),
+            server_frame::Payload::ChannelDeleted(Default::default()),
+            server_frame::Payload::ChannelOrder(Default::default()),
+            server_frame::Payload::MemberUpdated(Default::default()),
+            server_frame::Payload::MemberRemoved(Default::default()),
+            server_frame::Payload::VoiceMoved(Default::default()),
+        ];
+        // `ServerFrame` carries 29 payloads: these are all but Welcome and Error.
+        assert_eq!(ignored.len(), 27);
+
+        for payload in ignored {
+            let printed = format!("{payload:?}");
+            let frame = ServerFrame {
+                payload: Some(payload),
+            };
+            match classify_first_frame(frame.payload) {
+                // The log line names the payload it ignored.
+                FirstFrame::Ignore(name) => {
+                    assert!(printed.starts_with(name), "{name} for {printed}");
+                }
+                other => panic!("expected {printed} to be ignored, got {other:?}"),
+            }
+        }
+
+        assert!(matches!(
+            classify_first_frame(Some(server_frame::Payload::Welcome(Default::default()))),
+            FirstFrame::Welcome(_)
+        ));
+        assert!(matches!(
+            classify_first_frame(Some(server_frame::Payload::Error(Default::default()))),
+            FirstFrame::Error(_)
+        ));
+        assert!(matches!(classify_first_frame(None), FirstFrame::Unknown));
     }
 }

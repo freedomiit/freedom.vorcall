@@ -2,8 +2,13 @@
 //!
 //! A Wayland client cannot read input it does not have focus for, by design.
 //! The portal is the sanctioned way around that: the compositor keeps the
-//! binding and tells us when it activates and deactivates, so the key is never
+//! bindings and tells us when one activates and deactivates, so the key is never
 //! grabbed by us and never consumed on our behalf.
+//!
+//! Every action is one shortcut of a single `BindShortcuts` call, which is also
+//! the only confirmation dialog the user sees. The compositor matches the
+//! modifiers itself — the trigger string carries them — so nothing here tracks
+//! modifier state.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -14,27 +19,72 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
-use crate::{Backend, Binding, Edge, EdgeFilter, Listener, Stop, Unavailable, keymap};
+use crate::{
+    ActionId, Backend, Edge, Listener, Mods, Router, Shortcut, Stop, Trigger, Unavailable, keymap,
+};
 
-const SHORTCUT_ID: &str = "push-to-talk";
+/// The action the app documents as push to talk, which is the one the compositor
+/// names in its dialog.
+const PUSH_TO_TALK: ActionId = 0;
 
 /// Far beyond the budget the other backends keep, because binding a shortcut
 /// can put a confirmation dialog in front of the user first.
 const BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the portal thread reports back once it has bound, or failed to bind:
-/// the compositor's own description of the trigger it settled on.
-type Ready = Result<Option<String>, Unavailable>;
+/// the compositor's own description of the trigger it settled on, per action.
+type Ready = Result<Vec<(ActionId, String)>, Unavailable>;
+
+/// One shortcut as the portal wants it: an id of our own making, the trigger we
+/// would prefer, and the sentence the user is asked to confirm.
+struct Request {
+    action: ActionId,
+    id: String,
+    trigger: Option<String>,
+    description: String,
+}
+
+impl Request {
+    fn new(shortcut: &Shortcut) -> Request {
+        let description = if shortcut.description.is_empty() {
+            default_description(shortcut.action)
+        } else {
+            shortcut.description.clone()
+        };
+        Request {
+            action: shortcut.action,
+            id: format!("action-{}", shortcut.action),
+            trigger: keymap::xdg_trigger(&shortcut.binding),
+            description,
+        }
+    }
+}
+
+fn default_description(action: ActionId) -> String {
+    if action == PUSH_TO_TALK {
+        "Vorcall push to talk".to_string()
+    } else {
+        format!("Vorcall shortcut {action}")
+    }
+}
 
 pub(crate) fn start(
-    binding: Binding,
-    edges: UnboundedSender<Edge>,
+    bindings: Vec<Shortcut>,
+    edges: UnboundedSender<(ActionId, Edge)>,
 ) -> Result<Listener, Unavailable> {
-    if matches!(binding, Binding::Mouse(_)) {
-        return Err(Unavailable::Unsupported(
-            "mouse buttons are window-only on Wayland".to_string(),
-        ));
+    // The portal is keyboard-only, so a mouse binding is left out of the one
+    // `BindShortcuts` call instead of costing the keyboard ones their listener.
+    let (bound, unavailable) =
+        crate::partition(&bindings, |shortcut| match shortcut.binding.trigger {
+            Trigger::Mouse(_) => Err(Unavailable::Unsupported(
+                "mouse buttons are window-only on Wayland".to_string(),
+            )),
+            Trigger::Key(_) => Ok(Request::new(shortcut)),
+        });
+    if bound.is_empty() {
+        return Err(crate::nothing_bindable(&unavailable));
     }
+    let requests: Vec<Request> = bound.into_iter().map(|(_, _, request)| request).collect();
 
     let (ready_tx, ready_rx) = mpsc::channel::<Ready>();
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -53,7 +103,7 @@ pub(crate) fn start(
                     return;
                 }
             };
-            runtime.block_on(portal(binding, edges, &ready_tx, stop_rx));
+            runtime.block_on(portal(requests, edges, &ready_tx, stop_rx));
         })
         .map_err(|err| Unavailable::Failed(format!("cannot start the listener thread: {err}")))?;
 
@@ -61,9 +111,10 @@ pub(crate) fn start(
         stop: Some(stop_tx),
     };
     match ready_rx.recv_timeout(BIND_TIMEOUT) {
-        Ok(Ok(description)) => Ok(Listener::new(
+        Ok(Ok(descriptions)) => Ok(Listener::new(
             Backend::WaylandPortal,
-            description,
+            descriptions,
+            unavailable,
             Box::new(handle),
         )),
         Ok(Err(err)) => Err(err),
@@ -76,8 +127,8 @@ pub(crate) fn start(
 }
 
 async fn portal(
-    binding: Binding,
-    edges: UnboundedSender<Edge>,
+    requests: Vec<Request>,
+    edges: UnboundedSender<(ActionId, Edge)>,
     ready: &mpsc::Sender<Ready>,
     stop: oneshot::Receiver<()>,
 ) {
@@ -90,7 +141,7 @@ async fn portal(
         let _ = ready.send(Err(no_portal()));
         return;
     };
-    // Still the portal's own availability, not the binding's: a compositor that
+    // Still the portal's own availability, not the bindings': a compositor that
     // cannot open a session cannot bind anything either.
     let Ok(session) = shortcuts
         .create_session(CreateSessionOptions::default())
@@ -100,7 +151,7 @@ async fn portal(
         return;
     };
 
-    match bind(&shortcuts, &session, binding, edges, ready, stop).await {
+    match bind(&shortcuts, &session, requests, edges, ready, stop).await {
         Ok(()) => {}
         Err(err) => {
             let _ = ready.send(Err(err));
@@ -112,8 +163,8 @@ async fn portal(
 async fn bind(
     shortcuts: &GlobalShortcuts,
     session: &ashpd::desktop::Session<GlobalShortcuts>,
-    binding: Binding,
-    edges: UnboundedSender<Edge>,
+    requests: Vec<Request>,
+    edges: UnboundedSender<(ActionId, Edge)>,
     ready: &mpsc::Sender<Ready>,
     stop: oneshot::Receiver<()>,
 ) -> Result<(), Unavailable> {
@@ -128,43 +179,70 @@ async fn bind(
         return Err(refused());
     };
 
-    let trigger = keymap::xdg_trigger(&binding);
-    let shortcut =
-        NewShortcut::new(SHORTCUT_ID, "Vorcall push to talk").preferred_trigger(trigger.as_deref());
-    let bound = shortcuts
-        .bind_shortcuts(session, &[shortcut], None, BindShortcutsOptions::default())
+    let wanted: Vec<NewShortcut> = requests
+        .iter()
+        .map(|request| {
+            NewShortcut::new(request.id.as_str(), request.description.as_str())
+                .preferred_trigger(request.trigger.as_deref())
+        })
+        .collect();
+    let reply = shortcuts
+        .bind_shortcuts(session, &wanted, None, BindShortcutsOptions::default())
         .await
         .and_then(|request| request.response())
         .map_err(|_| refused())?;
-    if bound.shortcuts().is_empty() {
-        return Err(refused());
-    }
-    let description = bound
-        .shortcuts()
+
+    let missing: Vec<&str> = requests
         .iter()
-        .find(|shortcut| shortcut.id() == SHORTCUT_ID)
-        .map(|shortcut| shortcut.trigger_description().to_string());
-    if ready.send(Ok(description)).is_err() {
+        .filter(|request| {
+            !reply
+                .shortcuts()
+                .iter()
+                .any(|shortcut| shortcut.id() == request.id)
+        })
+        .map(|request| request.id.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(Unavailable::Failed(format!(
+            "the compositor refused a shortcut ({})",
+            missing.join(", ")
+        )));
+    }
+
+    let descriptions: Vec<(ActionId, String)> = requests
+        .iter()
+        .filter_map(|request| {
+            let bound = reply
+                .shortcuts()
+                .iter()
+                .find(|shortcut| shortcut.id() == request.id)?;
+            Some((request.action, bound.trigger_description().to_string()))
+        })
+        .collect();
+    if ready.send(Ok(descriptions)).is_err() {
         return Ok(());
     }
 
-    let mut filter = EdgeFilter::default();
+    // The compositor, not this crate, decides when a shortcut is active, so
+    // every action is routed without modifiers of its own.
+    let mut router = Router::new(edges);
+    for request in &requests {
+        router.push(request.action, Mods::default(), request.id.clone());
+    }
+
     futures::pin_mut!(activated, deactivated, stop);
     loop {
-        let edge = tokio::select! {
+        tokio::select! {
             Some(signal) = activated.next() => {
-                (signal.shortcut_id() == SHORTCUT_ID).then_some(Edge::Pressed)
+                router.trigger(Edge::Pressed, |bound| bound.as_str() == signal.shortcut_id());
             }
             Some(signal) = deactivated.next() => {
-                (signal.shortcut_id() == SHORTCUT_ID).then_some(Edge::Released)
+                router.trigger(Edge::Released, |bound| bound.as_str() == signal.shortcut_id());
             }
             _ = &mut stop => break,
             else => break,
-        };
-        let Some(edge) = edge else {
-            continue;
-        };
-        if filter.admit(edge) && edges.unbounded_send(edge).is_err() {
+        }
+        if router.closed() {
             break;
         }
     }

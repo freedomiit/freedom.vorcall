@@ -5,7 +5,7 @@
 //! the keyboard, plus the side-agnostic virtual key on Windows — because a
 //! binding is a logical key, not a physical one.
 
-use crate::{Binding, Key, MouseButton};
+use crate::{Binding, Key, MouseButton, Trigger};
 
 /// Windows virtual-key codes.
 pub fn windows_vks(key: Key) -> Vec<u16> {
@@ -23,6 +23,26 @@ pub fn windows_vks(key: Key) -> Vec<u16> {
         Key::End => vec![0x23],
         Key::PageUp => vec![0x21],
         Key::PageDown => vec![0x22],
+        Key::ArrowLeft => vec![0x25],
+        Key::ArrowUp => vec![0x26],
+        Key::ArrowRight => vec![0x27],
+        Key::ArrowDown => vec![0x28],
+        Key::Enter => vec![0x0D],
+        Key::Escape => vec![0x1B],
+        Key::Backspace => vec![0x08],
+        // The OEM codes: their characters depend on the layout, their position
+        // on the keyboard does not.
+        Key::Semicolon => vec![0xBA],
+        Key::Equal => vec![0xBB],
+        Key::Comma => vec![0xBC],
+        Key::Minus => vec![0xBD],
+        Key::Period => vec![0xBE],
+        Key::Slash => vec![0xBF],
+        Key::Backquote => vec![0xC0],
+        Key::BracketLeft => vec![0xDB],
+        Key::Backslash => vec![0xDC],
+        Key::BracketRight => vec![0xDD],
+        Key::Quote => vec![0xDE],
         Key::F(number) => vec![0x70 + u16::from(number) - 1],
         // VK codes for the alphanumeric block are the uppercase ASCII values.
         Key::Char(character) => vec![character.to_ascii_uppercase() as u16],
@@ -50,6 +70,26 @@ pub fn mac_keycodes(key: Key) -> Vec<u16> {
         Key::End => vec![0x77],
         Key::PageUp => vec![0x74],
         Key::PageDown => vec![0x79],
+        Key::ArrowLeft => vec![0x7B],
+        Key::ArrowRight => vec![0x7C],
+        Key::ArrowDown => vec![0x7D],
+        Key::ArrowUp => vec![0x7E],
+        Key::Enter => vec![0x24],
+        Key::Escape => vec![0x35],
+        // `kVK_Delete` is the backspace key; the forward delete above is a
+        // different code.
+        Key::Backspace => vec![0x33],
+        Key::Equal => vec![0x18],
+        Key::Minus => vec![0x1B],
+        Key::BracketRight => vec![0x1E],
+        Key::BracketLeft => vec![0x21],
+        Key::Quote => vec![0x27],
+        Key::Semicolon => vec![0x29],
+        Key::Backslash => vec![0x2A],
+        Key::Comma => vec![0x2B],
+        Key::Slash => vec![0x2C],
+        Key::Period => vec![0x2F],
+        Key::Backquote => vec![0x32],
         Key::F(number) => mac_function_key(number)
             .map(|code| vec![code])
             .unwrap_or_default(),
@@ -113,7 +153,8 @@ fn mac_character_key(character: char) -> Option<u16> {
 /// The `CGEventFlags` bit a modifier key raises, for keys that have one.
 ///
 /// Modifiers arrive as `FlagsChanged` rather than key events, so this is how
-/// their press and release are read.
+/// their press and release are read — and, for a chord, how the macOS backend
+/// reads the modifiers held with the trigger.
 pub fn mac_modifier_flag(key: Key) -> Option<u64> {
     match key {
         Key::Control => Some(0x0004_0000),
@@ -140,8 +181,26 @@ pub fn x11_keysyms(key: Key) -> Vec<u32> {
         Key::End => vec![0xff57],
         Key::PageUp => vec![0xff55],
         Key::PageDown => vec![0xff56],
-        Key::F(number) => vec![0xffbe + u32::from(number) - 1],
+        Key::ArrowLeft => vec![0xff51],
+        Key::ArrowUp => vec![0xff52],
+        Key::ArrowRight => vec![0xff53],
+        Key::ArrowDown => vec![0xff54],
+        Key::Enter => vec![0xff0d],
+        Key::Escape => vec![0xff1b],
+        Key::Backspace => vec![0xff08],
         // Latin-1 keysyms are the ASCII values of the unshifted character.
+        Key::Quote => vec![0x27],
+        Key::Comma => vec![0x2c],
+        Key::Minus => vec![0x2d],
+        Key::Period => vec![0x2e],
+        Key::Slash => vec![0x2f],
+        Key::Semicolon => vec![0x3b],
+        Key::Equal => vec![0x3d],
+        Key::BracketLeft => vec![0x5b],
+        Key::Backslash => vec![0x5c],
+        Key::BracketRight => vec![0x5d],
+        Key::Backquote => vec![0x60],
+        Key::F(number) => vec![0xffbe + u32::from(number) - 1],
         Key::Char(character) => vec![character.to_ascii_lowercase() as u32],
     }
 }
@@ -165,32 +224,112 @@ pub fn mac_button(button: MouseButton) -> i64 {
 }
 
 /// The preferred trigger handed to the GlobalShortcuts portal, spelled the way
-/// the XDG shortcuts specification wants it.
+/// the XDG shortcuts specification wants it: the modifiers in upper case, then
+/// the key's XKB name, joined with `+`.
 ///
 /// Mouse buttons have no spelling there, so they return `None`.
 pub fn xdg_trigger(binding: &Binding) -> Option<String> {
-    let key = match binding {
-        Binding::Key(key) => key,
-        Binding::Mouse(_) => return None,
+    let key = match binding.trigger {
+        Trigger::Key(key) => key,
+        Trigger::Mouse(_) => return None,
     };
-    let trigger = match key {
-        Key::Control => "CTRL".to_string(),
-        Key::Alt => "ALT".to_string(),
-        Key::Shift => "SHIFT".to_string(),
-        Key::Super => "LOGO".to_string(),
-        Key::Space => "space".to_string(),
-        Key::Tab => "Tab".to_string(),
-        Key::CapsLock => "Caps_Lock".to_string(),
-        Key::Insert => "Insert".to_string(),
-        Key::Delete => "Delete".to_string(),
-        Key::Home => "Home".to_string(),
-        Key::End => "End".to_string(),
-        Key::PageUp => "Page_Up".to_string(),
-        Key::PageDown => "Page_Down".to_string(),
-        Key::F(number) => format!("F{number}"),
-        Key::Char(character) => character.to_string(),
-    };
+    let mut trigger = String::new();
+    if binding.ctrl {
+        trigger.push_str("CTRL+");
+    }
+    if binding.shift {
+        trigger.push_str("SHIFT+");
+    }
+    if binding.alt {
+        trigger.push_str("ALT+");
+    }
+    trigger.push_str(&xdg_key(key));
     Some(trigger)
+}
+
+fn xdg_key(key: Key) -> String {
+    let name = match key {
+        Key::Control => "CTRL",
+        Key::Alt => "ALT",
+        Key::Shift => "SHIFT",
+        Key::Super => "LOGO",
+        Key::Space => "space",
+        Key::Tab => "Tab",
+        Key::CapsLock => "Caps_Lock",
+        Key::Insert => "Insert",
+        Key::Delete => "Delete",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "Page_Up",
+        Key::PageDown => "Page_Down",
+        Key::ArrowUp => "Up",
+        Key::ArrowDown => "Down",
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
+        Key::Enter => "Return",
+        Key::Escape => "Escape",
+        Key::Backspace => "BackSpace",
+        Key::Comma => "comma",
+        Key::Period => "period",
+        Key::Slash => "slash",
+        Key::Semicolon => "semicolon",
+        Key::Minus => "minus",
+        Key::Equal => "equal",
+        Key::BracketLeft => "bracketleft",
+        Key::BracketRight => "bracketright",
+        Key::Backquote => "grave",
+        Key::Quote => "apostrophe",
+        Key::Backslash => "backslash",
+        Key::F(number) => return format!("F{number}"),
+        Key::Char(character) => return character.to_string(),
+    };
+    name.to_string()
+}
+
+/// Every key the grammar can name, for the tables' own tests and for the
+/// grammar's round-trip test.
+#[cfg(test)]
+pub(crate) fn every_key() -> Vec<Key> {
+    let mut keys = vec![
+        Key::Control,
+        Key::Alt,
+        Key::Shift,
+        Key::Super,
+        Key::Space,
+        Key::Tab,
+        Key::CapsLock,
+        Key::Insert,
+        Key::Delete,
+        Key::Home,
+        Key::End,
+        Key::PageUp,
+        Key::PageDown,
+        Key::ArrowUp,
+        Key::ArrowDown,
+        Key::ArrowLeft,
+        Key::ArrowRight,
+        Key::Enter,
+        Key::Escape,
+        Key::Backspace,
+        Key::Comma,
+        Key::Period,
+        Key::Slash,
+        Key::Semicolon,
+        Key::Minus,
+        Key::Equal,
+        Key::BracketLeft,
+        Key::BracketRight,
+        Key::Backquote,
+        Key::Quote,
+        Key::Backslash,
+    ];
+    keys.extend((1..=24).map(Key::F));
+    keys.extend(
+        "abcdefghijklmnopqrstuvwxyz0123456789"
+            .chars()
+            .map(Key::Char),
+    );
+    keys
 }
 
 #[cfg(test)]
@@ -198,29 +337,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn every_key() -> Vec<Key> {
-        let mut keys = vec![
-            Key::Control,
-            Key::Alt,
-            Key::Shift,
-            Key::Super,
-            Key::Space,
-            Key::Tab,
-            Key::CapsLock,
-            Key::Insert,
-            Key::Delete,
-            Key::Home,
-            Key::End,
-            Key::PageUp,
-            Key::PageDown,
-        ];
-        keys.extend((1..=24).map(Key::F));
-        keys.extend(
-            "abcdefghijklmnopqrstuvwxyz0123456789"
-                .chars()
-                .map(Key::Char),
-        );
-        keys
+    fn simple(key: Key) -> Binding {
+        Binding::simple(Trigger::Key(key))
     }
 
     /// Fails when two keys claim the same platform code: a binding on one would
@@ -237,6 +355,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Pins the list the other tests sweep: 31 named keys, F1..F24, and the 36
+    /// alphanumeric keys. A new [`Key`] variant has to be added to it.
+    #[test]
+    fn every_key_lists_the_whole_grammar() {
+        assert_eq!(every_key().len(), 31 + 24 + 36);
     }
 
     #[test]
@@ -291,23 +416,49 @@ mod tests {
         assert_eq!(windows_vks(Key::F(1)), vec![0x70]);
         assert_eq!(windows_vks(Key::F(24)), vec![0x87]);
         assert_eq!(windows_vks(Key::Char('a')), vec![0x41]);
+        assert_eq!(windows_vks(Key::ArrowUp), vec![0x26]);
+        assert_eq!(windows_vks(Key::Comma), vec![0xBC]);
         assert_eq!(mac_keycodes(Key::Char('a')), vec![0x00]);
         assert_eq!(mac_keycodes(Key::F(12)), vec![0x6F]);
+        assert_eq!(mac_keycodes(Key::ArrowUp), vec![0x7E]);
+        assert_eq!(mac_keycodes(Key::Backspace), vec![0x33]);
         assert_eq!(x11_keysyms(Key::Tab), vec![0xff09]);
         assert_eq!(x11_keysyms(Key::F(1)), vec![0xffbe]);
         assert_eq!(x11_keysyms(Key::Char('z')), vec![0x7a]);
+        assert_eq!(x11_keysyms(Key::ArrowUp), vec![0xff52]);
+        assert_eq!(x11_keysyms(Key::Comma), vec![0x2c]);
     }
 
     #[test]
     fn xdg_triggers_exist_for_keys_and_never_for_mouse_buttons() {
         for key in every_key() {
             assert!(
-                xdg_trigger(&Binding::Key(key)).is_some(),
+                xdg_trigger(&simple(key)).is_some(),
                 "{key:?} has no XDG trigger"
             );
         }
         for button in [MouseButton::Back, MouseButton::Forward, MouseButton::Middle] {
-            assert_eq!(xdg_trigger(&Binding::Mouse(button)), None);
+            assert_eq!(xdg_trigger(&Binding::simple(Trigger::Mouse(button))), None);
+        }
+    }
+
+    #[test]
+    fn xdg_triggers_spell_the_modifiers_the_portal_expects() {
+        let cases = [
+            ("Ctrl+Shift+m", "CTRL+SHIFT+m"),
+            ("Alt+ArrowUp", "ALT+Up"),
+            ("Ctrl+Comma", "CTRL+comma"),
+            ("Ctrl+Shift+Alt+F8", "CTRL+SHIFT+ALT+F8"),
+            ("Control", "CTRL"),
+            ("Space", "space"),
+        ];
+        for (name, trigger) in cases {
+            let binding = Binding::parse(name).expect("the name parses");
+            assert_eq!(
+                xdg_trigger(&binding).as_deref(),
+                Some(trigger),
+                "{name} has the wrong XDG trigger"
+            );
         }
     }
 

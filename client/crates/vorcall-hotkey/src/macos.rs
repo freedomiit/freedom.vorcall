@@ -4,6 +4,10 @@
 //! tap cannot alter or swallow an event, and the value the callback returns is
 //! ignored. Reading events at all needs the Input Monitoring permission, which
 //! is checked before any tap is created.
+//!
+//! One tap serves every binding. The modifiers a chord needs come from the
+//! event's own `CGEventFlags`, which every event carries, so nothing here has to
+//! remember which modifier keys are down.
 
 use std::cell::{Cell, RefCell};
 use std::ptr;
@@ -22,7 +26,10 @@ use core_graphics::event::{
 };
 use futures::channel::mpsc::UnboundedSender;
 
-use crate::{Backend, Binding, Edge, EdgeFilter, Key, Listener, Stop, Unavailable, keymap};
+use crate::{
+    ActionId, Backend, Edge, Key, Listener, Mods, Router, Shortcut, Stop, Trigger, Unavailable,
+    keymap,
+};
 
 /// How long `start` waits for the tap to come up on its own thread.
 const START_TIMEOUT: Duration = Duration::from_secs(1);
@@ -49,8 +56,8 @@ enum Target {
 }
 
 pub(crate) fn start(
-    binding: Binding,
-    edges: UnboundedSender<Edge>,
+    bindings: Vec<Shortcut>,
+    edges: UnboundedSender<(ActionId, Edge)>,
 ) -> Result<Listener, Unavailable> {
     // SAFETY: both calls take no arguments and only consult (or ask for) this
     // process's Input Monitoring grant.
@@ -63,42 +70,52 @@ pub(crate) fn start(
         ));
     }
 
-    let target = match binding {
-        // Caps Lock only ever arrives as a FlagsChanged, and the modifier table
-        // has no bit for it, so a listener on it could never fire. Refusing
-        // here is what lets the app fall back to its in-window handling.
-        Binding::Key(Key::CapsLock) => {
-            return Err(Unavailable::Unsupported(
+    // A binding this tap can never see is skipped rather than fatal; the app
+    // falls back to its in-window handling for those actions alone.
+    let (bound, unavailable) = crate::partition(&bindings, |shortcut| {
+        match shortcut.binding.trigger {
+            // Caps Lock only ever arrives as a FlagsChanged, and the modifier
+            // table has no bit for it, so a listener on it could never fire.
+            Trigger::Key(Key::CapsLock) => Err(Unavailable::Unsupported(
                 "Caps Lock cannot be observed system-wide on macOS".to_string(),
-            ));
-        }
-        Binding::Key(key) => match keymap::mac_modifier_flag(key) {
-            Some(flag) => Target::Modifier(flag),
-            None => {
-                let keycodes = keymap::mac_keycodes(key);
-                if keycodes.is_empty() {
-                    return Err(Unavailable::Unsupported(
-                        "macOS has no code for that key".to_string(),
-                    ));
+            )),
+            Trigger::Key(key) => match keymap::mac_modifier_flag(key) {
+                Some(flag) => Ok(Target::Modifier(flag)),
+                None => {
+                    let keycodes = keymap::mac_keycodes(key);
+                    if keycodes.is_empty() {
+                        return Err(Unavailable::Unsupported(
+                            "macOS has no code for that key".to_string(),
+                        ));
+                    }
+                    Ok(Target::Keycodes(keycodes))
                 }
-                Target::Keycodes(keycodes)
-            }
-        },
-        Binding::Mouse(button) => Target::Button(keymap::mac_button(button)),
-    };
+            },
+            Trigger::Mouse(button) => Ok(Target::Button(keymap::mac_button(button))),
+        }
+    });
+    if bound.is_empty() {
+        return Err(crate::nothing_bindable(&unavailable));
+    }
+
+    let mut router = Router::new(edges);
+    for (action, mods, target) in bound {
+        router.push(action, mods, target);
+    }
 
     let (ready_tx, ready_rx) = mpsc::channel::<Result<CFRunLoop, Unavailable>>();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let thread = std::thread::Builder::new()
         .name("vorcall-hotkey".to_string())
-        .spawn(move || run(target, edges, &ready_tx, &flag))
+        .spawn(move || run(router, &ready_tx, &flag))
         .map_err(|err| Unavailable::Failed(format!("cannot start the listener thread: {err}")))?;
 
     match ready_rx.recv_timeout(START_TIMEOUT) {
         Ok(Ok(run_loop)) => Ok(Listener::new(
             Backend::MacEventTap,
-            None,
+            Vec::new(),
+            unavailable,
             Box::new(Handle {
                 run_loop,
                 stop,
@@ -118,8 +135,7 @@ pub(crate) fn start(
 }
 
 fn run(
-    target: Target,
-    edges: UnboundedSender<Edge>,
+    router: Router<Target>,
     ready: &mpsc::Sender<Result<CFRunLoop, Unavailable>>,
     stop: &AtomicBool,
 ) {
@@ -127,7 +143,7 @@ fn run(
     // after the system disables it.
     let port: Rc<Cell<CFMachPortRef>> = Rc::new(Cell::new(ptr::null_mut()));
     let callback_port = Rc::clone(&port);
-    let filter = RefCell::new(EdgeFilter::default());
+    let router = RefCell::new(router);
 
     let tap = CGEventTap::new(
         CGEventTapLocation::Session,
@@ -152,13 +168,7 @@ fn run(
                         unsafe { CGEventTapEnable(tap, true) };
                     }
                 }
-                _ => {
-                    if let Some(edge) = classify(&target, event_type, event)
-                        && filter.borrow_mut().admit(edge)
-                    {
-                        let _ = edges.unbounded_send(edge);
-                    }
-                }
+                _ => dispatch(&mut router.borrow_mut(), event_type, event),
             }
             // A listen-only tap cannot change the event stream anyway.
             None
@@ -201,40 +211,77 @@ fn run(
     }
 }
 
-fn classify(target: &Target, event_type: CGEventType, event: &CGEvent) -> Option<Edge> {
-    match (target, event_type) {
-        (Target::Keycodes(keycodes), CGEventType::KeyDown) => {
+fn dispatch(router: &mut Router<Target>, event_type: CGEventType, event: &CGEvent) {
+    let flags = event.get_flags().bits();
+    // Every event reports the modifiers that were held when it happened, so the
+    // chord state is read rather than remembered.
+    router.set_mods(mods(flags));
+
+    match event_type {
+        CGEventType::KeyDown => {
             if event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0 {
-                return None;
+                return;
             }
-            matches_keycode(event, keycodes).then_some(Edge::Pressed)
+            let keycode = keycode(event);
+            router.trigger(Edge::Pressed, |target| matches_keycode(target, keycode));
         }
-        (Target::Keycodes(keycodes), CGEventType::KeyUp) => {
-            matches_keycode(event, keycodes).then_some(Edge::Released)
+        CGEventType::KeyUp => {
+            let keycode = keycode(event);
+            router.trigger(Edge::Released, |target| matches_keycode(target, keycode));
         }
-        (Target::Modifier(flag), CGEventType::FlagsChanged) => {
-            // Any modifier change reports every modifier's current state, so
-            // the bit alone says whether the bound one is down.
-            let held = event.get_flags().bits() & flag != 0;
-            Some(if held { Edge::Pressed } else { Edge::Released })
+        CGEventType::FlagsChanged => {
+            // Any modifier change reports every modifier's current state, so the
+            // bit alone says whether a bound modifier is down.
+            router.trigger(
+                Edge::Pressed,
+                |target| matches!(target, Target::Modifier(flag) if flags & flag != 0),
+            );
+            router.trigger(
+                Edge::Released,
+                |target| matches!(target, Target::Modifier(flag) if flags & flag == 0),
+            );
         }
-        (Target::Button(number), CGEventType::OtherMouseDown) => {
-            matches_button(event, *number).then_some(Edge::Pressed)
+        CGEventType::OtherMouseDown => {
+            let number = button(event);
+            router.trigger(Edge::Pressed, |target| matches_button(target, number));
         }
-        (Target::Button(number), CGEventType::OtherMouseUp) => {
-            matches_button(event, *number).then_some(Edge::Released)
+        CGEventType::OtherMouseUp => {
+            let number = button(event);
+            router.trigger(Edge::Released, |target| matches_button(target, number));
         }
-        _ => None,
+        _ => {}
     }
 }
 
-fn matches_keycode(event: &CGEvent, keycodes: &[u16]) -> bool {
-    let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-    keycodes.iter().any(|code| i64::from(*code) == keycode)
+fn mods(flags: u64) -> Mods {
+    Mods {
+        ctrl: held(flags, Key::Control),
+        shift: held(flags, Key::Shift),
+        alt: held(flags, Key::Alt),
+    }
 }
 
-fn matches_button(event: &CGEvent, number: i64) -> bool {
-    event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER) == number
+fn held(flags: u64, key: Key) -> bool {
+    keymap::mac_modifier_flag(key).is_some_and(|flag| flags & flag != 0)
+}
+
+fn keycode(event: &CGEvent) -> i64 {
+    event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+}
+
+fn button(event: &CGEvent) -> i64 {
+    event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER)
+}
+
+fn matches_keycode(target: &Target, keycode: i64) -> bool {
+    match target {
+        Target::Keycodes(keycodes) => keycodes.iter().any(|code| i64::from(*code) == keycode),
+        Target::Modifier(_) | Target::Button(_) => false,
+    }
+}
+
+fn matches_button(target: &Target, number: i64) -> bool {
+    matches!(target, Target::Button(bound) if *bound == number)
 }
 
 struct Handle {

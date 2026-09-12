@@ -1,25 +1,34 @@
 //! The screen-share stage: the toolbar over the video, and the wgpu path that
 //! turns a decoded I420 picture into pixels.
 //!
-//! Nothing here reads the application state. The caller hands over the picture
-//! and a set of message constructors, so the same stage is drawn in the main
-//! window and in the popped-out one.
+//! [`view`] and [`popped`] read nothing but [`StageView`] and [`StageHandlers`],
+//! so the same stage is drawn in the chat column and in the popped-out window;
+//! [`in_chat`] and [`popped_window`] are what fill those in from the application
+//! state.
 
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
 use iced::alignment::Vertical;
-use iced::widget::{button, column, container, pick_list, row, shader, slider, text};
-use iced::{Element, Length, Rectangle, Theme, mouse, wgpu};
+use iced::widget::{
+    Space, button, column, container, pick_list, row, shader, slider, svg, text, tooltip,
+};
+use iced::{Color, Element, Length, Rectangle, mouse, wgpu};
 use vorcall_screen::codec::Picture;
 
-use crate::brand::palette::{GROUND, MUTED};
+use crate::app::message::{Message, ShareMsg};
+use crate::app::state::rules::{self, SHARE_VOLUME_MAX};
+use crate::app::{App, MainState};
+use crate::icons::Icon;
+use crate::theme::{ThemeTokens, styles};
+use crate::view::widgets::ICON_SIZE;
+use crate::view::{TEXT_BODY, TEXT_SECONDARY};
 
-/// BT.709 limited range, the range the encoder writes. Black sits at 16 and
-/// white at 235 on the luma plane, neutral chroma at 128; the coefficients are
-/// the ones the standard tabulates. The WGSL below is formatted out of these
-/// same constants so the shader and the tests cannot drift apart.
+/// BT.709 limited range, the range the encoder writes. Black sits at 16 and white
+/// at 235 on the luma plane, neutral chroma at 128; the coefficients are the ones
+/// the standard tabulates. The WGSL below is formatted out of these same
+/// constants so the shader and the tests cannot drift apart.
 const Y_OFFSET: f32 = 16.0 / 255.0;
 const Y_SCALE: f32 = 255.0 / 219.0;
 const C_OFFSET: f32 = 128.0 / 255.0;
@@ -32,8 +41,12 @@ const B_CB: f32 = 1.8556;
 /// The width the volume slider gets in the toolbar.
 const VOLUME_WIDTH: f32 = 120.0;
 
-/// What the stage sends back. The caller owns the message type, so the stage
-/// can be built before those variants exist.
+/// The padding around an icon in the toolbar, matching the icon buttons
+/// everywhere else.
+const ICON_PADDING: f32 = 6.0;
+
+/// What the stage sends back. The caller owns the message type, so the stage can
+/// be drawn from any of them.
 pub struct StageHandlers<M: Clone> {
     pub watch: fn(i64) -> M,
     pub stop: M,
@@ -58,30 +71,33 @@ pub struct StageView<'a> {
     pub fullscreen: bool,
 }
 
-/// The in-window stage: toolbar above the video. In fullscreen only the video
-/// and a slim toolbar remain.
-pub fn view<'a, M: Clone + 'a>(stage: StageView<'a>, handlers: StageHandlers<M>) -> Element<'a, M> {
+/// The in-window stage: toolbar above the video.
+pub fn view<'a, M: Clone + 'a>(
+    stage: StageView<'a>,
+    handlers: StageHandlers<M>,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, M> {
     let popped = stage.popped;
-    content(stage, handlers, popped)
+    content(stage, handlers, tokens, popped)
 }
 
-/// The pop-out window's content: the same toolbar (Pop in instead of Pop out)
-/// and video.
+/// The pop-out window's content: the same toolbar, spelled Pop in.
 pub fn popped<'a, M: Clone + 'a>(
     stage: StageView<'a>,
     handlers: StageHandlers<M>,
+    tokens: &'a ThemeTokens,
 ) -> Element<'a, M> {
-    content(stage, handlers, true)
+    content(stage, handlers, tokens, true)
 }
 
 fn content<'a, M: Clone + 'a>(
     stage: StageView<'a>,
     handlers: StageHandlers<M>,
+    tokens: &'a ThemeTokens,
     popped: bool,
 ) -> Element<'a, M> {
-    let video = video(stage.picture, stage.seq);
-
-    column![toolbar(stage, handlers, popped), video]
+    let video = video(stage.picture, stage.seq, tokens);
+    column![toolbar(stage, handlers, tokens, popped), video]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -90,6 +106,7 @@ fn content<'a, M: Clone + 'a>(
 fn toolbar<'a, M: Clone + 'a>(
     stage: StageView<'a>,
     handlers: StageHandlers<M>,
+    tokens: &'a ThemeTokens,
     popped: bool,
 ) -> Element<'a, M> {
     let StageHandlers {
@@ -102,13 +119,18 @@ fn toolbar<'a, M: Clone + 'a>(
         volume_released,
     } = handlers;
 
-    let mut bar = row![text(format!("Watching {}", stage.sharer))]
-        .spacing(8)
-        .align_y(Vertical::Center);
+    let mut bar = row![
+        glyph(Icon::Screen, tokens.text_secondary),
+        text(format!("Watching {}", stage.sharer))
+            .size(TEXT_BODY)
+            .color(tokens.text_primary),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
 
-    // In fullscreen the video is the whole window: only the controls that get
-    // the viewer back out of it, and the volume, stay. With a single sharer
-    // there is nothing to pick between, so the name above is the whole story.
+    // In fullscreen the video is the whole window: only the controls that get the
+    // viewer back out of it, and the volume, stay. With a single sharer there is
+    // nothing to pick between, so the name above is the whole story.
     if !stage.fullscreen && stage.sharers.len() > 1 {
         let options: Vec<Sharer> = stage
             .sharers
@@ -120,48 +142,78 @@ fn toolbar<'a, M: Clone + 'a>(
             .find(|sharer| sharer.id == stage.current)
             .cloned();
 
-        bar = bar.push(pick_list(options, selected, move |sharer| watch(sharer.id)));
+        bar = bar.push(
+            pick_list(options, selected, move |sharer| watch(sharer.id))
+                .text_size(TEXT_SECONDARY)
+                .padding([4.0, 8.0])
+                .style(styles::pick_list(tokens))
+                .menu_style(styles::menu(tokens)),
+        );
     }
+
+    bar = bar.push(Space::new().width(Length::Fill));
 
     if stage.has_audio {
         bar = bar.push(
-            slider(0.0..=2.0, stage.volume, volume)
-                .step(0.05_f32)
+            slider(0.0..=SHARE_VOLUME_MAX, stage.volume, volume)
                 .on_release(volume_released)
-                .width(VOLUME_WIDTH),
+                .step(0.05_f32)
+                .width(VOLUME_WIDTH)
+                .style(styles::slider(tokens)),
         );
-        bar = bar.push(text(format!("{:.0}%", stage.volume * 100.0)).color(MUTED));
+        bar = bar.push(
+            text(format!("{:.0}%", stage.volume * 100.0))
+                .size(TEXT_SECONDARY)
+                .color(tokens.text_muted),
+        );
     }
 
     if !stage.fullscreen {
-        bar = bar.push(text(stage.stats).color(MUTED));
         bar = bar.push(
-            button(text(if popped { "Pop in" } else { "Pop out" })).on_press(if popped {
-                pop_in
-            } else {
-                pop_out
-            }),
+            text(stage.stats)
+                .size(TEXT_SECONDARY)
+                .color(tokens.text_muted),
         );
+        let (tip, press) = if popped {
+            ("Pop in", pop_in)
+        } else {
+            ("Pop out", pop_out)
+        };
+        bar = bar.push(icon_button(Icon::Pin, tip, press, tokens));
     }
 
-    bar = bar.push(
-        button(text(if stage.fullscreen {
+    bar = bar.push(icon_button(
+        Icon::Expand,
+        if stage.fullscreen {
             "Exit fullscreen"
         } else {
             "Fullscreen"
-        }))
-        .on_press(fullscreen),
-    );
-    bar = bar.push(
-        button(text("Stop watching"))
-            .on_press(stop)
-            .style(button::danger),
-    );
+        },
+        fullscreen,
+        tokens,
+    ));
+    bar = bar.push(tooltip_of(
+        button(glyph(Icon::Close, tokens.text_on_accent))
+            .padding(ICON_PADDING)
+            .style(styles::button::danger(tokens))
+            .on_press(stop),
+        "Stop watching",
+        tokens,
+    ));
 
-    container(bar).padding(8).width(Length::Fill).into()
+    container(bar)
+        .width(Length::Fill)
+        .padding([6.0, 10.0])
+        .style(styles::container::elevated(tokens))
+        .into()
 }
 
-fn video<'a, M: 'a>(picture: Option<&'a Arc<Picture>>, seq: u64) -> Element<'a, M> {
+/// The picture itself, filling whatever is left under the toolbar.
+fn video<'a, M: 'a>(
+    picture: Option<&'a Arc<Picture>>,
+    seq: u64,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, M> {
     let body: Element<'a, M> = match picture {
         Some(picture) => shader(StageProgram {
             picture: Some(picture.clone()),
@@ -170,19 +222,64 @@ fn video<'a, M: 'a>(picture: Option<&'a Arc<Picture>>, seq: u64) -> Element<'a, 
         .width(Length::Fill)
         .height(Length::Fill)
         .into(),
-        None => text("Waiting for video…").color(MUTED).into(),
+        None => text("Waiting for video…")
+            .size(TEXT_BODY)
+            .color(tokens.text_muted)
+            .into(),
     };
 
-    container(body).center(Length::Fill).style(ground).into()
+    // The letterbox bars are this container's ground: the shader only paints
+    // inside the aspect-fitted rectangle.
+    container(body)
+        .center(Length::Fill)
+        .style(styles::container::chat(tokens))
+        .into()
 }
 
-/// The letterbox bars are this container's background: the shader only paints
-/// inside the aspect-fitted rectangle.
-fn ground(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(GROUND.into()),
-        ..container::Style::default()
-    }
+/// One icon, square, in one colour. [`crate::icons::icon`] is the same thing
+/// bound to [`Message`]; the stage is generic over its caller's message type, so
+/// it builds its own, as it does for the two below.
+fn glyph<'a, M: 'a>(icon: Icon, color: Color) -> Element<'a, M> {
+    svg(icon.handle())
+        .width(ICON_SIZE)
+        .height(ICON_SIZE)
+        .style(styles::svg(color))
+        .into()
+}
+
+fn icon_button<'a, M: Clone + 'a>(
+    icon: Icon,
+    tip: &str,
+    press: M,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, M> {
+    tooltip_of(
+        button(glyph(icon, tokens.text_secondary))
+            .padding(ICON_PADDING)
+            .style(styles::button::icon(tokens))
+            .on_press(press),
+        tip,
+        tokens,
+    )
+}
+
+fn tooltip_of<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    tip: &str,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, M> {
+    tooltip(
+        content,
+        container(
+            text(tip.to_owned())
+                .size(TEXT_SECONDARY)
+                .color(tokens.text_primary),
+        )
+        .padding([4.0, 8.0])
+        .style(styles::container::popover(tokens)),
+        tooltip::Position::Bottom,
+    )
+    .into()
 }
 
 /// A pick-list entry. The list shows the username and hands back the id.
@@ -198,6 +295,7 @@ impl fmt::Display for Sharer {
     }
 }
 
+/// One decoded picture on its way to the shader.
 pub struct StageProgram {
     pub picture: Option<Arc<Picture>>,
     pub seq: u64,
@@ -215,18 +313,22 @@ impl<M> shader::Program<M> for StageProgram {
     }
 }
 
+/// The picture as the renderer takes it.
 pub struct StagePrimitive {
-    picture: Option<Arc<Picture>>,
-    seq: u64,
+    pub picture: Option<Arc<Picture>>,
+    pub seq: u64,
 }
 
-// Hand-written so a frame never reaches a log as pixels.
 impl fmt::Debug for StagePrimitive {
+    /// Sizes only: a picture is somebody's screen.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let size = self
+            .picture
+            .as_ref()
+            .map(|picture| (picture.width, picture.height));
         f.debug_struct("StagePrimitive")
+            .field("size", &size)
             .field("seq", &self.seq)
-            .field("width", &self.picture.as_ref().map_or(0, |p| p.width))
-            .field("height", &self.picture.as_ref().map_or(0, |p| p.height))
             .finish()
     }
 }
@@ -268,8 +370,8 @@ impl shader::Primitive for StagePrimitive {
             return;
         };
 
-        // The primitive is rebuilt on every view(); only a new decoded picture
-        // is worth the three uploads.
+        // The primitive is rebuilt on every view(); only a new decoded picture is
+        // worth the three uploads.
         if pipeline.uploaded_seq != Some(self.seq) {
             let chroma_width = picture.width.div_ceil(2);
             let chroma_height = picture.height.div_ceil(2);
@@ -302,9 +404,9 @@ impl shader::Primitive for StagePrimitive {
             pipeline.uploaded_seq = Some(self.seq);
         }
 
-        // iced draws with the render pass's viewport already set to the widget
-        // in physical pixels; the fit is the same rectangle, shrunk to the
-        // picture's aspect ratio.
+        // iced draws with the render pass's viewport already set to the widget in
+        // physical pixels; the fit is the same rectangle, shrunk to the picture's
+        // aspect ratio.
         pipeline.fit = Some(fit_rect(
             *bounds * viewport.scale_factor(),
             picture.width,
@@ -329,8 +431,9 @@ impl shader::Primitive for StagePrimitive {
     }
 }
 
-/// One per renderer engine, and one stage is on screen per window, so the
-/// planes below belong to whatever picture was last prepared.
+/// The Y, U and V planes on the device, one set per renderer engine — and one
+/// stage is on screen per window, so they belong to whatever picture that
+/// window's renderer last prepared.
 pub struct StagePipeline {
     render: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
@@ -431,8 +534,8 @@ impl shader::Pipeline for StagePipeline {
     }
 
     // trim() is left at its no-op default: dropping the planes between frames
-    // would cost a full re-upload on the next one, and they go with the
-    // pipeline when the window does.
+    // would cost a full re-upload on the next one, and they go with the pipeline
+    // when the window does.
 }
 
 struct Planes {
@@ -523,8 +626,8 @@ fn upload(
 ) {
     let rows = height as usize;
     // A padded stride is what the decoder normally hands out; a stride shorter
-    // than the row cannot happen for I420, and a short plane would be rejected
-    // by wgpu's own validation, so both are dropped rather than drawn.
+    // than the row cannot happen for I420, and a short plane would be rejected by
+    // wgpu's own validation, so both are dropped rather than drawn.
     if stride < width as usize || rows == 0 {
         return;
     }
@@ -554,8 +657,8 @@ fn upload(
     )
 }
 
-/// The largest `width:height` rectangle inside `area`, centred, in whole
-/// physical pixels.
+/// The largest `width:height` rectangle inside `area`, centred, in whole physical
+/// pixels.
 fn fit_rect(area: Rectangle, width: u32, height: u32) -> Rectangle {
     if area.width <= 0.0 || area.height <= 0.0 || width == 0 || height == 0 {
         return Rectangle {
@@ -625,6 +728,64 @@ fn fs_main(frag: Output) -> @location(0) vec4<f32> {{
         g_cr = G_CR,
         b_cb = B_CB,
     )
+}
+
+/// The stage as the chat column draws it, built from the application state.
+pub fn in_chat<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
+    view(stage_view(main), handlers(), &app.tokens)
+}
+
+/// The stage as the popped-out window draws it.
+pub fn popped_window<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
+    popped(stage_view(main), handlers(), &app.tokens)
+}
+
+/// What the stage reads out of the state.
+fn stage_view(main: &MainState) -> StageView<'_> {
+    let watch = &main.voice.watch;
+    StageView {
+        sharer: rules::sharer_name(&main.voice, &main.server),
+        sharers: rules::sharer_list(&main.voice, main.member_id),
+        current: watch.state.unwrap_or_default(),
+        picture: watch.picture.as_ref(),
+        seq: watch.seq,
+        has_audio: watch
+            .state
+            .and_then(|user_id| main.voice.sharing(user_id))
+            .unwrap_or(false),
+        // Every step of a drag reaches the mixer through this; only its release
+        // reaches `config.share_volume` and the disk.
+        volume: watch.volume,
+        stats: stats_line(main),
+        popped: watch.popped.is_some(),
+        fullscreen: watch.fullscreen.is_some(),
+    }
+}
+
+/// The picture's own size, the decoder's rate, and what the depacketizer took in:
+/// the viewer measures no bitrate of its own.
+fn stats_line(main: &MainState) -> String {
+    let watch = &main.voice.watch;
+    let (width, height) = watch
+        .picture
+        .as_ref()
+        .map_or((0, 0), |picture| (picture.width, picture.height));
+    let fps = watch.stats.map_or(0.0, |(decode_fps, _, _)| decode_fps);
+    let kbps = watch.kbps;
+    format!("{width}×{height} · {fps:.0} fps · {kbps} kbit/s")
+}
+
+/// The messages the stage sends.
+fn handlers() -> StageHandlers<Message> {
+    StageHandlers {
+        watch: |user_id| Message::Share(ShareMsg::Watch(user_id)),
+        stop: Message::Share(ShareMsg::StopWatching),
+        pop_out: Message::Share(ShareMsg::PopOut),
+        pop_in: Message::Share(ShareMsg::PopIn),
+        fullscreen: Message::Share(ShareMsg::ToggleFullscreen),
+        volume: |volume| Message::Share(ShareMsg::SetVolume(volume)),
+        volume_released: Message::Share(ShareMsg::VolumeReleased),
+    }
 }
 
 #[cfg(test)]

@@ -21,8 +21,8 @@ public sealed class ClientConnection : IDisposable
     private const int MaxCloseReasonBytes = 123;
     private static readonly TimeSpan CloseTimeout = TimeSpan.FromSeconds(5);
 
-    private readonly Channel<ServerFrame> _outbox =
-        Channel.CreateBounded<ServerFrame>(new BoundedChannelOptions(OutboxCapacity) { SingleReader = true });
+    private readonly System.Threading.Channels.Channel<ServerFrame> _outbox =
+        System.Threading.Channels.Channel.CreateBounded<ServerFrame>(new BoundedChannelOptions(OutboxCapacity) { SingleReader = true });
 
     private readonly ILogger _logger;
     private readonly CancellationTokenSource _lifetime;

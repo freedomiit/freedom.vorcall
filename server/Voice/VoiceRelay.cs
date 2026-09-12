@@ -15,7 +15,7 @@ namespace Vorcall.Server.Voice;
 // that a session's own key has already been proved from, so the socket cannot be used to
 // bounce traffic at a third party. Screen share rides the same socket and the same key: its
 // fan-out leaves the receive loop through a per-session queue so a sharer's watchers never cost
-// the room's audio a millisecond.
+// the channel's audio a millisecond.
 public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger) : BackgroundService
 {
     private const int ReceiveBufferBytes = 8 * 1024 * 1024;
@@ -33,12 +33,12 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
     private readonly ConcurrentDictionary<uint, VoiceSession> _sessions = new();
 
     // Copy-on-write under _gate so the receive loop forwards over a snapshot without locking.
-    private readonly ConcurrentDictionary<string, ImmutableArray<VoiceSession>> _rooms = new();
-    private readonly ConcurrentDictionary<string, RoomCounters> _counters = new();
+    private readonly ConcurrentDictionary<long, ImmutableArray<VoiceSession>> _channels = new();
+    private readonly ConcurrentDictionary<long, ChannelCounters> _counters = new();
     private readonly Lock _gate = new();
 
     // These three drops happen before a datagram is attached to any session, so there is no
-    // room to charge them to: they are relay-wide and repeat in every room's line.
+    // channel to charge them to: they are relay-wide and repeat in every channel's line.
     private long _dropSize;
     private long _dropHeader;
     private long _dropUnknownSsrc;
@@ -47,14 +47,14 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
     // Raised from the receive loop and the housekeeping tick: handlers must be fast and must
     // not throw.
-    public event Action<string, long, bool>? SpeakingChanged;
+    public event Action<long, long, bool>? SpeakingChanged;
 
     public bool IsAvailable => _socket is not null;
 
     // Whether a share may be started at all: the kill switch plus a relay that actually came up.
     public bool ShareEnabled => options.ShareEnabled && IsAvailable;
 
-    // How many sharers a room may hold at once. The relay does not enforce it; the signalling
+    // How many sharers a channel may hold at once. The relay does not enforce it; the signalling
     // side does, and reads the ceiling from here.
     public int MaxSharersPerRoom => options.MaxSharersPerRoom;
 
@@ -62,7 +62,12 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
     public int Port => options.Port;
 
-    public VoiceSession CreateSession(string roomId, long userId)
+    public VoiceSession CreateSession(long channelId, long userId)
+        => CreateSession(channelId, userId, muted: false, deafened: false, priority: false);
+
+    // The moderation flags belong to the session from its first packet: a server-muted member must
+    // not be heard in the window between the join and a SetModeration call.
+    public VoiceSession CreateSession(long channelId, long userId, bool muted, bool deafened, bool priority)
     {
         var key = RandomNumberGenerator.GetBytes(VoiceSession.KeyBytes);
         VoiceSession session;
@@ -75,12 +80,17 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
             while (ssrc == 0 || _sessions.ContainsKey(ssrc));
 
-            session = new VoiceSession(ssrc, userId, roomId, key, options.ShareMaxKbps);
+            session = new VoiceSession(ssrc, userId, channelId, key, options.ShareMaxKbps)
+            {
+                Muted = muted,
+                Deafened = deafened,
+                Priority = priority,
+            };
             _sessions[ssrc] = session;
-            _rooms[roomId] = _rooms.TryGetValue(roomId, out var members) ? members.Add(session) : [session];
+            _channels[channelId] = _channels.TryGetValue(channelId, out var members) ? members.Add(session) : [session];
         }
 
-        logger.LogDebug("Voice session {Ssrc} opened for user {UserId} in room {RoomId}", session.Ssrc, userId, roomId);
+        logger.LogDebug("Voice session {Ssrc} opened for user {UserId} in channel {ChannelId}", session.Ssrc, userId, channelId);
         return session;
     }
 
@@ -94,16 +104,16 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 return;
             }
 
-            if (_rooms.TryGetValue(session.RoomId, out var members))
+            if (_channels.TryGetValue(session.ChannelId, out var members))
             {
                 var remaining = members.Remove(session);
                 if (remaining.IsEmpty)
                 {
-                    _rooms.TryRemove(session.RoomId, out _);
+                    _channels.TryRemove(session.ChannelId, out _);
                 }
                 else
                 {
-                    _rooms[session.RoomId] = remaining;
+                    _channels[session.ChannelId] = remaining;
                 }
             }
 
@@ -123,7 +133,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
 
         session.Dispose();
-        logger.LogDebug("Voice session {Ssrc} closed for user {UserId} in room {RoomId}", ssrc, session.UserId, session.RoomId);
+        logger.LogDebug("Voice session {Ssrc} closed for user {UserId} in channel {ChannelId}", ssrc, session.UserId, session.ChannelId);
     }
 
     // Marks a session as sharing, or ends its share. Starting is idempotent: a second call only
@@ -165,6 +175,29 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         if (started is { } queue && session is { } sharer)
         {
             _ = Task.Run(() => ShareWorkerAsync(sharer, queue));
+        }
+    }
+
+    // Applies the moderation flags to a live session. Takes only the relay's own lock and raises
+    // nothing, so the signalling side may call it while holding its own: true says the mute ended a
+    // talk spurt, which the caller announces once it has let go of that lock. An unknown ssrc is a
+    // no-op, which is what a moderation frame racing a leave looks like from here.
+    public bool SetModeration(uint ssrc, bool muted, bool deafened, bool priority)
+    {
+        lock (_gate)
+        {
+            if (!_sessions.TryGetValue(ssrc, out var session))
+            {
+                return false;
+            }
+
+            session.Muted = muted;
+            session.Deafened = deafened;
+            session.Priority = priority;
+
+            // Once the audio is dropped nothing arrives to expire the talk spurt, so a mute that
+            // lands mid-spurt has to end it or every client keeps showing a talker.
+            return muted && session.StopSpeaking();
         }
     }
 
@@ -340,7 +373,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                     if (inbound.Session.MarkAudio(Stopwatch.GetTimestamp()))
                     {
                         // The session was looked up before RemoveSession could have taken it out,
-                        // so a blind raise here can land after the room already saw
+                        // so a blind raise here can land after the channel already saw
                         // VoiceMemberLeft and leave a talker nobody ever silences. A removed
                         // session simply goes quiet.
                         if (_sessions.ContainsKey(inbound.Session.Ssrc))
@@ -408,7 +441,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             return false;
         }
 
-        var counters = _counters.GetOrAdd(session.RoomId, static _ => new RoomCounters());
+        var counters = _counters.GetOrAdd(session.ChannelId, static _ => new ChannelCounters());
 
         // Share media is a hundred packets a second on its own: it answers to a byte budget of
         // its own further down instead of the packet bucket audio and pings share.
@@ -457,12 +490,21 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
         }
 
+        // Server mute, refused where the share flags are and for the same reason: a forgery must
+        // not be able to probe the flag, and a muted sender must not mark itself speaking either.
+        // Only audio is silenced — its pings, keyframe requests and share media carry on.
+        if (header.Type == MediaHeader.TypeAudio && session.Muted)
+        {
+            Interlocked.Increment(ref counters.DropMuted);
+            return false;
+        }
+
         Interlocked.Increment(ref counters.PacketsIn);
         Interlocked.Add(ref counters.BytesIn, length);
 
         if (session.LearnAddress(address))
         {
-            logger.LogDebug("Voice session of user {UserId} in room {RoomId} moved to another address", session.UserId, session.RoomId);
+            logger.LogDebug("Voice session of user {UserId} in channel {ChannelId} moved to another address", session.UserId, session.ChannelId);
         }
 
         inbound = new Inbound(session, counters, header, plaintextLength);
@@ -473,7 +515,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
     // recipient's own key. The sender never gets its own audio back.
     private async Task ForwardAsync(Socket socket, Inbound inbound, byte[] buffer, byte[] scratch, byte[] plaintext, CancellationToken stoppingToken)
     {
-        if (!_rooms.TryGetValue(inbound.Session.RoomId, out var members))
+        if (!_channels.TryGetValue(inbound.Session.ChannelId, out var members))
         {
             return;
         }
@@ -484,7 +526,9 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
         foreach (var member in members)
         {
-            if (member.Ssrc == inbound.Session.Ssrc)
+            // A deafened member is skipped as a recipient only: its own address and its pongs are
+            // untouched.
+            if (member.Ssrc == inbound.Session.Ssrc || member.Deafened)
             {
                 continue;
             }
@@ -531,7 +575,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
     private async Task ShareWorkerAsync(VoiceSession session, ChannelReader<VoiceSession.Outbound> queue)
     {
         var scratch = new byte[MediaHeader.MaxDatagram];
-        var counters = _counters.GetOrAdd(session.RoomId, static _ => new RoomCounters());
+        var counters = _counters.GetOrAdd(session.ChannelId, static _ => new ChannelCounters());
 
         try
         {
@@ -552,12 +596,12 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Voice share worker for user {UserId} in room {RoomId} stopped", session.UserId, session.RoomId);
+            logger.LogError(ex, "Voice share worker for user {UserId} in channel {ChannelId} stopped", session.UserId, session.ChannelId);
         }
     }
 
     // False once the socket is gone, which is the worker's cue to leave.
-    private bool FanOut(VoiceSession session, VoiceSession.Outbound item, byte[] scratch, RoomCounters counters)
+    private bool FanOut(VoiceSession session, VoiceSession.Outbound item, byte[] scratch, ChannelCounters counters)
     {
         var socket = _socket;
         if (socket is null)
@@ -577,20 +621,20 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
         foreach (var watcher in watchers)
         {
-            if (watcher.Ssrc == session.Ssrc)
+            if (watcher.Ssrc == session.Ssrc || watcher.Deafened)
             {
                 continue;
             }
 
-            // A watch is only ever set up inside one room; a mismatch would be a bug in the
-            // signalling side, and the frame is dropped rather than leaked to the other room.
-            if (!string.Equals(watcher.RoomId, session.RoomId, StringComparison.Ordinal))
+            // A watch is only ever set up inside one channel; a mismatch would be a bug in the
+            // signalling side, and the frame is dropped rather than leaked to the other channel.
+            if (watcher.ChannelId != session.ChannelId)
             {
                 logger.LogDebug(
-                    "Voice share of user {UserId} in room {RoomId} had a watcher from room {WatcherRoomId}",
+                    "Voice share of user {UserId} in channel {ChannelId} had a watcher from channel {WatcherChannelId}",
                     session.UserId,
-                    session.RoomId,
-                    watcher.RoomId);
+                    session.ChannelId,
+                    watcher.ChannelId);
                 continue;
             }
 
@@ -677,7 +721,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
     }
 
-    private async Task SendAsync(Socket socket, byte[] datagram, int length, IPEndPoint destination, RoomCounters counters, CancellationToken stoppingToken)
+    private async Task SendAsync(Socket socket, byte[] datagram, int length, IPEndPoint destination, ChannelCounters counters, CancellationToken stoppingToken)
     {
         try
         {
@@ -738,14 +782,14 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         var dropHeader = Interlocked.Read(ref _dropHeader);
         var dropUnknownSsrc = Interlocked.Read(ref _dropUnknownSsrc);
 
-        foreach (var (roomId, members) in _rooms)
+        foreach (var (channelId, members) in _channels)
         {
-            if (members.IsEmpty || !_counters.TryGetValue(roomId, out var counters))
+            if (members.IsEmpty || !_counters.TryGetValue(channelId, out var counters))
             {
                 continue;
             }
 
-            // Evictions are counted on the session whose queue overflowed, so the room's figure
+            // Evictions are counted on the session whose queue overflowed, so the channel's figure
             // is its own refusals plus what its sharers threw away.
             var queueDrops = Interlocked.Read(ref counters.DropQueueFull);
             foreach (var member in members)
@@ -754,8 +798,8 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
 
             logger.LogInformation(
-                "Voice room {RoomId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; share: {SharePacketsIn} packets in, {SharePacketsOut} out, {ShareBytesIn} bytes in, {ShareBytesOut} out, {KeyframeRequests} keyframe requests; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address, {DropShareRate} share rate, {DropNotSharing} not sharing, {DropNotWatching} not watching, {DropQueueFull} queue full",
-                roomId,
+                "Voice channel {ChannelId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; share: {SharePacketsIn} packets in, {SharePacketsOut} out, {ShareBytesIn} bytes in, {ShareBytesOut} out, {KeyframeRequests} keyframe requests; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address, {DropShareRate} share rate, {DropNotSharing} not sharing, {DropMuted} muted, {DropNotWatching} not watching, {DropQueueFull} queue full",
+                channelId,
                 members.Length,
                 Interlocked.Read(ref counters.PacketsIn),
                 Interlocked.Read(ref counters.PacketsOut),
@@ -775,6 +819,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 Interlocked.Read(ref counters.DropNoAddress),
                 Interlocked.Read(ref counters.DropShareRate),
                 Interlocked.Read(ref counters.DropNotSharing),
+                Interlocked.Read(ref counters.DropMuted),
                 Interlocked.Read(ref counters.DropNotWatching),
                 queueDrops);
         }
@@ -790,18 +835,18 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
         try
         {
-            handler(session.RoomId, session.UserId, speaking);
+            handler(session.ChannelId, session.UserId, speaking);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Voice speaking handler failed for user {UserId} in room {RoomId}", session.UserId, session.RoomId);
+            logger.LogError(ex, "Voice speaking handler failed for user {UserId} in channel {ChannelId}", session.UserId, session.ChannelId);
         }
     }
 
-    private readonly record struct Inbound(VoiceSession Session, RoomCounters Counters, MediaHeader Header, int PlaintextLength);
+    private readonly record struct Inbound(VoiceSession Session, ChannelCounters Counters, MediaHeader Header, int PlaintextLength);
 
     // Fields, not properties: Interlocked needs a ref to the storage.
-    private sealed class RoomCounters
+    private sealed class ChannelCounters
     {
         public long PacketsIn;
         public long PacketsOut;
@@ -818,6 +863,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         public long DropNoAddress;
         public long DropShareRate;
         public long DropNotSharing;
+        public long DropMuted;
         public long DropNotWatching;
         public long DropQueueFull;
     }

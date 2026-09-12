@@ -12,9 +12,24 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
     public DbSet<Invite> Invites => Set<Invite>();
 
-    public DbSet<Room> Rooms => Set<Room>();
+    // Exactly one row, keyed Server.RowId.
+    public DbSet<Server> Server => Set<Server>();
 
-    public DbSet<RoomMember> RoomMembers => Set<RoomMember>();
+    public DbSet<Category> Categories => Set<Category>();
+
+    public DbSet<Channel> Channels => Set<Channel>();
+
+    public DbSet<ChannelRead> ChannelReads => Set<ChannelRead>();
+
+    public DbSet<Role> Roles => Set<Role>();
+
+    public DbSet<MemberRole> MemberRoles => Set<MemberRole>();
+
+    public DbSet<ChannelOverride> ChannelOverrides => Set<ChannelOverride>();
+
+    public DbSet<Ban> Bans => Set<Ban>();
+
+    public DbSet<Image> Images => Set<Image>();
 
     public DbSet<Reaction> Reactions => Set<Reaction>();
 
@@ -29,14 +44,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         message.Property(m => m.Author).HasColumnName("author").HasMaxLength(32).IsRequired();
         message.Property(m => m.Text).HasColumnName("text").HasMaxLength(2000).IsRequired();
         message.Property(m => m.SentAt).HasColumnName("sent_at").HasColumnType("timestamp with time zone").IsRequired();
-
-        // The default backfills every message written before rooms existed into general, so the
-        // column can be required without rewriting a single existing row.
-        message.Property(m => m.RoomId).HasColumnName("room_id").HasMaxLength(48).IsRequired().HasDefaultValue("general");
+        message.Property(m => m.ChannelId).HasColumnName("channel_id").IsRequired();
         message.Property(m => m.UserId).HasColumnName("user_id");
         message.Property(m => m.EditedAt).HasColumnName("edited_at").HasColumnType("timestamp with time zone");
         message.Property(m => m.DeletedAt).HasColumnName("deleted_at").HasColumnType("timestamp with time zone");
         message.Property(m => m.ReplyToId).HasColumnName("reply_to_id");
+        message.Property(m => m.MentionEveryone).HasColumnName("mention_everyone").IsRequired().HasDefaultValue(false);
+        message.Property(m => m.MentionHere).HasColumnName("mention_here").IsRequired().HasDefaultValue(false);
 
         // Never null, so a mention query is a plain = ANY without a null branch; the default is
         // what backfills every message written before mentions existed.
@@ -45,11 +59,14 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             .HasColumnType("bigint[]")
             .IsRequired()
             .HasDefaultValueSql("ARRAY[]::bigint[]");
-        message.HasIndex(m => new { m.RoomId, m.Id });
+        message.HasIndex(m => new { m.ChannelId, m.Id });
 
         // No navigation: a message keeps its author text forever, and deleting the account only
         // detaches the id.
         message.HasOne<User>().WithMany().HasForeignKey(m => m.UserId).OnDelete(DeleteBehavior.SetNull);
+
+        // Deleting a channel takes its messages with it.
+        message.HasOne<Channel>().WithMany().HasForeignKey(m => m.ChannelId).OnDelete(DeleteBehavior.Cascade);
 
         var user = modelBuilder.Entity<User>();
         user.ToTable("users");
@@ -59,6 +76,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         user.Property(u => u.UsernameNormalized).HasColumnName("username_normalized").HasMaxLength(32).IsRequired();
         user.Property(u => u.PasswordHash).HasColumnName("password_hash").HasColumnType("text").IsRequired();
         user.Property(u => u.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
+        user.Property(u => u.Nickname).HasColumnName("nickname").HasMaxLength(32);
+        user.Property(u => u.AvatarImageId).HasColumnName("avatar_image_id");
+        user.Property(u => u.BannerImageId).HasColumnName("banner_image_id");
+        user.Property(u => u.Description).HasColumnName("description").HasMaxLength(256).IsRequired().HasDefaultValue("");
+        user.Property(u => u.AccentColor).HasColumnName("accent_color");
+        user.Property(u => u.ServerMuted).HasColumnName("server_muted").IsRequired().HasDefaultValue(false);
+        user.Property(u => u.ServerDeafened).HasColumnName("server_deafened").IsRequired().HasDefaultValue(false);
         user.Property(u => u.LastClientVersion).HasColumnName("last_client_version").HasMaxLength(64);
         user.Property(u => u.LastClientPlatform).HasColumnName("last_client_platform").HasMaxLength(64);
         user.Property(u => u.LastSeenAt).HasColumnName("last_seen_at").HasColumnType("timestamp with time zone");
@@ -89,32 +113,135 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         invite.Property(i => i.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
         invite.Property(i => i.ExpiresAt).HasColumnName("expires_at").HasColumnType("timestamp with time zone").IsRequired();
         invite.Property(i => i.UsedAt).HasColumnName("used_at").HasColumnType("timestamp with time zone");
+
+        // No foreign key, as with used_by_user_id: both are read back by id only, and an invite
+        // outlives the account that minted or consumed it.
+        invite.Property(i => i.CreatedBy).HasColumnName("created_by");
         invite.Property(i => i.UsedByUserId).HasColumnName("used_by_user_id");
         invite.HasIndex(i => i.CodeHash).IsUnique();
 
-        var room = modelBuilder.Entity<Room>();
-        room.ToTable("rooms");
-        room.HasKey(r => r.Id);
-        room.Property(r => r.Id).HasColumnName("id").HasMaxLength(48);
-        room.Property(r => r.Kind).HasColumnName("kind").HasConversion<short>().IsRequired();
-        room.Property(r => r.Name).HasColumnName("name").HasMaxLength(32).IsRequired();
-        room.Property(r => r.CreatedBy).HasColumnName("created_by");
-        room.Property(r => r.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
-        room.HasOne<User>().WithMany().HasForeignKey(r => r.CreatedBy).OnDelete(DeleteBehavior.SetNull);
+        var server = modelBuilder.Entity<Server>();
+        server.ToTable("server");
+        server.HasKey(s => s.Id);
 
-        var roomMember = modelBuilder.Entity<RoomMember>();
-        roomMember.ToTable("room_members");
-        roomMember.HasKey(m => new { m.RoomId, m.UserId });
-        roomMember.Property(m => m.RoomId).HasColumnName("room_id").HasMaxLength(48);
-        roomMember.Property(m => m.UserId).HasColumnName("user_id");
-        roomMember.Property(m => m.JoinedAt).HasColumnName("joined_at").HasColumnType("timestamp with time zone").IsRequired();
-        roomMember.Property(m => m.LastReadMessageId).HasColumnName("last_read_message_id").IsRequired().HasDefaultValue(0L);
-        roomMember.HasIndex(m => m.UserId);
+        // The id is the constant Server.RowId, not a sequence: the migration and the seeder insert
+        // the one row with that id.
+        server.Property(s => s.Id).HasColumnName("id").ValueGeneratedNever();
+        server.Property(s => s.Name).HasColumnName("name").HasMaxLength(32).IsRequired().HasDefaultValue("Vorcall");
+        server.Property(s => s.Description).HasColumnName("description").HasMaxLength(256).IsRequired().HasDefaultValue("");
+        server.Property(s => s.IconImageId).HasColumnName("icon_image_id");
+        server.Property(s => s.OwnerId).HasColumnName("owner_id");
+        server.Property(s => s.GeneralChannelId).HasColumnName("general_channel_id");
 
-        // Deleting a room or an account takes its memberships with it: neither leaves a row
-        // pointing at something that is gone.
-        roomMember.HasOne<Room>().WithMany().HasForeignKey(m => m.RoomId).OnDelete(DeleteBehavior.Cascade);
-        roomMember.HasOne<User>().WithMany().HasForeignKey(m => m.UserId).OnDelete(DeleteBehavior.Cascade);
+        // Losing the owner's account or the general channel must not take the server row with it;
+        // the CLI and the seeder repair the null.
+        server.HasOne<User>().WithMany().HasForeignKey(s => s.OwnerId).OnDelete(DeleteBehavior.SetNull);
+        server.HasOne<Channel>().WithMany().HasForeignKey(s => s.GeneralChannelId).OnDelete(DeleteBehavior.SetNull);
+
+        var category = modelBuilder.Entity<Category>();
+        category.ToTable("categories");
+        category.HasKey(c => c.Id);
+        category.Property(c => c.Id).HasColumnName("id").UseIdentityByDefaultColumn();
+        category.Property(c => c.Name).HasColumnName("name").HasMaxLength(32).IsRequired();
+        category.Property(c => c.Position).HasColumnName("position").IsRequired();
+
+        var channel = modelBuilder.Entity<Channel>();
+        channel.ToTable("channels");
+        channel.HasKey(c => c.Id);
+        channel.Property(c => c.Id).HasColumnName("id").UseIdentityByDefaultColumn();
+        channel.Property(c => c.Kind).HasColumnName("kind").HasConversion<short>().IsRequired();
+        channel.Property(c => c.Name).HasColumnName("name").HasMaxLength(32).IsRequired();
+        channel.Property(c => c.Topic).HasColumnName("topic").HasMaxLength(256).IsRequired().HasDefaultValue("");
+        channel.Property(c => c.CategoryId).HasColumnName("category_id");
+        channel.Property(c => c.Position).HasColumnName("position").IsRequired();
+        channel.Property(c => c.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
+        channel.Property(c => c.DmLow).HasColumnName("dm_low");
+        channel.Property(c => c.DmHigh).HasColumnName("dm_high");
+
+        // Filtered on the DM kind so the two null columns every text and voice channel carries stay
+        // out of it: one DM per pair of accounts, the pair ordered low id first.
+        channel.HasIndex(c => new { c.DmLow, c.DmHigh }).IsUnique().HasFilter("\"kind\" = 3");
+        channel.HasIndex(c => new { c.CategoryId, c.Position });
+
+        // Deleting a category leaves its channels uncategorised rather than deleting them.
+        channel.HasOne<Category>().WithMany().HasForeignKey(c => c.CategoryId).OnDelete(DeleteBehavior.SetNull);
+
+        var channelRead = modelBuilder.Entity<ChannelRead>();
+        channelRead.ToTable("channel_reads");
+        channelRead.HasKey(r => new { r.ChannelId, r.UserId });
+        channelRead.Property(r => r.ChannelId).HasColumnName("channel_id");
+        channelRead.Property(r => r.UserId).HasColumnName("user_id");
+        channelRead.Property(r => r.LastReadMessageId).HasColumnName("last_read_message_id").IsRequired().HasDefaultValue(0L);
+        channelRead.HasIndex(r => r.UserId);
+
+        // Deleting a channel or an account takes its cursors with it: neither leaves a row pointing
+        // at something that is gone.
+        channelRead.HasOne<Channel>().WithMany().HasForeignKey(r => r.ChannelId).OnDelete(DeleteBehavior.Cascade);
+        channelRead.HasOne<User>().WithMany().HasForeignKey(r => r.UserId).OnDelete(DeleteBehavior.Cascade);
+
+        var role = modelBuilder.Entity<Role>();
+        role.ToTable("roles");
+        role.HasKey(r => r.Id);
+        role.Property(r => r.Id).HasColumnName("id").UseIdentityByDefaultColumn();
+        role.Property(r => r.Name).HasColumnName("name").HasMaxLength(32).IsRequired();
+        role.Property(r => r.Color).HasColumnName("color");
+        role.Property(r => r.IconEmoji).HasColumnName("icon_emoji").HasMaxLength(16).IsRequired().HasDefaultValue("");
+        role.Property(r => r.IconImageId).HasColumnName("icon_image_id");
+        role.Property(r => r.Position).HasColumnName("position").IsRequired();
+        role.Property(r => r.Permissions).HasColumnName("permissions").IsRequired();
+        role.Property(r => r.Hoist).HasColumnName("hoist").IsRequired();
+        role.Property(r => r.IsEveryone).HasColumnName("is_everyone").IsRequired();
+
+        // Filtered so only the true row is constrained: the everyone role cannot be duplicated, and
+        // every other role stays out of the index.
+        role.HasIndex(r => r.IsEveryone).IsUnique().HasFilter("\"is_everyone\"");
+
+        var memberRole = modelBuilder.Entity<MemberRole>();
+        memberRole.ToTable("member_roles");
+        memberRole.HasKey(m => new { m.UserId, m.RoleId });
+        memberRole.Property(m => m.UserId).HasColumnName("user_id");
+        memberRole.Property(m => m.RoleId).HasColumnName("role_id");
+        memberRole.HasIndex(m => m.RoleId);
+        memberRole.HasOne<User>().WithMany().HasForeignKey(m => m.UserId).OnDelete(DeleteBehavior.Cascade);
+        memberRole.HasOne<Role>().WithMany().HasForeignKey(m => m.RoleId).OnDelete(DeleteBehavior.Cascade);
+
+        var channelOverride = modelBuilder.Entity<ChannelOverride>();
+        channelOverride.ToTable("channel_overrides");
+        channelOverride.HasKey(o => new { o.ChannelId, o.TargetKind, o.TargetId });
+        channelOverride.Property(o => o.ChannelId).HasColumnName("channel_id");
+        channelOverride.Property(o => o.TargetKind).HasColumnName("target_kind").HasConversion<short>();
+        channelOverride.Property(o => o.TargetId).HasColumnName("target_id");
+        channelOverride.Property(o => o.Allow).HasColumnName("allow").IsRequired();
+        channelOverride.Property(o => o.Deny).HasColumnName("deny").IsRequired();
+
+        // No foreign key on the target: it is a role id or a user id depending on target_kind, and
+        // the handlers drop the override when either is deleted.
+        channelOverride.HasOne<Channel>().WithMany().HasForeignKey(o => o.ChannelId).OnDelete(DeleteBehavior.Cascade);
+
+        var ban = modelBuilder.Entity<Ban>();
+        ban.ToTable("bans");
+        ban.HasKey(b => b.UserId);
+
+        // The key is the banned account's id, not a sequence of its own.
+        ban.Property(b => b.UserId).HasColumnName("user_id").ValueGeneratedNever();
+        ban.Property(b => b.BannedBy).HasColumnName("banned_by");
+        ban.Property(b => b.Reason).HasColumnName("reason").HasMaxLength(256).IsRequired();
+        ban.Property(b => b.BannedAt).HasColumnName("banned_at").HasColumnType("timestamp with time zone").IsRequired();
+        ban.HasOne<User>().WithMany().HasForeignKey(b => b.UserId).OnDelete(DeleteBehavior.Cascade);
+
+        var image = modelBuilder.Entity<Image>();
+        image.ToTable("images");
+        image.HasKey(i => i.Id);
+        image.Property(i => i.Id).HasColumnName("id").UseIdentityByDefaultColumn();
+        image.Property(i => i.Purpose).HasColumnName("purpose").HasConversion<short>().IsRequired();
+        image.Property(i => i.UploaderId).HasColumnName("uploader_id");
+        image.Property(i => i.ContentType).HasColumnName("content_type").HasMaxLength(32).IsRequired();
+        image.Property(i => i.Size).HasColumnName("size").IsRequired();
+        image.Property(i => i.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
+
+        // The sweeper reads by created_at.
+        image.HasIndex(i => i.CreatedAt);
+        image.HasOne<User>().WithMany().HasForeignKey(i => i.UploaderId).OnDelete(DeleteBehavior.SetNull);
 
         var reaction = modelBuilder.Entity<Reaction>();
         reaction.ToTable("reactions");
@@ -130,7 +257,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         attachment.ToTable("attachments");
         attachment.HasKey(a => a.Id);
         attachment.Property(a => a.Id).HasColumnName("id").UseIdentityByDefaultColumn();
-        attachment.Property(a => a.RoomId).HasColumnName("room_id").HasMaxLength(48).IsRequired();
+        attachment.Property(a => a.ChannelId).HasColumnName("channel_id").IsRequired();
         attachment.Property(a => a.UploaderId).HasColumnName("uploader_id");
         attachment.Property(a => a.MessageId).HasColumnName("message_id");
         attachment.Property(a => a.FileName).HasColumnName("file_name").HasMaxLength(128).IsRequired();
@@ -142,6 +269,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         attachment.HasIndex(a => a.MessageId);
         attachment.HasIndex(a => a.CreatedAt);
         attachment.HasOne<User>().WithMany().HasForeignKey(a => a.UploaderId).OnDelete(DeleteBehavior.SetNull);
+        attachment.HasOne<Channel>().WithMany().HasForeignKey(a => a.ChannelId).OnDelete(DeleteBehavior.Cascade);
 
         // Deleting a message clears its attachment rows explicitly; SetNull is only the backstop
         // for a row the service did not reach.

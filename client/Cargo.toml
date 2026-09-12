@@ -4,13 +4,13 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.4.0"
+version = "0.5.0"
 license = "MIT"
 
 # Oldest client version the current release still lets chat. Clients below it
 # show the "Update required" screen; release.yml asserts min_version <= version.
 [workspace.metadata.vorcall]
-min_version = "0.4.0"
+min_version = "0.5.0"
 
 [workspace.dependencies]
 # Pure-Rust port of WebRTC's AEC3, noise suppressor and AGC2. Young and its API
@@ -26,7 +26,7 @@ directories = "6"
 futures = "0.3"
 # Already in the lock through zbus; used directly for key and signature encoding.
 hex = "0.4"
-iced = { version = "0.14", features = ["tokio", "canvas", "image-without-codecs"] }
+iced = { version = "0.14", features = ["tokio", "canvas", "image-without-codecs", "svg"] }
 # Attachments are decoded off the UI thread, so iced only ever receives RGBA.
 image = { version = "0.25", default-features = false, features = [
     "png",

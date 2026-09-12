@@ -6,8 +6,9 @@ public class Attachment
 {
     public long Id { get; set; }
 
-    // The room the upload was made for; a SendMessage may only link it to a message of that room.
-    public string RoomId { get; set; } = string.Empty;
+    // The channel the upload was made for; a SendMessage may only link it to a message of that
+    // channel.
+    public long ChannelId { get; set; }
 
     public long? UploaderId { get; set; }
 

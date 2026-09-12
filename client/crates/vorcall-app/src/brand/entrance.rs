@@ -6,6 +6,7 @@ use iced::widget::canvas::{self, Canvas, Frame, Path, Program};
 use iced::{
     Color, Element, Event, Length, Point, Rectangle, Renderer, Theme, Vector, keyboard, mouse,
 };
+use vorcall_core::config::Entrance as Preference;
 
 use super::data::{self, Track};
 use super::palette;
@@ -20,28 +21,37 @@ pub enum Variant {
 }
 
 /// Which entrance this launch plays, or `None` when the splash is switched off.
-pub fn choose() -> Option<Variant> {
+/// `preferred` is the stored setting; `VORCALL_ENTRANCE` beats it.
+pub fn choose(preferred: Preference) -> Option<Variant> {
     variant_from(
         std::env::var("VORCALL_ENTRANCE").ok().as_deref(),
+        preferred,
         rand::random_range(0..10),
     )
 }
 
-fn variant_from(setting: Option<&str>, roll: u32) -> Option<Variant> {
+fn variant_from(setting: Option<&str>, preferred: Preference, roll: u32) -> Option<Variant> {
     let rolled = if roll == 0 {
         Variant::Rare
     } else {
         Variant::Wink
     };
+    let from_preference = || match preferred {
+        Preference::Off => None,
+        Preference::Wink => Some(Variant::Wink),
+        Preference::Rare => Some(Variant::Rare),
+        Preference::Random => Some(rolled),
+    };
+
     let setting = setting.map(|value| value.trim().to_ascii_lowercase());
     match setting.as_deref() {
         Some("off") => None,
         Some("rare") => Some(Variant::Rare),
         Some("wink") => Some(Variant::Wink),
-        None | Some("") => Some(rolled),
+        None | Some("") => from_preference(),
         Some(other) => {
             tracing::warn!(value = other, "VORCALL_ENTRANCE takes off, wink or rare");
-            Some(rolled)
+            from_preference()
         }
     }
 }
@@ -372,14 +382,37 @@ mod tests {
     }
 
     #[test]
-    fn the_setting_beats_the_roll() {
-        assert_eq!(variant_from(Some("off"), 0), None);
-        assert_eq!(variant_from(Some("RARE "), 7), Some(Variant::Rare));
-        assert_eq!(variant_from(Some("wink"), 0), Some(Variant::Wink));
-        assert_eq!(variant_from(None, 0), Some(Variant::Rare));
-        assert_eq!(variant_from(None, 3), Some(Variant::Wink));
-        assert_eq!(variant_from(Some(""), 3), Some(Variant::Wink));
-        assert_eq!(variant_from(Some("bogus"), 0), Some(Variant::Rare));
+    fn the_variable_beats_the_preference_and_the_roll() {
+        let random = Preference::Random;
+
+        assert_eq!(variant_from(Some("off"), Preference::Wink, 0), None);
+        assert_eq!(
+            variant_from(Some("RARE "), Preference::Off, 7),
+            Some(Variant::Rare)
+        );
+        assert_eq!(
+            variant_from(Some("wink"), Preference::Rare, 0),
+            Some(Variant::Wink)
+        );
+        assert_eq!(variant_from(None, random, 0), Some(Variant::Rare));
+        assert_eq!(variant_from(None, random, 3), Some(Variant::Wink));
+        assert_eq!(variant_from(Some(""), random, 3), Some(Variant::Wink));
+        // A value nobody can read falls back to the preference, roll and all.
+        assert_eq!(variant_from(Some("bogus"), random, 0), Some(Variant::Rare));
+    }
+
+    /// Without the variable the stored preference decides, and only `Random`
+    /// leaves it to the roll.
+    #[test]
+    fn the_preference_decides_when_the_variable_is_unset() {
+        assert_eq!(variant_from(None, Preference::Off, 0), None);
+        assert_eq!(variant_from(None, Preference::Wink, 0), Some(Variant::Wink));
+        assert_eq!(variant_from(None, Preference::Rare, 7), Some(Variant::Rare));
+        assert_eq!(
+            variant_from(Some("bogus"), Preference::Off, 0),
+            None,
+            "an unreadable value is not a reason to play one"
+        );
     }
 
     /// Whether `point` falls inside the polygon `ring`, shrunk about its centroid by

@@ -6,28 +6,36 @@ Schema: `proto/vorcall.proto` (proto3). Both the .NET server and the Rust client
 
 Live traffic: one WebSocket at `/ws`. Every WebSocket message is a **binary** frame holding exactly one `ClientFrame` (client to server) or one `ServerFrame` (server to client). Text frames are a protocol error. Max inbound WebSocket message: 16 KiB; larger messages are a fatal protocol error.
 
-REST: every request and response body is `application/x-protobuf`. Request bodies are capped at 16 KiB; a larger body gets `413`. The one exception is the attachment upload body, which is raw image bytes and is capped at 8 MiB instead.
+REST: every request and response body is `application/x-protobuf`. Request bodies are capped at 16 KiB; a larger body gets `413`. The exceptions are the attachment and image upload bodies, which are raw image bytes and are capped at 8 MiB instead.
 
 | Endpoint | Request | Success | Failure |
 |---|---|---|---|
-| `GET /api/messages?room=general&limit=100&before=<id>` | — | 200 `MessagePage` | 400 when `room` does not match the room id grammar; 403 `ApiError` when the bearer user is not a member of that room |
-| `GET /api/users` | — | 200 `UserList` | — |
-| `POST /api/attachments?room=<id>` | raw image bytes | 201 `Attachment` | 400 / 403 / 411 / 413 / 415 / 507 `ApiError` |
+| `GET /api/messages?channel=<id>&limit=100&before=<id>` | — | 200 `MessagePage` | 400 when `channel` is missing or is not a positive integer; 403 `ApiError` when the bearer user may not view that channel |
+| `GET /api/users` | — | 200 `MemberList` | — |
+| `POST /api/attachments?channel=<id>` | raw image bytes | 201 `Attachment` | 400 / 403 / 411 / 413 / 415 / 507 `ApiError` |
 | `GET /api/attachments/{id}` | — | 200 the bytes | 403 / 404 `ApiError` |
+| `POST /api/images?purpose=avatar\|banner\|server_icon\|role_icon` | raw image bytes | 201 `Image` | 400 / 403 / 411 / 413 / 415 / 507 `ApiError` |
+| `GET /api/images/{id}` | — | 200 the bytes | 404 `ApiError` |
+| `GET /api/invites` | — | 200 `InviteList` | 403 `ApiError` |
+| `POST /api/invites` | `CreateInviteRequest` | 201 `InviteCreated` | 400 / 403 `ApiError` |
+| `DELETE /api/invites/{id}` | — | 204 | 403 / 404 `ApiError` |
+| `GET /api/bans` | — | 200 `BanList` | 403 `ApiError` |
 | `POST /api/auth/register` | `RegisterRequest` | 201 `TokenResponse` | 400 / 403 / 409 / 429 `ApiError` |
-| `POST /api/auth/login` | `LoginRequest` | 200 `TokenResponse` | 401 / 429 `ApiError` |
-| `POST /api/auth/refresh` | `RefreshRequest` | 200 `TokenResponse` | 401 / 429 `ApiError` |
+| `POST /api/auth/login` | `LoginRequest` | 200 `TokenResponse` | 401 / 403 / 429 `ApiError` |
+| `POST /api/auth/refresh` | `RefreshRequest` | 200 `TokenResponse` | 401 / 403 / 429 `ApiError` |
 | `POST /api/auth/logout` | `LogoutRequest` | 204 | — |
 | `POST /api/auth/password` | `ChangePasswordRequest` | 204 | 400 / 401 `ApiError` |
 | `GET /health` | — | 200 `{"status":"ok"}` | 503 |
 
-- `GET /api/messages`: `room` is optional and defaults to `general`; a value that does not match the room id grammar is `400`. `limit` is clamped to 1..100 (default 100). `before` is optional and exclusive: only messages with `id < before` are returned. Messages come back **ascending by id**; without `before` the page is the newest `limit` messages. `has_more` is true when older messages exist before `messages[0]`.
-- `GET /api/users`: every registered user, ordered by username case-insensitively.
-- `POST /api/attachments?room=<id>`: the body is the raw image, its `Content-Type` one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`. `X-Vorcall-Filename` is optional. See Attachments for the failure rules. Rate limited to 20 uploads per minute per user.
+- `GET /api/messages`: `channel` is required — there is no default channel — and must be a positive integer naming a text or DM channel the bearer user may view, else `400 ApiError{"channel"}` (malformed, or a voice channel) or `403 ApiError{"VIEW_CHANNEL"}` (unknown or not viewable). `limit` is clamped to 1..100 (default 100); a non-numeric `limit`, or a `before` below 1, is a bare `400` with no body. `before` is optional and exclusive: only messages with `id < before` are returned. Messages come back **ascending by id**; without `before` the page is the newest `limit` messages. `has_more` is true when older messages exist before `messages[0]`.
+- `GET /api/users`: every member of the server as a `Profile`, ordered by username case-insensitively. Any bearer; the member list is not permission-filtered, channel visibility is.
+- `POST /api/attachments?channel=<id>`: the body is the raw image, its `Content-Type` one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`. `X-Vorcall-Filename` is optional. See Attachments for the failure rules. Rate limited to 20 uploads per minute per user.
 - `GET /api/attachments/{id}`: the bytes with `Content-Length`, a strong `ETag` (`"<id>-<size>"`), `Cache-Control: private, max-age=31536000, immutable`, and Range supported. `404` when the id is unknown; `403` when the caller may not see it (see Attachments).
+- `POST /api/images` and `GET /api/images/{id}`: see Profiles and images.
+- `GET /api/invites`, `POST /api/invites`, `DELETE /api/invites/{id}`, `GET /api/bans`: see Invites and bans.
 - `POST /api/auth/register`: `400` when the username, password or invite code fail the format rules; `403` when the invite is unknown, used or expired; `409` when the username is taken — and then the invite is **not** consumed; `429` when rate-limited.
-- `POST /api/auth/login`: `401` is always `ApiError{"invalid username or password"}`, the same body whether the user exists or not. `429` carries `Retry-After: <seconds>` when the username is locked or the IP is rate-limited.
-- `POST /api/auth/refresh`: `401` when the token is unknown, expired, revoked or already rotated (see Sessions); `429` when rate-limited.
+- `POST /api/auth/login`: `401` is always `ApiError{"invalid username or password"}`, the same body whether the user exists or not. `403` is `ApiError{"banned"}`. `429` carries `Retry-After: <seconds>` when the username is locked or the IP is rate-limited.
+- `POST /api/auth/refresh`: `401` when the token is unknown, expired, revoked or already rotated (see Sessions); `403` `ApiError{"banned"}` when the account is banned; `429` when rate-limited.
 - `POST /api/auth/logout`: always `204`, idempotent; it revokes the presented refresh token. No bearer needed.
 - `POST /api/auth/password`: bearer required. `400` when the new password fails the policy; `401` when the current password is wrong or the bearer is invalid.
 - `GET /health` needs neither the door key nor a bearer.
@@ -37,19 +45,24 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 Two gates, both checked before any WebSocket upgrade:
 
 1. **Door key** — the header `X-Vorcall-Key: <pre-shared key>` on every `/ws` and `/api/*` request. It is compared in constant time. A missing or wrong key gets an empty `401` with `WWW-Authenticate: X-Vorcall-Key`. It is a door key, not identity.
-2. **Bearer access token** — `Authorization: Bearer <jwt>` on `/ws`, `/api/messages`, `/api/users`, `/api/attachments/*` and `/api/auth/password`. Failure is `401` with `WWW-Authenticate: Bearer ...`.
+2. **Bearer access token** — `Authorization: Bearer <jwt>` on `/ws`, `/api/messages`, `/api/users`, `/api/attachments`, `/api/attachments/*`, `/api/images`, `/api/images/*`, `/api/invites`, `/api/invites/*`, `/api/bans` and `/api/auth/password`. Failure is `401` with `WWW-Authenticate: Bearer ...`.
 
 `/api/auth/register`, `/api/auth/login`, `/api/auth/refresh` and `/api/auth/logout` need only the door key.
 
 Clients tell the gates apart by the `WWW-Authenticate` scheme: `X-Vorcall-Key` means a stale build (wrong key); `Bearer` means refresh or sign in again; a 401 with no challenge is an application answer from the auth endpoints (`ApiError`, e.g. wrong password or refused refresh token).
 
+A banned account passes neither gate in practice: the `/ws` upgrade answers `403` and so do login and refresh (see Moderation).
+
+Permissions are a third, per-frame and per-endpoint gate, described under Roles and permissions. A missing permission is never a `401`: on the WebSocket it is `ERROR_CODE_PERMISSION_DENIED`, on REST it is `403 ApiError{detail = <permission name>}`.
+
 ## Identity and accounts
 
-Accounts are invite-only.
+Accounts are invite-only. Every account is a member of the one server from registration on; there is nothing to join.
 
 - **Username** — trimmed, 1..32 Unicode scalars, no control characters, unique case-insensitively (compared after uppercasing with invariant culture). The display name is the username in its registered casing.
+- **Nickname** — optional, same grammar as a username but not unique. When set it replaces the username everywhere the member is shown; empty means "show the username".
 - **Password** — 8..128 Unicode scalars, no other rules.
-- **Invite code** — 20 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, shown as four groups of five separated by `-`. Input is uppercased and stripped of `-` and whitespace. Single use; expires 7 days after creation by default; created only by the admin CLI on the server.
+- **Invite code** — 20 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, shown as four groups of five separated by `-`. Input is uppercased and stripped of `-` and whitespace. Single use. The admin CLI creates one with a 7-day expiry by default; `POST /api/invites` takes an explicit validity of 1..365 days. The server stores only the code's hash, so the plaintext is shown once, at creation.
 
 Registration signs the user in and returns tokens. `Hello.nickname` is deprecated and ignored.
 
@@ -57,7 +70,7 @@ Registration signs the user in and returns tokens. `Hello.nickname` is deprecate
 
 **Access token** — JWT HS256, 15 minutes (`expires_in = 900`), claims `sub` (user id), `name` (username), `iat`, `exp`, `jti`, issuer and audience `vorcall`. A WebSocket authenticated at upgrade time stays valid after its access token expires; only new requests need a fresh token.
 
-**Refresh token** — opaque, 32 random bytes base64url; the server stores only its SHA-256. Each token belongs to a family created at login or registration. A refresh rotates the token (the presented one is marked rotated, a new one is issued in the same family) and slides the expiry to now + 30 days. Presenting a token that was already rotated or revoked revokes the whole family and answers `401` (reuse detection). Logout revokes the presented token's whole family (so a token the client had already rotated still ends the session). Changing the password revokes every refresh token of the user except the live token of the family the presented one belongs to. The admin CLI can revoke all tokens of a user.
+**Refresh token** — opaque, 32 random bytes base64url; the server stores only its SHA-256. Each token belongs to a family created at login or registration. A refresh rotates the token (the presented one is marked rotated, a new one is issued in the same family) and slides the expiry to now + 30 days. Presenting a token that was already rotated or revoked revokes the whole family and answers `401` (reuse detection). Logout revokes the presented token's whole family (so a token the client had already rotated still ends the session). Changing the password revokes every refresh token of the user except the live token of the family the presented one belongs to. A kick or a ban revokes every refresh token of the account. The admin CLI can revoke all tokens of a user.
 
 **Rate limits** — `/api/auth/register|login|refresh` allow 10 requests per minute per client IP (sliding window; `429` with `Retry-After: 60`). Login locks a username after 5 consecutive failures for 60 s, doubling on each further lock up to 15 minutes, cleared by a successful login.
 
@@ -75,53 +88,133 @@ Both endpoints need the door key and a valid bearer access token, same as `/api/
 - The client verifies the manifest's signature against the keys baked in from `client/update-keys.pub` before parsing it at all, then verifies a downloaded asset's size and SHA-256 against the manifest before treating it as installable.
 - Version comparison is a plain three-integer compare (`MAJOR.MINOR.PATCH`); anything else — a `v` prefix, a pre-release suffix, extra fields — is rejected rather than parsed loosely.
 
-## Rooms and presence
+## Server, channels and categories
 
-Rooms are persistent rows (`rooms`, `room_members`); the connection registry mirrors them in memory at boot. There are two kinds:
+There is exactly one server. `Server{name, description, icon_image_id, owner_id, general_channel_id}` carries its shared facts; `owner_id` names the single account that bypasses every permission check, and `general_channel_id` the text channel that always exists.
 
-- **Public** (`ROOM_KIND_PUBLIC`) — any account may see it in `RoomList` and join it. `general` is public and every account is a member of it from registration on; it cannot be left.
-- **DM** (`ROOM_KIND_DM`) — room id `dm-<lower user id>-<higher user id>`, exactly two members, both permanent. Only its two members ever see it.
+**Channels** have numeric ids (`int64`, server-assigned) and one of three kinds:
 
-Room ids still match `^[a-z0-9-]{1,48}$`. A public room's id is the slug of its name. The name is trimmed, 1..32 Unicode scalars, no control characters. The slug is the name lowercased, with whitespace and `_` turned into `-`, everything outside `[a-z0-9-]` dropped, runs of `-` collapsed and leading/trailing `-` trimmed; it must be non-empty, at most 32 characters and must not start with `dm-`, otherwise `ERROR_CODE_INVALID_ROOM_NAME`. A slug already taken is `ERROR_CODE_ROOM_EXISTS`. The display name keeps the casing that was typed. A DM's `Room.name` is empty; clients show the other member's username.
+- `CHANNEL_KIND_TEXT` — messages, history, read counters.
+- `CHANNEL_KIND_VOICE` — a voice session and screen shares; no messages (`SendMessage` on one is `ERROR_CODE_INVALID_ARGUMENT`).
+- `CHANNEL_KIND_DM` — exactly two permanent members, both of whom may always view it, send in it and connect to its voice session. `name` is empty; clients show the other member's display name. `dm_member_ids` holds both user ids.
 
-Presence is still per live connection and unchanged in shape: `RoomState{room_id, members}` fully replaces what the client knows about who is **online** in that room, `MemberJoined{room_id, member}`, `MemberLeft{room_id, user_id}` — now for every room the account is a member of, not just `general`. `Room.member_ids` is the persistent membership, which is a different thing: a client derives "joined" as `member_ids` containing its own id. A `Member` is `{user_id, username}`; ids are the database user ids and are stable across sessions.
+**Categories** group the non-DM channels shown in the sidebar. A category has a `name` and a `position`; a channel has a `category_id` (`0` = no category, listed above the categories) and a `position` within it. Positions are dense integers the server rewrites on every reorder; clients sort by them and never invent their own.
 
-One live connection per user. A `Hello` from a user who already has a live connection replaces it: the older connection receives fatal `ERROR_CODE_SESSION_REPLACED` then close 1008 "session replaced"; its room memberships transfer to the new connection silently (no `MemberLeft`/`MemberJoined` to others).
+There is no join and no leave. Every account is a member of the server, and a channel is **visible** to a member exactly when `VIEW_CHANNEL` resolves for them in it (see Roles and permissions). "Who is in this channel" is therefore "everyone who may view it". DM channels are visible to their two members only.
 
-**Hello sequence.** `Welcome`, then `RoomState`+`VoiceState` for `general`, then the same pair for every other room the account belongs to, in an order clients must not rely on, then `RoomList` — every public room plus the account's DMs, in an order clients must not rely on, each with `unread`, `mentions` and `last_message_id`; a public room the account has not joined reports 0 unread and 0 mentions. Then `MemberJoined` is broadcast to each of those rooms. On a session replacement no `MemberJoined` is broadcast: the sequence is otherwise identical, silent to everyone else.
+`general` is the text channel named by `general_channel_id`. It cannot be deleted (`ERROR_CODE_FORBIDDEN`) and its `VIEW_CHANNEL` cannot be denied to `@everyone`: that override is refused at write time with `ERROR_CODE_INVALID_ARGUMENT`, and resolution forces `VIEW_CHANNEL` on for every member anyway.
 
-- `CreateRoom{name}` — invalid name or unusable slug: non-fatal `ERROR_CODE_INVALID_ROOM_NAME`. Slug already taken: non-fatal `ERROR_CODE_ROOM_EXISTS`. Otherwise the room and the creator's membership are persisted, the creator receives `RoomState`+`VoiceState` for it, and every online connection receives `RoomUpdated`.
-- `JoinRoom{room_id}` — invalid or unknown room: non-fatal `ERROR_CODE_UNKNOWN_ROOM`. A DM the caller is not part of: non-fatal `ERROR_CODE_FORBIDDEN`. Already a member: `RoomState`+`VoiceState` only (idempotent resync). Otherwise a membership row is written with the read cursor at the room's newest message id, the room's online members receive `MemberJoined`, the joiner receives `RoomState`+`VoiceState`, and every online connection receives `RoomUpdated`.
-- `LeaveRoom{room_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. `general` or a DM: non-fatal `ERROR_CODE_FORBIDDEN` — neither can be left. Not a member: non-fatal `ERROR_CODE_NOT_A_MEMBER`. Otherwise `VoiceMemberLeft` first if the leaver was in that room's voice channel, then every current member **including the leaver** receives `MemberLeft`, the membership row is removed, and every online connection receives `RoomUpdated`.
-- `OpenDm{user_id}` — the caller's own id or an unknown user: non-fatal `ERROR_CODE_FORBIDDEN`. The DM already exists: `RoomState`+`VoiceState` resync to the caller only. Otherwise the room is created with both memberships (read cursor 0), each party that is online receives `RoomState`+`VoiceState`, and `RoomUpdated` goes to those two parties only — never to the whole server.
-- `MarkRead{room_id, message_id}` — not a member: non-fatal `ERROR_CODE_NOT_A_MEMBER`. Otherwise the cursor becomes `max(cursor, min(message_id, newest id in the room))`. There is no reply frame.
-- `RoomUpdated{room}` replaces what the client knows about that room's shared facts (kind, name, member_ids, created_by). It never carries counters.
+Names — channels, categories and roles alike — are trimmed, 1..32 Unicode scalars, no control characters, and need **not** be unique; anything else is `ERROR_CODE_INVALID_NAME`. Topics and descriptions are 0..256 scalars. At most 50 categories, 200 channels and 100 overrides per channel exist; a create that would exceed a cap is refused with `ERROR_CODE_INVALID_ARGUMENT` naming the collection (`"categories"`, `"channels"`, `"overrides"`). The channel cap counts the non-DM channels only — a DM is always openable — and the override cap is not charged when the frame merely rewrites or deletes an override that is already there.
 
-Counters in `RoomEntry` are per reader: `unread` counts the room's messages with `id > cursor` that are not tombstones and not written by the reader; `mentions` counts those among them whose `mention_ids` contain the reader.
+Management frames, all requiring `MANAGE_CHANNELS` (resolved in the channel for an existing channel, at server level for a create or a category operation) and all answering with a broadcast rather than a reply:
 
-When a connection ends, the remaining online members of each room it was in receive `MemberLeft`.
+- `CreateChannel{kind, name, topic, category_id}` — `kind` must be `TEXT` or `VOICE` (a DM is opened with `OpenDm`, never created here), `category_id` `0` or an existing category (`ERROR_CODE_UNKNOWN_CATEGORY`). The channel is appended to its category. Everyone who may view it receives `ChannelUpserted`.
+- `UpdateChannel{id, name, topic}` — renames and re-topics. `ChannelUpserted` to its viewers.
+- `DeleteChannel{id}` — `general` is refused with `ERROR_CODE_FORBIDDEN`. Otherwise its messages, attachments, read cursors and overrides go with it, any voice session in it ends (`VoiceMemberLeft`, then `VoiceMoved{0}` to each member that was in it), and everyone who could view it receives `ChannelDeleted`.
+- `CreateCategory{name}`, `UpdateCategory{id, name}` — `CategoryUpserted` to everyone.
+- `DeleteCategory{id}` — its channels move to "no category" with their positions appended there; `CategoryDeleted` plus a `ChannelOrder` to everyone.
+- `ReorderChannels{positions}` — the full list of non-DM channels as `ChannelPosition{id, category_id, position}`; the server stores it verbatim after validating every id and category, then broadcasts `ChannelOrder` with the same list to everyone.
+- `ReorderCategories{ids}` — the full list of category ids; `position` is the index. There is no category-order frame: every category whose position changed is broadcast to everyone as `CategoryUpserted`.
+- `SetOverride{channel_id, override}` — upserts one `Override{role_id | user_id, allow, deny}` on that channel; `allow == 0 && deny == 0` deletes it. A DM channel has nothing an override could decide — its two members see it by membership — so one is refused with `ERROR_CODE_INVALID_ARGUMENT{"channel"}`, checked before `MANAGE_CHANNELS`. An unknown `role_id` is `ERROR_CODE_UNKNOWN_ROLE` and an unknown `user_id` `ERROR_CODE_UNKNOWN_USER`. The remaining rules are under Roles and permissions. `ChannelUpserted` (overrides included) to the channel's viewers.
 
-Ordering guarantee: membership changes and room broadcasts are serialized by the server. A connection never sees a `ChatMessage`, `MemberJoined`, `MemberLeft` or any other room frame before its `Welcome` and that room's initial `RoomState`.
+`OpenDm{user_id}` needs no permission: the caller's own id, an unknown user or a banned user is non-fatal `ERROR_CODE_UNKNOWN_USER`; a DM that already exists answers `ChannelUpserted` + `VoiceState` to the caller only (idempotent resync); otherwise a DM channel is created with both members (read cursor 0) and each party that is online receives `ChannelUpserted` + `VoiceState` — never the whole server.
+
+Visibility is maintained per member: when a role, override, channel or category change makes a channel visible to a member who could not see it, that member receives `ChannelUpserted`; when it stops being visible, that member alone receives `ChannelDeleted` and treats the channel as gone. Role, category and server deltas go to every online member regardless of channel visibility.
+
+## Roles and permissions
+
+A `Role` is `{id, name, color, icon_emoji, icon_image_id, position, permissions, hoist, everyone}`. `color` and `accent_color` are `0xRRGGBB` with `0` meaning "none". `position` orders the hierarchy: higher outranks lower. `hoist` asks clients to list the role's members as their own group. At most 100 roles exist, `@everyone` counted among them, so 99 are creatable; a create beyond that is `ERROR_CODE_INVALID_ARGUMENT{"roles"}`.
+
+`@everyone` is the row with `everyone = true`. It sits at position `0`, every member holds it implicitly, it cannot be deleted, and only its `permissions` may be edited — a frame touching its name, colour, icon, hoist or position is `ERROR_CODE_INVALID_ARGUMENT`. Its default permissions are `VIEW_CHANNEL | SEND_MESSAGES | ATTACH_FILES | ADD_REACTIONS | CONNECT | SPEAK | SHARE_SCREEN | CHANGE_NICKNAME`.
+
+A member holds any number of further roles (`Profile.role_ids`). The name is painted by the highest-positioned role of that member whose `color` is non-zero; if none has one, the client's default text colour applies.
+
+`Permission` is a bit set (`uint64` on the wire, 21 bits defined). Bits split into two scopes:
+
+- **server-scoped** — `MANAGE_SERVER`, `MANAGE_ROLES`, `MANAGE_MEMBERS`, `MANAGE_INVITES`, `KICK_MEMBERS`, `BAN_MEMBERS`, `CHANGE_NICKNAME`. They are held server-wide and **never** appear in an override; an override carrying one has that bit masked away.
+- **channel-scoped** — every other bit: `MANAGE_CHANNELS`, `MANAGE_MESSAGES`, `VIEW_CHANNEL`, `SEND_MESSAGES`, `ATTACH_FILES`, `ADD_REACTIONS`, `MENTION_EVERYONE`, `CONNECT`, `SPEAK`, `SHARE_SCREEN`, `MUTE_MEMBERS`, `DEAFEN_MEMBERS`, `MOVE_MEMBERS`, `PRIORITY_SPEAKER`.
+
+### Resolution
+
+Resolving a member's permissions, with or without a channel, is exactly this — both sides implement it (`server/Permissions/`, `vorcall-core/src/permissions.rs`) and both are tested against the same matrix:
+
+1. The member is the owner (`Server.owner_id`) → every bit, whatever the overrides say.
+2. `base = @everyone.permissions | OR(permissions of every role the member holds)`.
+3. No channel (a server-level question) → return `base`.
+4. Otherwise `p = base & CHANNEL_SCOPED`; the server-scoped half of `base` is kept aside.
+5. Apply the `@everyone` override of that channel, if any: `p = (p & ~deny) | allow`.
+6. Apply the overrides of the member's other roles **in ascending position order, one after another**, each as `p = (p & ~deny) | allow`. A higher role's override therefore wins a conflict with a lower one; this is deliberately sequential, not a union of allows and denies.
+7. Apply the member's own override, if any, the same way. It wins over every role.
+8. If the channel is `general`, force `VIEW_CHANNEL` on.
+9. If `VIEW_CHANNEL` is off at this point, drop every channel-scoped bit: the result is the server-scoped half of `base` alone.
+10. Return `p | (base & SERVER_SCOPED)`. Server-scoped bits are never removed by a channel.
+
+An override is `{exactly one of role_id / user_id, allow, deny}` with `allow & deny == 0` (otherwise `ERROR_CODE_INVALID_ARGUMENT`) and only channel-scoped bits.
+
+### Hierarchy
+
+`highest_position(member)` is the greatest `position` among the member's roles, and `0` when the member holds `@everyone` only. From it:
+
+- **Managing a role** (create, edit, delete, assign, reorder): the caller must hold `MANAGE_ROLES` and the role's position must be strictly below `highest_position(caller)`. The owner may manage every role. `@everyone`'s permissions are the exception: any `MANAGE_ROLES` holder may edit them. A refusal is `ERROR_CODE_HIERARCHY`.
+- **Granting bits**: a caller may put into a role or an override only bits it holds itself at server level. The owner is exempt. A refusal is `ERROR_CODE_PERMISSION_DENIED` naming the bit the caller does not hold. What exactly has to be held differs per frame: `CreateRole` needs every bit in `permissions`; `UpdateRole` needs only the bits being **added** (taking one away needs nothing); `SetOverride` needs every bit in `allow | deny`, since a deny is as much a decision about a bit as an allow.
+- **Targeting a member** (kick, ban, nickname, server mute, server deafen, move, role change): the target must be strictly below the caller (`highest_position(caller) > highest_position(target)`), never the owner, and never the caller itself. The owner may target everyone but itself. Targeting the owner or yourself is `ERROR_CODE_FORBIDDEN`; being outranked is `ERROR_CODE_HIERARCHY`. Two exceptions let a member act on itself: its own nickname (with `CHANGE_NICKNAME`) and assigning itself a role it may manage.
+
+Role frames: `CreateRole{name, color, icon_emoji, icon_image_id, permissions, hoist}` inserts the role below the caller's highest position and broadcasts `RoleUpserted`; `UpdateRole{role}` replaces it (its `position` is ignored — reordering is a separate frame) and broadcasts `RoleUpserted`; `DeleteRole{id}` broadcasts `RoleDeleted` and drops the role from every member and every override; `ReorderRoles{ids}` takes the full list excluding `@everyone`, **bottom first**, so `position = index + 1`, and broadcasts `RoleOrder` with the same list; `SetMemberRoles{user_id, role_ids}` replaces a member's roles and broadcasts `MemberUpdated`. Every role frame goes to every online member. `icon_emoji` is at most 2 scalars, and a role shows at most one icon — an emoji or an image.
+
+`RoleOrder` is not only a reorder frame: a `CreateRole` or `DeleteRole` that renumbered the other roles broadcasts it right after the `RoleUpserted`/`RoleDeleted`, so a client never has to guess the new positions. `ReorderRoles` must carry the **complete** list of non-`@everyone` roles, each exactly once (anything else is `ERROR_CODE_INVALID_ARGUMENT{"ids"}`, an unknown id `ERROR_CODE_UNKNOWN_ROLE`), and every role whose position actually changes must be strictly below the caller's highest position both before and after the move, else `ERROR_CODE_HIERARCHY`. The owner moves anything.
+
+Every permission failure is non-fatal `ERROR_CODE_PERMISSION_DENIED` whose `detail` is the missing bit's name without the `PERMISSION_` prefix (`SEND_MESSAGES`, `MANAGE_CHANNELS`, …). Write-time refusals that are not about a missing bit are `ERROR_CODE_INVALID_ARGUMENT` with `detail` naming the field or collection at fault — a `VIEW_CHANNEL` deny for `@everyone` on `general` (`"deny"`), a name/colour/icon/hoist change on `@everyone` (`"role"`), `allow & deny != 0` (`"override"`), a role carrying both an emoji and an image icon (`"icon"`), an unknown `CreateChannel.kind` (`"kind"`), an over-long `topic`/`description`/ban `reason`, an `icon_emoji` past 2 scalars, a missing nested `override`/`role` message, a cap exceeded. The fatal codes `KICKED`, `BANNED` and `SESSION_REPLACED` carry no `detail` (the one exception being the session replacement the handshake itself performs).
+
+Any change to roles, overrides, channels or memberships is re-resolved immediately: channel visibility deltas go out as described above, a member that loses `CONNECT` or `VIEW_CHANNEL` in a channel it is in voice in is disconnected from it, and `VoiceMember.priority` is recomputed and the channel's `VoiceState` re-sent.
+
+## Hello sequence
+
+One live connection per user. A `Hello` from a user who already has a live connection replaces it: the older connection receives fatal `ERROR_CODE_SESSION_REPLACED` then close 1008 "session replaced". The account never stopped being online, so no presence frame goes out.
+
+After `Welcome{latest_message_id, member_id, username}` the server sends, in this order:
+
+1. `ServerSnapshot` — `server`; **every** role; **every** category; every non-DM channel the reader may view, each with its `overrides`, plus the reader's own DM channels; every member of the server as a `Profile` with `online` set from presence; and `read_states` for every viewable text channel and DM.
+2. One `VoiceState` per voice or DM channel that has at least one voice member. Channels with nobody in voice are not announced.
+3. `MemberUpdated{member.online = true}` to every **other** online member. A session replacement skips this step; the rest of the sequence is identical.
+
+The snapshot is the whole world as that member may see it — a client needs no REST call to fill it in. Everything after it is a delta:
+
+| Change | Frame | Audience |
+|---|---|---|
+| server facts | `ServerUpdated` | everyone |
+| role created/edited, order | `RoleUpserted`, `RoleDeleted`, `RoleOrder` | everyone |
+| category | `CategoryUpserted`, `CategoryDeleted` | everyone |
+| channel created/edited/overrides | `ChannelUpserted` | the channel's viewers |
+| channel deleted, or no longer viewable | `ChannelDeleted` | its viewers / that one member |
+| channel order | `ChannelOrder` | everyone |
+| roles, nickname, profile, presence, server mute flags | `MemberUpdated` | everyone |
+| banned | `MemberRemoved` | everyone |
+
+When a connection ends, every other online member receives `MemberUpdated` with `online = false` for it, after the `VoiceMemberLeft` of any voice session it held.
 
 ## Messages
 
-- `SendMessage{text, room_id, reply_to_id, attachment_ids}` — an empty `room_id` means `general`. Invalid or unknown room: non-fatal `ERROR_CODE_UNKNOWN_ROOM`. Not a member: non-fatal `ERROR_CODE_NOT_A_MEMBER`. `text` is 1..2000 Unicode scalars after trimming, or empty only when `attachment_ids` is non-empty; anything else is non-fatal `ERROR_CODE_INVALID_MESSAGE`. A `reply_to_id` other than 0 must name a message of the same room — a tombstone is allowed — else `ERROR_CODE_UNKNOWN_MESSAGE`. At most 4 attachment ids, each of which must exist, have been uploaded by the sender, belong to this room and not be linked to a message yet, else `ERROR_CODE_INVALID_ATTACHMENT`. Mentions are the `<@id>` tokens of the text whose id names an existing user; they are stored as `mention_ids`, distinct, and an unknown id stays as plain text and is not stored. The message and the links to its attachments are persisted in one transaction, then broadcast as `ChatMessage` to every member of the room, **including the sender**. The sender renders only the echo.
-- `ChatMessage` carries `edited_at_unix_ms` (0 when never edited), `deleted` (a tombstone: empty text, no attachments, no reactions — tombstones stay in history and in pages), `reply_to`, `mention_ids`, `reactions` (grouped by emoji, user ids ascending) and `attachments`. `reply_to` is a `ReplyRef` the server fills at read time from the target's **current** state: its id, author, the first 120 scalars of its text and whether it is a tombstone.
-- `EditMessage{id, text}` — invalid text: non-fatal `ERROR_CODE_INVALID_MESSAGE`. Unknown message or a tombstone: non-fatal `ERROR_CODE_UNKNOWN_MESSAGE`. No longer a member of the message's room: non-fatal `ERROR_CODE_NOT_A_MEMBER`. Not the author: non-fatal `ERROR_CODE_FORBIDDEN`. Otherwise the text and `edited_at_unix_ms` are set and `mention_ids` is recomputed, then `MessageEdited{message}` is broadcast to the room.
-- `DeleteMessage{id}` — unknown message or a tombstone: `ERROR_CODE_UNKNOWN_MESSAGE`. No longer a member of the message's room: `ERROR_CODE_NOT_A_MEMBER` (even the author, once they have left the room). Not the author: `ERROR_CODE_FORBIDDEN`. Otherwise the message becomes a tombstone: text, mentions, reactions and attachments are cleared and the attachment files are removed. `MessageDeleted{room_id, id}` is broadcast to the room.
-- `React{message_id, emoji, remove}` — `emoji` must be one of the eight the server accepts (👍 ❤️ 😂 😮 😢 🔥 🎉 👀), else non-fatal `ERROR_CODE_INVALID_REACTION`. Unknown message or a tombstone: `ERROR_CODE_UNKNOWN_MESSAGE`. Not a member of its room: `ERROR_CODE_NOT_A_MEMBER`. Otherwise the reader's reaction is added, or removed when `remove` is true; both are idempotent. `ReactionsChanged{room_id, message_id, reactions}` carrying the full grouped set is broadcast to the room.
+- `SendMessage{channel_id, text, reply_to_id, attachment_ids}` — `channel_id` is required; `0`, unknown, or a channel the sender may not view is non-fatal `ERROR_CODE_UNKNOWN_CHANNEL` (a hidden channel is indistinguishable from a missing one on purpose). A voice channel is `ERROR_CODE_INVALID_ARGUMENT`. Without `SEND_MESSAGES` in that channel: `ERROR_CODE_PERMISSION_DENIED{"SEND_MESSAGES"}`; with attachment ids but without `ATTACH_FILES`: `…{"ATTACH_FILES"}`. `text` is 1..2000 Unicode scalars after trimming, or empty only when `attachment_ids` is non-empty; anything else is non-fatal `ERROR_CODE_INVALID_MESSAGE`. A `reply_to_id` other than 0 must name a message of the same channel — a tombstone is allowed — else `ERROR_CODE_UNKNOWN_MESSAGE`. At most 4 attachment ids, each of which must exist, have been uploaded by the sender, belong to this channel, not be linked to a message yet, and not repeat within the frame, else `ERROR_CODE_INVALID_ATTACHMENT`. The text check runs **before** the two permission checks, so a malformed text in a channel the sender may not write in answers `ERROR_CODE_INVALID_MESSAGE`, not `ERROR_CODE_PERMISSION_DENIED`. The message and the links to its attachments are persisted in one transaction, then broadcast as `ChatMessage` to every member who may view the channel, **including the sender**. The sender renders only the echo.
+- Mentions. The `<@id>` tokens of the text whose id names an existing user become `mention_ids`, distinct; an unknown id stays plain text and is not stored. The literal words `@everyone` and `@here` set `mention_everyone` / `mention_here` — but only when the sender holds `MENTION_EVERYONE` in that channel; without the bit they stay plain text and both flags are false (the message is **not** refused). `@here` asks clients to notify the members who are online; `@everyone` all of them.
+- `ChatMessage` carries `channel_id`, `edited_at_unix_ms` (0 when never edited), `deleted` (a tombstone: empty text, no attachments, no reactions — tombstones stay in history and in pages), `reply_to`, `mention_ids`, the two mention flags, `reactions` (grouped by emoji, user ids ascending) and `attachments`. `reply_to` is a `ReplyRef` the server fills at read time from the target's **current** state: its id, author, the first 120 scalars of its text and whether it is a tombstone.
+- `EditMessage{id, text}` — invalid text: non-fatal `ERROR_CODE_INVALID_MESSAGE`. Unknown message or a tombstone: non-fatal `ERROR_CODE_UNKNOWN_MESSAGE`. A channel the caller may no longer view: `ERROR_CODE_UNKNOWN_CHANNEL`. Not the author: non-fatal `ERROR_CODE_FORBIDDEN` — `MANAGE_MESSAGES` does not grant editing someone else's text. Otherwise the text and `edited_at_unix_ms` are set, `mention_ids` and the mention flags are recomputed, and `MessageEdited{message}` is broadcast to the channel's viewers.
+- `DeleteMessage{id}` — unknown message or a tombstone: `ERROR_CODE_UNKNOWN_MESSAGE`. A channel the caller may no longer view: `ERROR_CODE_UNKNOWN_CHANNEL`. Neither the author nor a holder of `MANAGE_MESSAGES` in that channel: `ERROR_CODE_PERMISSION_DENIED{"MANAGE_MESSAGES"}`. Otherwise the message becomes a tombstone: text, mentions, reactions and attachments are cleared and the attachment files are removed. `MessageDeleted{channel_id, id}` is broadcast to the channel's viewers.
+- `React{message_id, emoji, remove}` — `emoji` must be one of the eight the server accepts (👍 ❤️ 😂 😮 😢 🔥 🎉 👀), else non-fatal `ERROR_CODE_INVALID_REACTION`. An unknown message: `ERROR_CODE_UNKNOWN_MESSAGE`. A channel the caller may not view: `ERROR_CODE_UNKNOWN_CHANNEL`. Without `ADD_REACTIONS`: `ERROR_CODE_PERMISSION_DENIED{"ADD_REACTIONS"}` — removing one needs the bit too, and this check comes before the tombstone verdict, so reacting to a tombstone without the bit answers the permission error rather than `ERROR_CODE_UNKNOWN_MESSAGE`. A tombstone with the bit held: `ERROR_CODE_UNKNOWN_MESSAGE`. Otherwise the reader's reaction is added, or removed when `remove` is true; both are idempotent. `ReactionsChanged{channel_id, message_id, reactions}` carrying the full grouped set is broadcast to the channel's viewers.
+- `MarkRead{channel_id, message_id}` — a channel the caller may not view: `ERROR_CODE_UNKNOWN_CHANNEL`; a voice channel, which holds no messages and therefore no cursor: `ERROR_CODE_INVALID_ARGUMENT{"channel"}`. Otherwise the cursor becomes `max(cursor, min(message_id, newest id in the channel))`. There is no reply frame.
 
-Mentions on the wire are the token `<@user_id>`. Clients render it as the mentioned user's username and convert a typed `@username` into the token before sending; the server never parses usernames out of text.
+Counters live in `ReadState{channel_id, unread, mentions, last_message_id}`, one per viewable text channel and DM, and are per reader: `unread` counts the channel's messages with `id > cursor` that are not tombstones and not written by the reader; `mentions` counts those among them whose `mention_ids` contain the reader **or** whose `mention_everyone` is set. `@here` is live-only and is never counted.
 
-Every error above is non-fatal. Every broadcast in this section is serialized under the same server lock as membership changes.
+Mentions on the wire are the token `<@user_id>`. Clients render it as the mentioned user's display name and convert a typed `@username` into the token before sending; the server never parses usernames out of text. `@everyone` and `@here` are plain words, not tokens.
+
+Every error above is non-fatal. Every broadcast in this section is serialized under the same server lock as every other mutation.
 
 ## Attachments
 
 Both attachment endpoints need the door key and a bearer access token.
 
-**Upload** — `POST /api/attachments?room=<id>`, the body being the raw image bytes:
+**Upload** — `POST /api/attachments?channel=<id>`, the body being the raw image bytes:
 
-- `room` missing or outside the room id grammar: `400`. The bearer user not a member of that room: `403`.
+- `channel` missing or not a positive integer: `400 ApiError{"channel"}`; a voice channel, which holds no messages to attach to: `400 ApiError{"channel"}` as well. A channel the bearer user may not view: `403 ApiError{"VIEW_CHANNEL"}`. One it may view without holding `ATTACH_FILES`: `403 ApiError{"ATTACH_FILES"}`.
 - `Content-Type` outside `image/png`, `image/jpeg`, `image/gif`, `image/webp`: `415`.
 - No `Content-Length`: `411`. `Content-Length` above 8 MiB: `413`.
 - Total stored attachment bytes plus the declared length above the quota `Vorcall:AttachmentsMaxBytes` (2 GiB by default): `507` `ApiError{"attachment storage is full"}`.
@@ -131,51 +224,92 @@ Both attachment endpoints need the door key and a bearer access token.
 
 An upload is **unlinked** until a `SendMessage` names its id. Unlinked uploads older than 1 hour are swept every 10 minutes, file and row together.
 
-**Download** — `GET /api/attachments/{id}`: unknown id `404`; unlinked and the caller is not the uploader `403`; linked and the caller is not a member of the message's room `403`. Otherwise the bytes with `Content-Length`, the strong `ETag` `"<id>-<size>"`, `Cache-Control: private, max-age=31536000, immutable`, and Range supported.
+**Download** — `GET /api/attachments/{id}`: unknown id `404`; unlinked and the caller is not the uploader `403`; linked and the caller may not view the message's channel `403`. Otherwise the bytes with `Content-Length`, the strong `ETag` `"<id>-<size>"`, `Cache-Control: private, max-age=31536000, immutable`, and Range supported.
 
 Deleting a message removes its attachments, rows and files alike.
 
+## Profiles and images
+
+A member is a `Profile{user_id, username, nickname, avatar_image_id, banner_image_id, description, accent_color, role_ids, online, server_muted, server_deafened}`. Clients show `nickname` when it is non-empty and `username` otherwise, everywhere a member appears.
+
+- `UpdateProfile{description, accent_color, avatar_image_id, banner_image_id}` — own profile only, no permission needed. `description` is 0..256 scalars, `accent_color` is `0xRRGGBB` (`0` = none). The two image fields are sentinel-coded: `0` keeps the current image, `-1` clears it, any other value must name an image of the right purpose uploaded by the caller (else `ERROR_CODE_UNKNOWN_IMAGE`). Answers `MemberUpdated` to every online member.
+- `SetNickname{user_id, nickname}` — `user_id = 0` means self. On self the caller needs `CHANGE_NICKNAME`; on another member `MANAGE_MEMBERS` plus the hierarchy rule (`ERROR_CODE_HIERARCHY` / `ERROR_CODE_FORBIDDEN`). An empty `nickname` clears it; otherwise the name grammar applies (`ERROR_CODE_INVALID_NAME`). Answers `MemberUpdated` to every online member.
+
+**Images** are a separate store from attachments, with a purpose attached to each upload.
+
+**Upload** — `POST /api/images?purpose=avatar|banner|server_icon|role_icon`, the raw image bytes as the body. The content types, magic-number check, `Content-Length` requirement, 8 MiB cap, storage quota and the 20-uploads-per-minute-per-user rate limit are the attachment upload's, unchanged. `purpose` missing or not one of the four: `400`. `avatar` and `banner` need a bearer and nothing more; `server_icon` needs `MANAGE_SERVER` and `role_icon` needs `MANAGE_ROLES`, a missing bit being `403 ApiError{detail = <bit name>}`. Success is `201 Image{id, content_type, size}`.
+
+**Download** — `GET /api/images/{id}`: any bearer may read any image; `404` when the id is unknown. The response carries `Content-Length`, the strong `ETag` `"<id>"` — the id alone, unlike an attachment's `"<id>-<size>"`, because an image's bytes never change (a new picture is a new row) — `Cache-Control: private, max-age=31536000, immutable`, and Range support. Clients may therefore cache an image id for good.
+
+An image referenced by a profile, the server or a role is kept; an unreferenced one — never linked, or dropped when its reference was replaced or cleared — is swept with the unlinked attachments once it is older than 1 hour. A frame referencing an image id that does not exist, carries the wrong purpose, or (for `avatar`/`banner`) was not uploaded by the caller is refused with `ERROR_CODE_UNKNOWN_IMAGE`.
+
+Clients downscale before uploading: avatar and server icon to at most 512×512, banner to 1600×600, role icon to 128×128. The server enforces bytes and type only, never dimensions.
+
+## Moderation
+
+- `KickMember{user_id}` — needs `KICK_MEMBERS` and the hierarchy rule. The account keeps existing; its live connection receives fatal `ERROR_CODE_KICKED` then close 1008, every refresh token of the account is revoked, and the other online members receive `MemberUpdated{online = false}`. The kicked account may sign in again immediately with its password.
+- `BanMember{user_id, reason}` — needs `BAN_MEMBERS` and the hierarchy rule; `reason` is 0..256 scalars, an over-long one `ERROR_CODE_INVALID_ARGUMENT{"reason"}`, and an unknown or already-banned target `ERROR_CODE_UNKNOWN_USER`. In one transaction a ban row is written (`Ban{user_id, username, reason, banned_by, banned_at_unix_ms}`), **every message the target ever sent becomes a tombstone** with its attachment files removed, the target's per-user channel overrides are dropped, and its refresh tokens are revoked. Then the frames: one `MessageDeleted` **per tombstoned message** to that message's channel's viewers, a `ChannelUpserted` to the viewers of each channel an override was removed from, the kick itself with `ERROR_CODE_BANNED`, the `MemberUpdated{online = false}` that ending a session produces, and finally `MemberRemoved{user_id}` to everyone. From then on `POST /api/auth/login` and `POST /api/auth/refresh` answer `403 ApiError{"banned"}` and the `/ws` upgrade answers a bare `403`.
+- `UnbanMember{user_id}` — needs `BAN_MEMBERS`; no hierarchy check, the target is not a member any more. The ban row is removed and `MemberUpdated` carrying the profile goes to everyone. Messages stay tombstones.
+- `VoiceModerate{user_id, channel_id, set_muted, muted, set_deafened, deafened, move, move_to}` — each flag is applied only when its `set_*` companion is true, so one frame can mute, deafen, move, or any combination. The bits are resolved **in the channel the target is currently in**: `MUTE_MEMBERS` for mute, `DEAFEN_MEMBERS` for deafen, `MOVE_MEMBERS` for a move (in both the old and the new channel), and the hierarchy rule applies to the target throughout. A target not in that channel's voice session is `ERROR_CODE_NOT_IN_VOICE`.
+  - **Server mute and deafen** persist on the account (`Profile.server_muted` / `server_deafened`) and apply to the live session at once: the relay drops audio from a muted session, and skips a deafened recipient on fan-out — audio and share media alike. Both flags are broadcast in the channel's `VoiceState` and in `MemberUpdated`, so every client shows them.
+  - **Move** ends the target's session in the old channel (`VoiceMemberLeft` to that channel's viewers) and sends the target `VoiceMoved{move_to}`; the target then sends `JoinVoice{move_to}` itself, with a fresh key and ssrc. A move needs the target to resolve `CONNECT` in `move_to`. `move_to = 0` disconnects instead: `VoiceMoved{0}` and no rejoin.
+- `JoinVoice` by a member without `SPEAK` in that channel still creates the session, but muted: the relay drops its audio and `VoiceMember.server_muted` is true for it. Granting `SPEAK` later unmutes it without a rejoin.
+- `VoiceMember.priority` mirrors `PRIORITY_SPEAKER` resolved in that channel. It is recomputed whenever roles or overrides change, and a fresh `VoiceState` goes to the channel's viewers when any member's flags move.
+- `TransferOwnership{user_id}` — owner only (`ERROR_CODE_FORBIDDEN` for anyone else, the target being the owner included); the target must exist and not be banned (`ERROR_CODE_UNKNOWN_USER`). `Server.owner_id` is persisted and `ServerUpdated` goes to everyone.
+- `UpdateServer{name, description, icon_image_id}` — needs `MANAGE_SERVER`; name and description follow the usual grammars (an over-long description is `ERROR_CODE_INVALID_ARGUMENT{"description"}`). `icon_image_id` is **not** sentinel-coded the way `UpdateProfile`'s image fields are: `0` clears the icon, any other value must name a `server_icon` image (`ERROR_CODE_UNKNOWN_IMAGE`), and a negative value is `ERROR_CODE_INVALID_ARGUMENT{"icon_image_id"}`. `ServerUpdated` to everyone.
+
+## Invites and bans (REST)
+
+All four endpoints need the door key, a bearer access token and the permission named below. A missing permission is `403 ApiError{detail = <bit name>}`.
+
+| Endpoint | Permission | Behaviour |
+|---|---|---|
+| `GET /api/invites` | `MANAGE_INVITES` | `200 InviteList` — every invite, used ones included; `used_by` is 0 while unused, `created_by` is 0 for an invite the admin CLI made |
+| `POST /api/invites` | `MANAGE_INVITES` | body `CreateInviteRequest{days}`, `days` 1..365 (`400` otherwise) → `201 InviteCreated{id, code, expires_at_unix_ms}`. The plaintext `code` appears here and nowhere else: the server keeps only its hash |
+| `DELETE /api/invites/{id}` | `MANAGE_INVITES` | `204`, also for an already-used invite; `404` when the id is unknown |
+| `GET /api/bans` | `BAN_MEMBERS` | `200 BanList` — `banned_by` is 0 when the account that issued the ban no longer exists |
+
 ## Voice
 
-One voice channel per text room. Voice membership is separate from text membership: a user is in a room's voice channel only after `JoinVoice`, and signalling for it rides the same WebSocket. Media does not — see Media transport.
+Voice lives in voice channels and in DM channels; a text channel has none. A member is in a channel's voice session only after `JoinVoice`, and signalling for it rides the same WebSocket. Media does not — see Media transport.
 
 ### Signalling
 
-- `JoinVoice{room_id}` — requires membership of that **text** room. Invalid or unknown room: non-fatal `ERROR_CODE_UNKNOWN_ROOM`. Not a member of the text room: non-fatal `ERROR_CODE_NOT_A_MEMBER`. Relay disabled: non-fatal `ERROR_CODE_VOICE_UNAVAILABLE`. Already in that voice channel: the existing media session ends first — every member of the text room, the caller included, receives `VoiceMemberLeft` — and a new one is created exactly like a fresh join, so a `VoiceReady` always carries a key and ssrc that were never used before. Otherwise the server creates a media session, sends the caller `VoiceReady` then `VoiceState`, and every other member of the **text room** receives `VoiceMemberJoined`.
-- `LeaveVoice{room_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Otherwise every member of the text room **including the leaver** receives `VoiceMemberLeft`, and the media session is invalidated.
+- `JoinVoice{channel_id}` — the channel must be kind `VOICE` or `DM`. Id 0, unknown, or not visible to the caller: non-fatal `ERROR_CODE_UNKNOWN_CHANNEL`. A text channel: non-fatal `ERROR_CODE_INVALID_ARGUMENT`. Without `CONNECT` in it (a DM member always has it): non-fatal `ERROR_CODE_PERMISSION_DENIED{"CONNECT"}`. Relay disabled: non-fatal `ERROR_CODE_VOICE_UNAVAILABLE`. Already in that voice session: the existing media session ends first — every viewer of the channel, the caller included, receives `VoiceMemberLeft` — and a new one is created exactly like a fresh join, so a `VoiceReady` always carries a key and ssrc that were never used before. Otherwise the server creates a media session, sends the caller `VoiceReady` then `VoiceState`, and every other viewer of the channel receives `VoiceMemberJoined`. A joiner without `SPEAK`, or one the moderators have muted or deafened, has those flags on its session from the first packet.
+- `LeaveVoice{channel_id}` — unknown or invisible channel: `ERROR_CODE_UNKNOWN_CHANNEL`. Not in that channel's voice session: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Otherwise every viewer of the channel **including the leaver** receives `VoiceMemberLeft`, and the media session is invalidated.
 
-Audience: `VoiceState`, `VoiceMemberJoined`, `VoiceMemberLeft` and `Speaking` go to every member of the text room, whether or not they are in voice. `VoiceReady` goes only to the joiner — it carries that session's key and ssrc.
+Audience: `VoiceState`, `VoiceMemberJoined`, `VoiceMemberLeft` and `Speaking` go to every member who may view the channel, whether or not they are in voice. `VoiceReady` and `VoiceMoved` go only to the member they are about — `VoiceReady` carries that session's key and ssrc.
 
-`VoiceMember` is `{user_id, username, ssrc, sharing, share_audio}`; `user_id` is the same stable id as in `Member`. The two share flags are described under Screen share.
+`VoiceMember` is `{user_id, username, ssrc, sharing, share_audio, server_muted, server_deafened, priority}`; `user_id` is the same stable id as in `Profile`. The two share flags are described under Screen share, the three moderation flags under Moderation.
 
-`VoiceState` is also sent right after every `RoomState` — at `Hello`, after a session replacement and after `JoinRoom`, `CreateRoom` or `OpenDm` — possibly with zero members, so a client always learns the voice occupancy of a room it is in.
+`VoiceState` arrives at `Hello` (one per voice or DM channel with at least one member), to the joiner right after its `VoiceReady`, to both parties when a DM is opened, and to a channel's viewers whenever a member's moderation or priority flags change — possibly with zero members, so a client always learns the occupancy of a channel it can see.
 
-- `LeaveRoom` while in that room's voice channel: every member receives `VoiceMemberLeft` first, then the normal `MemberLeft`.
-- When a connection ends, each room it had a voice session in receives `VoiceMemberLeft` before `MemberLeft`.
-- Session replacement: the replaced connection's voice sessions end with `VoiceMemberLeft` to the room. Voice membership is **not** transferred — the media key and ssrc belong to the old session. The new connection must send `JoinVoice` again.
+- When a connection ends, each channel it had a voice session in receives `VoiceMemberLeft`, before the `MemberUpdated{online = false}`.
+- Session replacement: the replaced connection's voice sessions end with `VoiceMemberLeft` to the channel. Voice membership is **not** transferred — the media key and ssrc belong to the old session. The new connection must send `JoinVoice` again.
+- A permission change that takes `VIEW_CHANNEL` or `CONNECT` away from a member in that channel's voice session, or the channel being deleted, ends the session: `VoiceMemberLeft` to the channel's viewers and `VoiceMoved{0}` to that member.
 
-`Speaking{room_id, user_id, speaking}` is server-derived, never sent by clients. `true` on the first authenticated audio packet of a session that was not speaking; `false` once 250 ms pass without an audio packet, evaluated every 100 ms; `false` is also sent when a speaking session ends.
+`Speaking{channel_id, user_id, speaking}` is server-derived, never sent by clients. `true` on the first authenticated audio packet of a session that was not speaking; `false` once 250 ms pass without an audio packet, evaluated every 100 ms; `false` is also sent when a speaking session ends. A server-muted session never speaks — its audio is dropped before it counts.
 
-Ordering: voice membership changes and their broadcasts are serialized with text membership under the same server lock. A connection never sees a voice frame for a room before that room's `RoomState`.
+Ordering: voice membership changes and their broadcasts are serialized with every other mutation under the same server lock. A connection never sees a voice frame before its `ServerSnapshot`.
 
 ### Screen share
 
-Sharing rides the voice channel: a user may only share in a room it already has a voice session in, and the share ends with that session.
+Sharing rides the voice session: a member may only share in a channel it already has a voice session in, and the share ends with that session.
 
-- `StartShare{room_id, audio}` — invalid or unknown room: non-fatal `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Sharing disabled on the server: non-fatal `ERROR_CODE_SHARE_UNAVAILABLE`. The room already at its sharer limit: non-fatal `ERROR_CODE_SHARE_LIMIT`. Otherwise the session is marked as sharing, `ShareStarted{room_id, user_id, audio}` is broadcast to every member of the **text room, the sharer included**, and the sharer receives `ShareWatchers{room_id, count}`. The frame is idempotent: repeating it — including with a different `audio` — re-sends both frames and does not count against the limit again.
-- `StopShare{room_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. In voice but not sharing: non-fatal `ERROR_CODE_NOT_SHARING`. Otherwise `ShareStopped{room_id, user_id}` is broadcast to the same audience and every watcher of that share receives `WatchState{room_id, user_id = 0}`.
-- `WatchShare{room_id, user_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. The viewer not in that room's voice channel: `ERROR_CODE_NOT_IN_VOICE`. The named user not sharing in that room, or the viewer itself: `ERROR_CODE_NOT_SHARING`. Otherwise the watch replaces whatever the viewer was watching before — a viewer watches at most one share per voice session (the app holds one voice session, so one share at a time) — the viewer receives `WatchState{room_id, user_id}`, and both the new sharer and the one the viewer left receive a fresh `ShareWatchers`.
-- `UnwatchShare{room_id}` — invalid or unknown room: `ERROR_CODE_UNKNOWN_ROOM`. Not in that room's voice channel: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Otherwise idempotent: the caller receives `WatchState{room_id, user_id = 0}` and the sharer it was watching, if any, a fresh `ShareWatchers`.
+- `StartShare{channel_id, audio}` — unknown or invisible channel: non-fatal `ERROR_CODE_UNKNOWN_CHANNEL`. Not in that channel's voice session: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Without `SHARE_SCREEN` in it: non-fatal `ERROR_CODE_PERMISSION_DENIED{"SHARE_SCREEN"}`. Sharing disabled on the server: non-fatal `ERROR_CODE_SHARE_UNAVAILABLE`. The channel already at its sharer limit: non-fatal `ERROR_CODE_SHARE_LIMIT`. Otherwise the session is marked as sharing, `ShareStarted{channel_id, user_id, audio}` is broadcast to every viewer of the channel, **the sharer included**, and the sharer receives `ShareWatchers{channel_id, count}`. The frame is idempotent: repeating it — including with a different `audio` — re-sends both frames and does not count against the limit again.
+- `StopShare{channel_id}` — unknown or invisible channel: `ERROR_CODE_UNKNOWN_CHANNEL`. Not in that channel's voice session: non-fatal `ERROR_CODE_NOT_IN_VOICE`. In voice but not sharing: non-fatal `ERROR_CODE_NOT_SHARING`. Otherwise `ShareStopped{channel_id, user_id}` is broadcast to the same audience and every watcher of that share receives `WatchState{channel_id, user_id = 0}`.
+- `WatchShare{channel_id, user_id}` — unknown or invisible channel: `ERROR_CODE_UNKNOWN_CHANNEL`. The viewer not in that channel's voice session: `ERROR_CODE_NOT_IN_VOICE`. The named user not sharing in that channel, or the viewer itself: `ERROR_CODE_NOT_SHARING`. Otherwise the watch replaces whatever the viewer was watching before — a viewer watches at most one share per voice session (the app holds one voice session, so one share at a time) — the viewer receives `WatchState{channel_id, user_id}`, and both the new sharer and the one the viewer left receive a fresh `ShareWatchers`.
+- `UnwatchShare{channel_id}` — unknown or invisible channel: `ERROR_CODE_UNKNOWN_CHANNEL`. Not in that channel's voice session: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Otherwise idempotent: the caller receives `WatchState{channel_id, user_id = 0}` and the sharer it was watching, if any, a fresh `ShareWatchers`.
 
-Audience: `ShareStarted` and `ShareStopped` go to every member of the text room, in voice or not. `WatchState` goes only to the viewer it describes; `ShareWatchers` only to the sharer, on every change to its watcher count.
+Audience: `ShareStarted` and `ShareStopped` go to every viewer of the channel, in voice or not. `WatchState` goes only to the viewer it describes; `ShareWatchers` only to the sharer, on every change to its watcher count.
 
-`VoiceMember.sharing` and `VoiceMember.share_audio` carry the same facts in `VoiceState` and `VoiceMemberJoined`, so a client that joins a room late learns who is already sharing without waiting for a `ShareStarted`.
+`VoiceMember.sharing` and `VoiceMember.share_audio` carry the same facts in `VoiceState` and `VoiceMemberJoined`, so a client that arrives late learns who is already sharing without waiting for a `ShareStarted`.
 
-A share ends whenever the voice session behind it ends — `LeaveVoice`, `LeaveRoom`, the connection ending, or a session replacement. `ShareStopped` is then sent **before** `VoiceMemberLeft`, and the share's watchers receive `WatchState{user_id = 0}`. A viewer's watch ends the same way when the viewer's own voice session ends, silently: no frame is sent for it.
+A share ends whenever the voice session behind it ends — `LeaveVoice`, a moderator's move or disconnect, a lost `VIEW_CHANNEL`/`CONNECT`, the connection ending, or a session replacement. `ShareStopped` is then sent **before** `VoiceMemberLeft`, and the share's watchers receive `WatchState{user_id = 0}`. A viewer's watch ends the same way when the viewer's own voice session ends, silently: no frame is sent for it.
 
-Share audio reaches that share's watchers only — it is never mixed into the room's voice audio, so a member who is in voice but not watching hears nothing of it.
+Share audio reaches that share's watchers only — it is never mixed into the channel's voice audio, so a member who is in voice but not watching hears nothing of it.
 
-The server keeps at most `Vorcall:MaxSharersPerRoom` (default 3) sharers per room, and `Vorcall:ShareEnabled` (default true) is the kill switch that makes every `StartShare` answer `ERROR_CODE_SHARE_UNAVAILABLE`.
+The server keeps at most `Vorcall:MaxSharersPerRoom` (default 3) sharers per channel, and `Vorcall:ShareEnabled` (default true) is the kill switch that makes every `StartShare` answer `ERROR_CODE_SHARE_UNAVAILABLE`.
 
 Sharing and watching are client intent and survive a reconnect the way "in voice" does: after `Welcome` and the new `JoinVoice`/`VoiceReady`, a client that was sharing sends `StartShare` again, and a client that was watching sends `WatchShare` again — the latter only if the watched user is still listed as sharing in the new `VoiceState`.
 
@@ -200,9 +334,9 @@ offset 19  ciphertext, then tag (16 bytes)
 Cipher: IETF ChaCha20-Poly1305 (RFC 8439). The key is the 32-byte session key from `VoiceReady`; the nonce is the 12 header bytes `ssrc || seq`. The header is authenticated, not encrypted.
 
 - **Client to relay** — sealed with the client's own session key. `seq` starts at 0 and increases by one per packet of any type, share media included: one counter per session, never one per stream. Bit 63 of `seq` is never set by a client.
-- **Relay to client, audio** — the relay opens the packet with the sender's key, re-seals the plaintext with the recipient's key under the unchanged header, so the recipient sees the original sender's `ssrc`, `seq` and `ts`, and forwards it to every other voice member of the room. No mixing, no transcoding.
+- **Relay to client, audio** — the relay opens the packet with the sender's key, re-seals the plaintext with the recipient's key under the unchanged header, so the recipient sees the original sender's `ssrc`, `seq` and `ts`, and forwards it to every other voice member of the channel that is not deafened. No mixing, no transcoding.
 - **Relay to client, pong** — the same header as the ping except `type = 3` and `seq = ping.seq | (1 << 63)`, sealed with that session's key. The bit keeps the pong nonce distinct from the ping nonce.
-- **Relay to client, share media** — types 4 and 5 are accepted only from a session that is sharing (type 5 only when that share was started with `audio`), and are re-sealed per recipient under the unchanged header and forwarded **only to that sharer's watchers**, never to the rest of the room. They leave from a per-session sender worker rather than the receive path, which stays free for audio.
+- **Relay to client, share media** — types 4 and 5 are accepted only from a session that is sharing (type 5 only when that share was started with `audio`), and are re-sealed per recipient under the unchanged header and forwarded **only to that sharer's watchers**, the deafened ones skipped, never to the rest of the channel. They leave from a per-session sender worker rather than the receive path, which stays free for audio.
 - **Relay to client, keyframe request** — type 6 is accepted only from a viewer that is watching the session named by `target_ssrc`, and is forwarded to that target re-sealed with the target's key, the payload unchanged.
 
 Ping/pong payload: 8 bytes, an opaque client clock value echoed unchanged. Clients send a ping every 5 s from the moment they hold a `VoiceReady`, regardless of push-to-talk, to keep NAT and conntrack mappings alive and to measure the media path RTT. A client that receives no pong for 15 s reports the media link as down.
@@ -223,7 +357,7 @@ Share audio payload (type 5): exactly one Opus packet of 20 ms at 48 kHz **stere
 
 Keyframe request payload (type 6): 4 bytes, `target_ssrc u32` — the sharer the request is for. A viewer sends at most 2 per second; a sharer coalesces the requests it receives into at most one extra keyframe.
 
-The relay processes each inbound datagram in this order: size (≤ 1200 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2, 4, 5, 6}`) → session lookup by ssrc → per-session rate limit — share media (types 4 and 5) is charged to a byte budget (`Vorcall:ShareMaxKbps`, default 30000 kbit/s, burst the larger of 1.5 MiB and half a second of that rate) instead of the packet bucket, and types 1, 2 and 6 to the packet bucket (100 packets/s sustained, burst 200) → AEAD open → replay window (1024 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason — the share-media reasons being share-rate, not-sharing, not-watching and queue-full — and logs per-room counters every 30 s while the room has voice members.
+The relay processes each inbound datagram in this order: size (≤ 1200 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2, 4, 5, 6}`) → session lookup by ssrc → per-session rate limit — share media (types 4 and 5) is charged to a byte budget (`Vorcall:ShareMaxKbps`, default 30000 kbit/s, burst the larger of 1.5 MiB and half a second of that rate) instead of the packet bucket, and types 1, 2 and 6 to the packet bucket (100 packets/s sustained, burst 200) → AEAD open → server mute (a type 1 packet from a muted session is dropped here and never marks the session speaking) → replay window (1024 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason — the share-media reasons being share-rate, not-sharing, not-watching and queue-full, plus server-mute for audio — and logs per-channel counters every 30 s while the channel has voice members.
 
 `Speaking` is derived from type 1 alone: share media never marks a session as speaking. The relay's UDP socket buffers are 8 MiB in each direction, which the host sysctl in `deploy/provision-host.sh` has to allow.
 
@@ -233,7 +367,9 @@ The relay only ever sends to an address it learned this way: a member whose addr
 
 `Idle → Joining (JoinVoice sent) → Ready (VoiceReady received; UDP socket bound and pinging) → Media (first pong received) → Idle (LeaveVoice sent, or the WebSocket ended)`.
 
-"In voice" is user intent and survives reconnects: after every `Welcome` a client that was in voice sends `JoinVoice` again and rebuilds its media path with the new key. The old socket and key are discarded on disconnect. A non-fatal `ERROR_CODE_NOT_A_MEMBER` or `ERROR_CODE_VOICE_UNAVAILABLE` in answer to `JoinVoice` clears the intent.
+"In voice" is user intent and survives reconnects: after every `Welcome` a client that was in voice sends `JoinVoice` again and rebuilds its media path with the new key. The old socket and key are discarded on disconnect. A non-fatal `ERROR_CODE_UNKNOWN_CHANNEL`, `ERROR_CODE_PERMISSION_DENIED` or `ERROR_CODE_VOICE_UNAVAILABLE` in answer to `JoinVoice` clears the intent.
+
+`VoiceMoved{channel_id}` rewrites that intent from the outside: the client drops its current session and, when `channel_id` is non-zero, sends `JoinVoice{channel_id}` for the new channel; `0` leaves it idle. A client shows its own `server_muted` / `server_deafened` flags as moderator-imposed and does not let the user clear them, and it ducks every other peer by 12 dB while a `priority` speaker is speaking.
 
 Within `Media` a client may also be **Sharing** — `StartShare` sent once its own capture is running, ended by `StopShare` or by the voice session ending — and **Watching{user}** — `WatchShare` sent, confirmed by `WatchState` naming that user. On confirmation the client sends one keyframe request, and one more after every detected loss, at most one per 500 ms; after a loss it discards non-keyframe video until the next keyframe arrives.
 
@@ -241,8 +377,8 @@ The receive side keeps one jitter buffer per ssrc: adaptive 60–100 ms, packet 
 
 ## Server session state machine (per connection)
 
-1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. `Hello` may also carry `client_version` (e.g. `"0.2.0"`) and `client_platform` (e.g. `"linux-x86_64"`), both optional: the server logs them and stores them on the account (`users.last_client_version`/`last_client_platform`/`last_seen_at`) for the admin CLI's `users list` and `users outdated`. Neither field is enforced — a client that omits them (any build before the updater) still connects normally. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by the Hello sequence described under Rooms and presence — `RoomState`+`VoiceState` per room, then `RoomList` — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
-2. **Ready** — handles `JoinRoom`, `LeaveRoom`, `CreateRoom`, `OpenDm` and `MarkRead` as described under Rooms and presence, `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages, `JoinVoice`/`LeaveVoice` as described under Voice, `StartShare`/`StopShare`/`WatchShare`/`UnwatchShare` as described under Screen share, and `Ping`/`Pong`. `Ping` gets `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
+1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user; a banned account never gets that far, the upgrade itself answers `403`. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. `Hello` may also carry `client_version` (e.g. `"0.5.0"`) and `client_platform` (e.g. `"linux-x86_64"`), both optional: the server logs them and stores them on the account (`users.last_client_version`/`last_client_platform`/`last_seen_at`) for the admin CLI's `users list` and `users outdated`. Neither field is enforced — a client that omits them still connects normally. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by the Hello sequence — `ServerSnapshot`, then the `VoiceState`s — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
+2. **Ready** — handles `OpenDm` and `MarkRead` as described under Server, channels and categories and Messages; `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages; `JoinVoice`/`LeaveVoice` as described under Voice; `StartShare`/`StopShare`/`WatchShare`/`UnwatchShare` as described under Screen share; the channel, category and override frames under Server, channels and categories; the role, member-role and nickname frames under Roles and permissions and Profiles and images; `UpdateProfile` under Profiles and images; `KickMember`, `BanMember`, `UnbanMember`, `VoiceModerate`, `UpdateServer` and `TransferOwnership` under Moderation; and `Ping`, which gets a `Pong` echoing `sent_at_unix_ms`. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
 3. **Any state** — unparsable bytes or a text frame: fatal protocol error, close 1008. No frame received for 120 s: close 1001. A connection whose outbound queue exceeds 256 frames is closed with 1013. On server shutdown every socket is closed with 1001. If a connection's outbound queue is already full when a fatal error occurs, the `Error` frame may be dropped and only the close frame (1013 or 1008) is delivered: a slow consumer is closed as a slow consumer.
 
 The server also sends WebSocket-level keep-alive pings every 30 s; clients answer with pong frames automatically.
@@ -255,17 +391,21 @@ The server also sends WebSocket-level keep-alive pings every 30 s; clients answe
 
 `Disconnected → Connecting → AwaitingWelcome → Connected → (close, error or 75 s of silence) → Backoff → Connecting`.
 
-- Before every connection attempt the client refreshes the access token when fewer than 60 s remain; a REST call that answers 401 with a Bearer challenge is retried once after a refresh. On a `401` with `WWW-Authenticate: Bearer` it refreshes once and retries that request or upgrade. When a refresh itself answers `401` the loop stops for good and the UI returns to the sign-in screen. A bare `401` (door key) means a stale build: the client keeps retrying at the 30 s cap and shows "Unauthorized".
-- After `Welcome` the client fetches `GET /api/users`, then merges live frames. History is fetched per room on demand (`GET /api/messages?room=…`, the newest 100 messages) when a room is first opened.
-- Gap-fill: per room it has already loaded, the client remembers the newest message id it has delivered there. If the newest page starts after that id + 1 and `has_more` is true, it pages backwards with `before` until the pages overlap that id, up to 5 pages in total (500 messages); beyond that a gap may remain. "Load older" uses `before = <oldest known id>`. The client keeps at most 2000 messages per room, dropping the oldest.
-- The client sends `MarkRead` for a room while it is viewing that room at the bottom of the list and the window is focused, debounced to at most one per second per room.
-- `ERROR_CODE_SESSION_REPLACED` stops the loop for good; the UI returns to sign-in.
+- Before every connection attempt the client refreshes the access token when fewer than 60 s remain; a REST call that answers 401 with a Bearer challenge is retried once after a refresh. On a `401` with `WWW-Authenticate: Bearer` it refreshes once and retries that request or upgrade. When a refresh itself answers `401` the loop stops for good and the UI returns to the sign-in screen. A bare `401` (door key) means a stale build: the client keeps retrying at the 30 s cap and shows "Unauthorized". A `403` on login, refresh or the upgrade means the account is banned: the loop stops and the UI says so.
+- `ServerSnapshot` replaces the client's whole model of the server, so no REST call follows `Welcome`. History is fetched per channel on demand (`GET /api/messages?channel=…`, the newest 100 messages) when a channel is first opened.
+- Gap-fill: per channel it has already loaded, the client remembers the newest message id it has delivered there. If the newest page starts after that id + 1 and `has_more` is true, it pages backwards with `before` until the pages overlap that id, up to 5 pages in total (500 messages); beyond that a gap may remain. "Load older" uses `before = <oldest known id>`. The client keeps at most 2000 messages per channel, dropping the oldest.
+- The client sends `MarkRead` for a channel while it is viewing that channel at the bottom of the list and the window is focused, debounced to at most one per second per channel.
+- `ERROR_CODE_SESSION_REPLACED`, `ERROR_CODE_KICKED` and `ERROR_CODE_BANNED` stop the loop for good; the UI returns to sign-in naming the reason.
 - The client sends `Ping` every 30 s while connected.
 - Backoff: 1, 2, 4, 8, 16, 30 s (cap) with ±20 % jitter, reset after `Welcome`.
 
 ## Forward compatibility
 
-A client that receives a `ServerFrame` whose payload it does not recognise — including an empty payload — logs it and ignores it. Only undecodable bytes are a protocol error. Servers may therefore add new `ServerFrame` payloads without a version bump. New `ClientFrame` payloads still require server support; an unknown client payload is a fatal `ERROR_CODE_PROTOCOL` as today. The voice frames were added under version 1: a client without voice support ignores them. So were the five server payloads `RoomList`, `RoomUpdated`, `MessageEdited`, `MessageDeleted` and `ReactionsChanged`, and the six client payloads `CreateRoom`, `OpenDm`, `MarkRead`, `EditMessage`, `DeleteMessage` and `React`. A client built before them sees only `general`, never edits, deletes or reacts, and renders `<@id>` tokens raw. The screen share arrived under version 1 as well: the four server payloads `ShareStarted`, `ShareStopped`, `WatchState` and `ShareWatchers`, the four client payloads `StartShare`, `StopShare`, `WatchShare` and `UnwatchShare`, and the two `VoiceMember` fields `sharing` and `share_audio`. A client built before them ignores the frames and reads the two fields as false, so it never sees or joins a share. The release's `min_version` is `0.4.0`, so such a client is asked to update by the manifest rather than refused by the protocol.
+A client that receives a `ServerFrame` whose payload it does not recognise — including an empty payload — logs it and ignores it. Only undecodable bytes are a protocol error. Servers may therefore add new `ServerFrame` payloads without a version bump. New `ClientFrame` payloads still require server support; an unknown client payload is a fatal `ERROR_CODE_PROTOCOL` as today.
+
+The 0.5.0 release replaced rooms with channels and **removed** the room frames rather than keeping them: `ClientFrame` tags 4, 5 and 8 (`join_room`, `leave_room`, `create_room`), `ServerFrame` tags 5, 6, 7, 13 and 14 (`room_state`, `member_joined`, `member_left`, `room_list`, `room_updated`), `ChatMessage` field 5 (`room_id`) and `ErrorCode` 6 and 10 (`NOT_A_MEMBER`, `ROOM_EXISTS`) are all reserved by number and by name, and none of them will ever be reused. `ERROR_CODE_UNKNOWN_ROOM` (5) and `ERROR_CODE_INVALID_ROOM_NAME` (13) kept their numbers under the names `ERROR_CODE_UNKNOWN_CHANNEL` and `ERROR_CODE_INVALID_NAME`, and every `string room_id` became an `int64 channel_id` at its old tag.
+
+The protocol version stays 1, but a 0.4.x client cannot be served: it knows no channels and would read every id as an empty string. The release's `min_version` is therefore `0.5.0`, so such a client is asked to update by the manifest rather than refused by the protocol.
 
 ## Limits (summary)
 
@@ -274,9 +414,14 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 | Username | 1..32 scalars after trim, no control chars |
 | Password | 8..128 scalars |
 | Invite code | 20 chars, single use, 7-day expiry |
-| Room id | `^[a-z0-9-]{1,48}$` |
-| Room name | 1..32 scalars after trim |
-| Room slug | at most 32 chars, non-empty, not `dm-*` |
+| Invite validity | 1..365 days |
+| Channel / category / role name | 1..32 scalars after trim, no control chars |
+| Topic / description / ban reason | 0..256 scalars |
+| Roles | ≤ 100, `@everyone` included |
+| Categories | ≤ 50 |
+| Channels | ≤ 200, DMs not counted |
+| Overrides per channel | ≤ 100 |
+| Role icon emoji | ≤ 2 scalars |
 | Message text | 1..2000 scalars after trim (empty only with attachments) |
 | Reply excerpt | first 120 scalars |
 | Reactions palette | 8 emoji |
@@ -287,12 +432,14 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 | Attachment storage quota | 2 GiB by default |
 | Unlinked attachment sweep | older than 1 h, every 10 min |
 | Attachment upload rate limit | 20 uploads/min per user |
-| MarkRead debounce | 1 s per room |
+| Image upload | 8 MiB (avatar / server icon 512², banner 1600×600, role icon 128², client-side) |
+| Unreferenced image sweep | older than 1 h |
+| MarkRead debounce | 1 s per channel |
 | Inbound WebSocket message | 16 KiB |
 | REST request body | 16 KiB |
 | History page | 1..100, default 100 |
 | Gap-fill | max 5 pages |
-| Client message cap | 2000 messages per room |
+| Client message cap | 2000 messages per channel |
 | Access token | 15 min |
 | Refresh token | 30 days sliding |
 | Auth rate limit | 10 requests/min per IP |
@@ -315,5 +462,5 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 | Video fragment payload | 1156 bytes of frame data |
 | Share audio frame | 20 ms, 48 kHz stereo, 96 kbps CBR |
 | Share media budget | 30 Mbit/s per session, configurable |
-| Sharers per room | 3, configurable |
+| Sharers per channel | 3, configurable |
 | Keyframe requests | 2/s per viewer |

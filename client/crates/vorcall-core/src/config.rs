@@ -1,7 +1,8 @@
-//! On-disk client preferences: who signed in last and how the client behaves.
-//! Tokens live in `session.toml` instead, and messages are never stored.
+//! On-disk client preferences: who signed in last, how the client behaves and
+//! how it looks. Tokens live in `session.toml` instead, and messages are never
+//! stored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
@@ -23,6 +24,59 @@ pub const SHARE_DEFAULT_FPS: u32 = 30;
 pub const SHARE_MIN_BITRATE_KBPS: u32 = 1_000;
 pub const SHARE_MAX_BITRATE_KBPS: u32 = 30_000;
 
+/// The built-in dark preset; a custom theme is `custom:<slug>` and names a file
+/// under the config directory.
+pub const DEFAULT_THEME: &str = "vorcall-dark";
+
+/// The built-in light preset, the only other theme that is not a file.
+pub const LIGHT_THEME: &str = "vorcall-light";
+
+pub const FONT_SCALE_MIN: f32 = 0.85;
+pub const FONT_SCALE_MAX: f32 = 1.3;
+pub const FONT_SCALE_DEFAULT: f32 = 1.0;
+
+/// How wide the channel and member panes may be dragged.
+pub const PANE_MIN_WIDTH: f32 = 180.0;
+pub const PANE_MAX_WIDTH: f32 = 360.0;
+pub const DEFAULT_PANE_WIDTH: f32 = 240.0;
+
+/// The action id push-to-talk is stored under. Before 0.5.0 it lived in
+/// [`Config::ptt_key`], which is still read and still written.
+pub const PUSH_TO_TALK: &str = "push_to_talk";
+
+/// Every rebindable action: its id, its default binding and whether the binding
+/// is captured system-wide (the rest only fire while a Vorcall window has
+/// focus).
+///
+/// A binding is `[Ctrl+][Shift+][Alt+]<key>`, where `<key>` is an iced
+/// `keyboard::key::Named` variant name, a single ASCII letter or digit, the
+/// punctuation character a name like "Comma" stands for, or one of "MouseBack",
+/// "MouseForward", "MouseMiddle". "Ctrl+," and "Ctrl+Comma" are therefore the
+/// same binding, and a binding is saved back under the name.
+///
+/// The modifiers a binding asks for only have to be held, not held alone, so one
+/// key event can match several bindings: `Alt+Shift+ArrowDown` matches
+/// `Alt+ArrowDown` too. The most specific match wins — the binding asking for the
+/// most modifiers — which is why the two default arrow chords can sit on one
+/// arrow key. Two actions on the very same binding both fire, and that is what
+/// [`Config::keybind_conflicts`] reports.
+pub const KEYBIND_ACTIONS: [(&str, &str, bool); 12] = [
+    (PUSH_TO_TALK, DEFAULT_PTT_KEY, true),
+    ("toggle_mute", "Ctrl+Shift+M", true),
+    ("toggle_deafen", "Ctrl+Shift+D", true),
+    ("quick_switcher", "Ctrl+K", false),
+    ("settings", "Ctrl+Comma", false),
+    ("prev_channel", "Alt+ArrowUp", false),
+    ("next_channel", "Alt+ArrowDown", false),
+    // The prefixes only parse in the one order the grammar accepts, so these two
+    // are spelled "Shift+Alt+" and not the other way round.
+    ("next_unread", "Shift+Alt+ArrowDown", false),
+    ("prev_unread", "Shift+Alt+ArrowUp", false),
+    ("toggle_members", "Ctrl+U", false),
+    ("edit_last", "ArrowUp", false),
+    ("escape", "Escape", false),
+];
+
 /// How audio leaves the machine: while the push-to-talk binding is held, or whenever the noise gate is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +84,26 @@ pub enum TransmitMode {
     #[default]
     PushToTalk,
     VoiceActivation,
+}
+
+/// How tightly the message list and the sidebars are packed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Density {
+    #[default]
+    Cosy,
+    Compact,
+}
+
+/// Which splash animation a launch plays. `VORCALL_ENTRANCE` still overrides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Entrance {
+    #[default]
+    Random,
+    Wink,
+    Rare,
+    Off,
 }
 
 /// Local playback settings for one other user. Never leaves this machine.
@@ -69,9 +143,9 @@ pub struct Config {
     pub input_device: Option<String>,
     #[serde(default)]
     pub output_device: Option<String>,
-    /// An iced `keyboard::key::Named` variant name ("Control", "F8", "Space", ...),
-    /// a single ASCII letter or digit, or one of "MouseBack", "MouseForward",
-    /// "MouseMiddle". Left/right location is ignored.
+    /// Where push-to-talk lived before 0.5.0. `keybinds` is the home now;
+    /// `normalize` folds this in and `save` writes it back from the map, so a
+    /// rollback to an older client keeps the binding.
     #[serde(default = "default_ptt_key")]
     pub ptt_key: String,
     #[serde(default)]
@@ -105,6 +179,49 @@ pub struct Config {
     /// Playback volume for a watched share, 0.0..=2.0.
     #[serde(default = "default_volume")]
     pub share_volume: f32,
+    /// `"vorcall-dark"`, `"vorcall-light"` or `"custom:<slug>"`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(default)]
+    pub density: Density,
+    /// Multiplies every text size; clamped to FONT_SCALE_MIN..=FONT_SCALE_MAX.
+    #[serde(default = "default_font_scale")]
+    pub font_scale: f32,
+    #[serde(default)]
+    pub entrance: Entrance,
+    /// Draw the reaction palette as text labels instead of emoji, for a machine
+    /// whose fonts cannot render them. `VORCALL_TEXT_REACTIONS` still overrides.
+    #[serde(default)]
+    pub text_reactions: bool,
+    /// Never notify for `@everyone` or `@here`.
+    #[serde(default)]
+    pub suppress_everyone: bool,
+    #[serde(default = "default_true")]
+    pub show_members: bool,
+    /// Channel pane width, clamped to PANE_MIN_WIDTH..=PANE_MAX_WIDTH.
+    #[serde(default = "default_pane_width")]
+    pub sidebar_width: f32,
+    /// Member pane width, same range.
+    #[serde(default = "default_pane_width")]
+    pub members_width: f32,
+    /// The channel to reopen on the next launch; `0` = none yet.
+    #[serde(default)]
+    pub last_channel: i64,
+    /// Channels whose messages raise no notification.
+    #[serde(default)]
+    pub muted_channels: BTreeSet<i64>,
+    /// Categories the sidebar draws collapsed.
+    #[serde(default)]
+    pub collapsed_categories: BTreeSet<i64>,
+    /// DM channels the user closed; reopened by a new message or by the member
+    /// list.
+    #[serde(default)]
+    pub hidden_dms: BTreeSet<i64>,
+    /// Action id → binding, for the actions whose binding is not the default.
+    /// Read through [`Config::keybind`], which falls back to
+    /// [`KEYBIND_ACTIONS`].
+    #[serde(default)]
+    pub keybinds: BTreeMap<String, String>,
     /// Keyed by the peer's user id in decimal — TOML table keys are strings.
     #[serde(default)]
     pub peer_audio: BTreeMap<String, PeerAudio>,
@@ -129,6 +246,20 @@ impl Default for Config {
             share_bitrate_kbps: None,
             share_audio: true,
             share_volume: 1.0,
+            theme: DEFAULT_THEME.to_owned(),
+            density: Density::default(),
+            font_scale: FONT_SCALE_DEFAULT,
+            entrance: Entrance::default(),
+            text_reactions: false,
+            suppress_everyone: false,
+            show_members: true,
+            sidebar_width: DEFAULT_PANE_WIDTH,
+            members_width: DEFAULT_PANE_WIDTH,
+            last_channel: 0,
+            muted_channels: BTreeSet::new(),
+            collapsed_categories: BTreeSet::new(),
+            hidden_dms: BTreeSet::new(),
+            keybinds: BTreeMap::new(),
             peer_audio: BTreeMap::new(),
         }
     }
@@ -152,6 +283,112 @@ impl Config {
             self.peer_audio.insert(key, audio);
         }
     }
+
+    /// The binding in force for `action`: what the user set, or the default from
+    /// [`KEYBIND_ACTIONS`]. Empty for an action this build does not know.
+    pub fn keybind(&self, action: &str) -> &str {
+        match self.keybinds.get(action) {
+            Some(binding) => binding,
+            None => default_keybind(action),
+        }
+    }
+
+    /// Rebinds `action`. An empty binding restores its default; an unknown
+    /// action is ignored, since loading would drop it anyway.
+    pub fn set_keybind(&mut self, action: &str, binding: &str) {
+        let default = default_keybind(action);
+        if default.is_empty() {
+            return;
+        }
+
+        let binding = binding.trim();
+        let binding = if binding.is_empty() { default } else { binding };
+        self.keybinds.insert(action.to_owned(), binding.to_owned());
+        if action == PUSH_TO_TALK {
+            self.ptt_key = binding.to_owned();
+        }
+    }
+
+    /// Pairs of actions sharing a binding, in [`KEYBIND_ACTIONS`] order. The
+    /// keybinds tab paints both sides of every pair as a warning; nothing here
+    /// refuses the binding.
+    ///
+    /// Sharing means the very same binding, however it is spelled: a binding with
+    /// more modifiers on the same key is not a clash but the more specific match,
+    /// and wins the press outright.
+    pub fn keybind_conflicts(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+
+        for (index, (first, _, _)) in KEYBIND_ACTIONS.iter().enumerate() {
+            let binding = self.keybind(first);
+            if binding.is_empty() {
+                continue;
+            }
+            let binding = canonical_binding(binding);
+            for (second, _, _) in KEYBIND_ACTIONS.iter().skip(index + 1) {
+                if canonical_binding(self.keybind(second)) == binding {
+                    out.push(((*first).to_owned(), (*second).to_owned()));
+                }
+            }
+        }
+
+        out
+    }
+}
+
+/// One binding as it is compared against another: lowercased, with the
+/// punctuation characters folded onto the names they alias, so that "Ctrl+," and
+/// "Ctrl+Comma" are one binding. Only ever compared against another binding read
+/// the same way, never stored or shown.
+fn canonical_binding(binding: &str) -> String {
+    let mut rest = binding.trim();
+    let mut canonical = String::new();
+    for prefix in ["ctrl+", "shift+", "alt+"] {
+        if rest
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            canonical.push_str(prefix);
+            rest = &rest[prefix.len()..];
+        }
+    }
+    canonical.push_str(&punctuation_name(rest).to_ascii_lowercase());
+    canonical
+}
+
+/// The name the grammar spells a punctuation key with; anything else is already
+/// its own spelling.
+fn punctuation_name(key: &str) -> &str {
+    match key {
+        "," => "Comma",
+        "." => "Period",
+        "/" => "Slash",
+        ";" => "Semicolon",
+        "-" => "Minus",
+        "=" => "Equal",
+        "[" => "BracketLeft",
+        "]" => "BracketRight",
+        "`" => "Backquote",
+        "'" => "Quote",
+        "\\" => "Backslash",
+        other => other,
+    }
+}
+
+/// The stored theme, if it is one of the three forms a theme can take: the two
+/// presets, and `custom:<slug>` naming a file under the config directory. A slug
+/// is lowercase letters, digits and dashes, so nothing here can reach outside
+/// that directory.
+fn known_theme(theme: &str) -> bool {
+    if theme == DEFAULT_THEME || theme == LIGHT_THEME {
+        return true;
+    }
+    theme.strip_prefix("custom:").is_some_and(|slug| {
+        !slug.is_empty()
+            && slug
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    })
 }
 
 fn default_true() -> bool {
@@ -172,6 +409,34 @@ fn default_share_resolution() -> String {
 
 fn default_share_fps() -> u32 {
     SHARE_DEFAULT_FPS
+}
+
+fn default_theme() -> String {
+    DEFAULT_THEME.to_owned()
+}
+
+fn default_font_scale() -> f32 {
+    FONT_SCALE_DEFAULT
+}
+
+fn default_pane_width() -> f32 {
+    DEFAULT_PANE_WIDTH
+}
+
+fn default_keybind(action: &str) -> &'static str {
+    KEYBIND_ACTIONS
+        .iter()
+        .find(|(id, _, _)| *id == action)
+        .map(|(_, binding, _)| *binding)
+        .unwrap_or_default()
+}
+
+fn pane_width(value: f32) -> f32 {
+    if value.is_nan() {
+        DEFAULT_PANE_WIDTH
+    } else {
+        value.clamp(PANE_MIN_WIDTH, PANE_MAX_WIDTH)
+    }
 }
 
 /// Clamps values that could only have reached here from a hand-edited or
@@ -211,6 +476,47 @@ fn normalize(config: &mut Config) {
             audio.volume.clamp(0.0, 2.0)
         };
     }
+
+    let theme = config.theme.trim();
+    config.theme = if known_theme(theme) {
+        theme.to_owned()
+    } else {
+        DEFAULT_THEME.to_owned()
+    };
+
+    config.font_scale = if config.font_scale.is_nan() {
+        FONT_SCALE_DEFAULT
+    } else {
+        config.font_scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX)
+    };
+
+    config.sidebar_width = pane_width(config.sidebar_width);
+    config.members_width = pane_width(config.members_width);
+
+    // An action this build does not know, or an entry a hand edit emptied, would
+    // only ever shadow a default.
+    config.keybinds = std::mem::take(&mut config.keybinds)
+        .into_iter()
+        .filter(|(action, _)| !default_keybind(action).is_empty())
+        .map(|(action, binding)| (action, binding.trim().to_owned()))
+        .filter(|(_, binding)| !binding.is_empty())
+        .collect();
+
+    // Pre-0.5.0 files carry the push-to-talk binding in `ptt_key` alone; the map
+    // is the source of truth from here on, and `save` writes the old key back
+    // from it.
+    let ptt_key = config.ptt_key.trim().to_owned();
+    let ptt_key = if ptt_key.is_empty() {
+        DEFAULT_PTT_KEY.to_owned()
+    } else {
+        ptt_key
+    };
+    config
+        .keybinds
+        .entry(PUSH_TO_TALK.to_owned())
+        .or_insert(ptt_key);
+    let in_force = config.keybind(PUSH_TO_TALK).to_owned();
+    config.ptt_key = in_force;
 }
 
 /// `None` when the platform exposes no config directory at all.
@@ -255,7 +561,11 @@ pub fn save(config: &Config) -> anyhow::Result<()> {
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
 
-    let raw = toml::to_string_pretty(config).context("cannot serialize the configuration")?;
+    let mut synced = config.clone();
+    let in_force = synced.keybind(PUSH_TO_TALK).to_owned();
+    synced.ptt_key = in_force;
+
+    let raw = toml::to_string_pretty(&synced).context("cannot serialize the configuration")?;
     std::fs::write(&path, raw).with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
 }
@@ -276,6 +586,25 @@ mod tests {
     }
 
     #[test]
+    fn defaults_cover_every_appearance_and_layout_key() {
+        let config = Config::default();
+        assert_eq!(config.theme, DEFAULT_THEME);
+        assert_eq!(config.density, Density::Cosy);
+        assert_eq!(config.font_scale, 1.0);
+        assert_eq!(config.entrance, Entrance::Random);
+        assert!(!config.text_reactions);
+        assert!(!config.suppress_everyone);
+        assert!(config.show_members);
+        assert_eq!(config.sidebar_width, 240.0);
+        assert_eq!(config.members_width, 240.0);
+        assert_eq!(config.last_channel, 0);
+        assert!(config.muted_channels.is_empty());
+        assert!(config.collapsed_categories.is_empty());
+        assert!(config.hidden_dms.is_empty());
+        assert!(config.keybinds.is_empty());
+    }
+
+    #[test]
     fn a_config_without_the_new_keys_still_loads() {
         let raw = r#"
             username = "x"
@@ -291,6 +620,20 @@ mod tests {
         assert!(config.noise_suppression);
         assert!(config.echo_cancellation);
         assert!(!config.auto_gain);
+
+        assert_eq!(config.theme, DEFAULT_THEME);
+        assert_eq!(config.density, Density::Cosy);
+        assert_eq!(config.font_scale, FONT_SCALE_DEFAULT);
+        assert_eq!(config.entrance, Entrance::Random);
+        assert!(!config.text_reactions);
+        assert!(!config.suppress_everyone);
+        assert!(config.show_members);
+        assert_eq!(config.sidebar_width, DEFAULT_PANE_WIDTH);
+        assert_eq!(config.members_width, DEFAULT_PANE_WIDTH);
+        assert_eq!(config.last_channel, 0);
+        assert!(config.muted_channels.is_empty());
+        assert!(config.collapsed_categories.is_empty());
+        assert!(config.hidden_dms.is_empty());
     }
 
     #[test]
@@ -307,6 +650,154 @@ mod tests {
         assert_eq!(config.share_bitrate_kbps, None);
         assert!(config.share_audio);
         assert_eq!(config.share_volume, 1.0);
+    }
+
+    #[test]
+    fn the_old_ptt_key_becomes_the_push_to_talk_binding() {
+        let raw = r#"
+            username = "x"
+            ptt_key = "F8"
+        "#;
+        let mut config: Config = toml::from_str(raw).expect("parses a pre-0.5.0 config");
+        normalize(&mut config);
+
+        assert_eq!(config.keybind(PUSH_TO_TALK), "F8");
+        assert_eq!(
+            config.keybinds.get(PUSH_TO_TALK).map(String::as_str),
+            Some("F8")
+        );
+        assert_eq!(config.ptt_key, "F8");
+    }
+
+    #[test]
+    fn the_keybind_map_wins_over_a_stale_ptt_key() {
+        let raw = r#"
+            username = "x"
+            ptt_key = "F8"
+
+            [keybinds]
+            push_to_talk = "F9"
+        "#;
+        let mut config: Config = toml::from_str(raw).expect("parses both homes of the binding");
+        normalize(&mut config);
+
+        assert_eq!(config.keybind(PUSH_TO_TALK), "F9");
+        assert_eq!(config.ptt_key, "F9");
+    }
+
+    #[test]
+    fn an_empty_ptt_key_falls_back_to_the_default() {
+        let raw = r#"
+            ptt_key = "  "
+        "#;
+        let mut config: Config = toml::from_str(raw).expect("parses an emptied binding");
+        normalize(&mut config);
+
+        assert_eq!(config.keybind(PUSH_TO_TALK), DEFAULT_PTT_KEY);
+        assert_eq!(config.ptt_key, DEFAULT_PTT_KEY);
+    }
+
+    #[test]
+    fn every_action_has_a_default_binding_and_a_scope() {
+        let config = Config::default();
+        for (action, binding, _) in KEYBIND_ACTIONS {
+            assert!(!binding.is_empty(), "{action} has no default binding");
+            assert_eq!(config.keybind(action), binding);
+        }
+        assert_eq!(config.keybind("not_an_action"), "");
+
+        let global: Vec<&str> = KEYBIND_ACTIONS
+            .iter()
+            .filter(|(_, _, global)| *global)
+            .map(|(action, _, _)| *action)
+            .collect();
+        assert_eq!(global, vec![PUSH_TO_TALK, "toggle_mute", "toggle_deafen"]);
+
+        let mut ids: Vec<&str> = KEYBIND_ACTIONS.iter().map(|(id, _, _)| *id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two actions share an id");
+    }
+
+    #[test]
+    fn set_keybind_keeps_the_old_key_in_step_and_ignores_the_unknown() {
+        let mut config = Config::default();
+
+        config.set_keybind(PUSH_TO_TALK, " F10 ");
+        assert_eq!(config.keybind(PUSH_TO_TALK), "F10");
+        assert_eq!(config.ptt_key, "F10");
+
+        config.set_keybind(PUSH_TO_TALK, "");
+        assert_eq!(config.keybind(PUSH_TO_TALK), DEFAULT_PTT_KEY);
+        assert_eq!(config.ptt_key, DEFAULT_PTT_KEY);
+
+        config.set_keybind("quick_switcher", "Ctrl+J");
+        assert_eq!(config.keybind("quick_switcher"), "Ctrl+J");
+
+        config.set_keybind("not_an_action", "Ctrl+Z");
+        assert!(!config.keybinds.contains_key("not_an_action"));
+    }
+
+    #[test]
+    fn normalize_drops_unknown_and_empty_keybinds() {
+        let mut config = Config::default();
+        config
+            .keybinds
+            .insert("not_an_action".to_owned(), "Ctrl+Z".to_owned());
+        config
+            .keybinds
+            .insert("quick_switcher".to_owned(), "  ".to_owned());
+        config
+            .keybinds
+            .insert("settings".to_owned(), "  Ctrl+P  ".to_owned());
+        normalize(&mut config);
+
+        assert!(!config.keybinds.contains_key("not_an_action"));
+        assert!(!config.keybinds.contains_key("quick_switcher"));
+        assert_eq!(config.keybind("quick_switcher"), "Ctrl+K");
+        assert_eq!(config.keybind("settings"), "Ctrl+P");
+    }
+
+    #[test]
+    fn the_defaults_conflict_with_nothing() {
+        assert!(Config::default().keybind_conflicts().is_empty());
+    }
+
+    #[test]
+    fn keybind_conflicts_ignore_case() {
+        let mut config = Config::default();
+        config.set_keybind("quick_switcher", "ctrl+u");
+
+        assert_eq!(
+            config.keybind_conflicts(),
+            vec![("quick_switcher".to_owned(), "toggle_members".to_owned())]
+        );
+    }
+
+    /// The punctuation character and the name it aliases are one binding, so a
+    /// file written by an earlier build clashes the way the name does.
+    #[test]
+    fn a_punctuation_character_is_the_binding_its_name_spells() {
+        let mut config = Config::default();
+        config.set_keybind("quick_switcher", "Ctrl+,");
+
+        assert_eq!(config.keybind("settings"), "Ctrl+Comma");
+        assert_eq!(
+            config.keybind_conflicts(),
+            vec![("quick_switcher".to_owned(), "settings".to_owned())]
+        );
+    }
+
+    /// A binding with more modifiers on the same key is the more specific match,
+    /// not a clash: `Ctrl+M` wins its own press and `M` keeps the bare one.
+    #[test]
+    fn more_modifiers_on_one_key_is_no_conflict() {
+        let mut config = Config::default();
+        config.set_keybind("toggle_mute", "Ctrl+m");
+        config.set_keybind("toggle_deafen", "m");
+
+        assert!(config.keybind_conflicts().is_empty());
     }
 
     #[test]
@@ -347,8 +838,22 @@ mod tests {
             share_bitrate_kbps: Some(8_000),
             share_audio: false,
             share_volume: 0.75,
+            theme: "custom:noir".to_owned(),
+            density: Density::Compact,
+            font_scale: 1.25,
+            entrance: Entrance::Off,
+            text_reactions: true,
+            suppress_everyone: true,
+            show_members: false,
+            sidebar_width: 300.0,
+            members_width: 200.0,
+            last_channel: 12,
+            muted_channels: BTreeSet::from([3, 9]),
+            collapsed_categories: BTreeSet::from([1]),
+            hidden_dms: BTreeSet::from([4, 5, 6]),
             ..Default::default()
         };
+        config.set_keybind("quick_switcher", "Ctrl+J");
         config.set_peer_audio(
             1,
             PeerAudio {
@@ -363,6 +868,9 @@ mod tests {
                 muted: true,
             },
         );
+        // The load-time migration is what fills `keybinds[push_to_talk]`, so the
+        // original has to have been through it too.
+        normalize(&mut config);
 
         let raw = toml::to_string_pretty(&config).expect("serializes");
         let mut round_tripped: Config = toml::from_str(&raw).expect("parses back");
@@ -436,6 +944,58 @@ mod tests {
     }
 
     #[test]
+    fn normalize_clamps_the_appearance_ranges() {
+        let mut config = Config {
+            font_scale: 4.0,
+            sidebar_width: 10.0,
+            members_width: 4_000.0,
+            theme: "  ".to_owned(),
+            ..Config::default()
+        };
+        normalize(&mut config);
+        assert_eq!(config.font_scale, FONT_SCALE_MAX);
+        assert_eq!(config.sidebar_width, PANE_MIN_WIDTH);
+        assert_eq!(config.members_width, PANE_MAX_WIDTH);
+        assert_eq!(config.theme, DEFAULT_THEME);
+
+        config.font_scale = 0.1;
+        config.sidebar_width = f32::NAN;
+        config.theme = "  custom:noir  ".to_owned();
+        normalize(&mut config);
+        assert_eq!(config.font_scale, FONT_SCALE_MIN);
+        assert_eq!(config.sidebar_width, DEFAULT_PANE_WIDTH);
+        assert_eq!(config.theme, "custom:noir");
+
+        config.font_scale = f32::NAN;
+        normalize(&mut config);
+        assert_eq!(config.font_scale, FONT_SCALE_DEFAULT);
+    }
+
+    /// A theme is one of exactly three forms; anything else — a name no build
+    /// knows, or a slug that would reach outside the config directory — is the
+    /// default.
+    #[test]
+    fn normalize_keeps_only_the_three_theme_forms() {
+        let theme = |stored: &str| {
+            let mut config = Config {
+                theme: stored.to_owned(),
+                ..Config::default()
+            };
+            normalize(&mut config);
+            config.theme
+        };
+
+        assert_eq!(theme(DEFAULT_THEME), DEFAULT_THEME);
+        assert_eq!(theme(LIGHT_THEME), LIGHT_THEME);
+        assert_eq!(theme("custom:my-theme"), "custom:my-theme");
+        assert_eq!(theme("solarized"), DEFAULT_THEME);
+        assert_eq!(theme("custom:"), DEFAULT_THEME);
+        assert_eq!(theme("custom:../../x"), DEFAULT_THEME);
+        assert_eq!(theme("custom:My-Theme"), DEFAULT_THEME);
+        assert_eq!(theme("Vorcall-Dark"), DEFAULT_THEME);
+    }
+
+    #[test]
     fn transmit_mode_serializes_snake_case() {
         let config = Config {
             transmit_mode: TransmitMode::VoiceActivation,
@@ -462,5 +1022,26 @@ mod tests {
         assert!(raw.contains("share_audio = true"));
         assert!(!raw.contains("share_bitrate_kbps"));
         assert!(!raw.contains("input_device"));
+    }
+
+    #[test]
+    fn the_appearance_keys_serialize_snake_case() {
+        let mut config = Config {
+            density: Density::Compact,
+            entrance: Entrance::Wink,
+            muted_channels: BTreeSet::from([3]),
+            ..Config::default()
+        };
+        normalize(&mut config);
+
+        let raw = toml::to_string(&config).expect("serializes");
+        assert!(raw.contains(r#"theme = "vorcall-dark""#));
+        assert!(raw.contains(r#"density = "compact""#));
+        assert!(raw.contains(r#"entrance = "wink""#));
+        assert!(raw.contains("text_reactions = false"));
+        assert!(raw.contains("show_members = true"));
+        assert!(raw.contains("muted_channels = ["));
+        assert!(raw.contains("[keybinds]"));
+        assert!(raw.contains(r#"push_to_talk = "Control""#));
     }
 }

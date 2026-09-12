@@ -3,6 +3,7 @@ using System.Text;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Vorcall.Server.Auth;
+using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
 using Vorcall.Server.Updates;
 
@@ -13,11 +14,10 @@ namespace Vorcall.Server.Cli;
 public static class AdminCli
 {
     private const int DefaultInviteDays = 7;
-    private const int MaxInviteDays = 365;
     private const int MaxVersionEcho = 32;
     private const int UsageExitCode = 2;
 
-    public static bool IsCliInvocation(string[] args) => args.Length > 0 && args[0] is "invites" or "users";
+    public static bool IsCliInvocation(string[] args) => args.Length > 0 && args[0] is "invites" or "users" or "server";
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -33,13 +33,14 @@ public static class AdminCli
         var now = DateTime.UtcNow;
         return args[0] switch
         {
-            "invites" => await RunInvitesAsync(db, args, now),
+            "invites" => await RunInvitesAsync(app.Services, db, args, now),
             "users" => await RunUsersAsync(app.Services, db, args, now),
+            "server" => await RunServerAsync(app.Services, db, args, now),
             _ => Usage(),
         };
     }
 
-    private static async Task<int> RunInvitesAsync(AppDbContext db, string[] args, DateTime now)
+    private static async Task<int> RunInvitesAsync(IServiceProvider services, AppDbContext db, string[] args, DateTime now)
     {
         switch (Subcommand(args))
         {
@@ -50,17 +51,10 @@ public static class AdminCli
                     return Usage();
                 }
 
-                // Only the hash is stored, so this is the one and only time the code is legible.
-                var code = Credentials.NewInviteCode();
-                var expiresAt = now.AddDays(days);
-                db.Invites.Add(new Invite
-                {
-                    CodeHash = Credentials.Sha256Hex(code),
-                    CreatedAt = now,
-                    ExpiresAt = expiresAt,
-                });
-                await db.SaveChangesAsync();
+                var invites = services.GetRequiredService<InviteService>();
+                var (_, code, expiresAt) = await invites.CreateAsync(days, createdBy: null, now, CancellationToken.None);
 
+                // Only the hash is stored, so this is the one and only time the code is legible.
                 Console.WriteLine($"Invite code: {Credentials.FormatInviteCode(code)}");
                 Console.WriteLine($"Expires: {Format(expiresAt)}");
                 return 0;
@@ -245,6 +239,52 @@ public static class AdminCli
         }
     }
 
+    private static async Task<int> RunServerAsync(IServiceProvider services, AppDbContext db, string[] args, DateTime now)
+    {
+        var directory = services.GetRequiredService<ServerDirectory>();
+        switch (Subcommand(args))
+        {
+            case "set-owner":
+            {
+                if (Argument(args, 2) is not { } requested || string.IsNullOrWhiteSpace(requested))
+                {
+                    return Usage();
+                }
+
+                var user = await FindUserAsync(db, requested);
+                if (user is null)
+                {
+                    return NoSuchUser();
+                }
+
+                if (!await directory.SetOwnerAsync(user.Id, CancellationToken.None))
+                {
+                    Console.Error.WriteLine($"{user.Username} is banned and cannot own the server.");
+                    return 1;
+                }
+
+                Console.WriteLine($"Server owner set to {user.Username} (id {user.Id}).");
+                return 0;
+            }
+
+            case "show":
+            {
+                var server = await directory.LoadAsync(CancellationToken.None);
+                var owner = server.OwnerId is { } ownerId
+                    ? await db.Users.Where(u => u.Id == ownerId).Select(u => u.Username).FirstOrDefaultAsync() ?? "<none>"
+                    : "<none>";
+
+                Console.WriteLine($"Name: {server.Name}");
+                Console.WriteLine($"Owner: {owner}");
+                Console.WriteLine($"General channel: {server.GeneralChannelId?.ToString(CultureInfo.InvariantCulture) ?? "<none>"}");
+                return 0;
+            }
+
+            default:
+                return Usage();
+        }
+    }
+
     private static Task<User?> FindUserAsync(AppDbContext db, string? username)
         => Credentials.TryNormalizeUsername(username, out _, out var normalized)
             ? db.Users.FirstOrDefaultAsync(u => u.UsernameNormalized == normalized)
@@ -318,7 +358,7 @@ public static class AdminCli
         return args.Length == 4
             && args[2] == "--days"
             && int.TryParse(args[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out days)
-            && days is >= 1 and <= MaxInviteDays;
+            && InviteService.IsValidDays(days);
     }
 
     private static string Subcommand(string[] args) => Argument(args, 1) ?? string.Empty;
@@ -351,6 +391,8 @@ public static class AdminCli
               users outdated [--min X.Y.Z]     list accounts below the published release
               users revoke-sessions <name>     revoke every refresh token of an account
               users set-password <name>        set an account's password and revoke its sessions
+              server set-owner <username>      set who owns the server
+              server show                      show the server's name, owner and general channel
             """);
         return UsageExitCode;
     }
