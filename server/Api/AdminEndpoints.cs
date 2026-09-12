@@ -8,9 +8,10 @@ using Vorcall.Server.Chat;
 namespace Vorcall.Server.Api;
 
 // The admin CLI is a second process with no reach into this one's sockets, so kicking and
-// banning end here. Two gates, both of which answer like a path that does not exist: the request
-// has to come from the host itself, the docker network or a LAN, and it has to carry the admin
-// key. nginx has no location for /api/admin either, so the public side cannot even knock.
+// locking an account out end here. Two gates, both of which answer like a path that does not
+// exist: the request has to come from the host itself, the docker network or a LAN, and it has
+// to carry the admin key. nginx has no location for /api/admin either, so the public side cannot
+// even knock.
 public static class AdminEndpoints
 {
     // Shared with the CLI, which is the only caller these endpoints have.
@@ -25,8 +26,8 @@ public static class AdminEndpoints
         var options = app.Services.GetRequiredService<AdminOptions>();
         var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger(LogCategory);
 
-        // No key is a valid deployment: the CLI's database half still bans and revokes, and the
-        // endpoints that would have to be secret are simply not there.
+        // No key is a valid deployment: the CLI's database half still disables and revokes, and
+        // the endpoints that would have to be secret are simply not there.
         if (options.Key is null)
         {
             logger.LogInformation("admin endpoints disabled: Vorcall:AdminKey is not set");
@@ -73,7 +74,7 @@ public static class AdminEndpoints
         return Results.Json(new { closed });
     }
 
-    // POST /api/admin/refresh-account {"userId":42} -> 204, so a ban or an unban is visible to
+    // POST /api/admin/refresh-account {"userId":42} -> 204, so a lock or an unlock is visible to
     // the next request rather than at the end of the cache's own half minute.
     private static async Task<IResult> RefreshAccountAsync(
         HttpContext context,
@@ -92,7 +93,7 @@ public static class AdminEndpoints
         }
 
         accounts.Invalidate(request.UserId);
-        loggers.CreateLogger(LogCategory).LogInformation("Admin refreshed the ban state of user {UserId}", request.UserId);
+        loggers.CreateLogger(LogCategory).LogInformation("Admin refreshed the lock state of user {UserId}", request.UserId);
         return Results.NoContent();
     }
 

@@ -895,6 +895,8 @@ enum Refreshed {
     AuthRequired(String),
     /// The account is banned; no token will ever be issued again.
     Banned,
+    /// An admin disabled the account; no token will be issued until they undo it.
+    Disabled,
     Failed(ApiFailure),
     /// The UI is gone.
     UiGone,
@@ -1006,12 +1008,19 @@ async fn ensure_fresh(
         return Ok(());
     }
 
-    match refresh_session(endpoints, session, events).await {
+    refresh_outcome(refresh_session(endpoints, session, events).await)
+}
+
+/// What a refresh leaves the connection attempt doing. Split out of
+/// `ensure_fresh` so the cases that end the loop can be pinned without a server.
+fn refresh_outcome(refreshed: Refreshed) -> Result<(), AfterAttempt> {
+    match refreshed {
         Refreshed::Ok => Ok(()),
         Refreshed::AuthRequired(detail) => Err(AfterAttempt::Stop(Some(
             DisconnectReason::AuthRequired(detail),
         ))),
         Refreshed::Banned => Err(AfterAttempt::Stop(Some(DisconnectReason::Banned))),
+        Refreshed::Disabled => Err(AfterAttempt::Stop(Some(DisconnectReason::Disabled))),
         Refreshed::Failed(failure) => Err(refresh_failure_outcome(&failure)),
         Refreshed::UiGone => Err(AfterAttempt::Stop(None)),
     }
@@ -1040,18 +1049,32 @@ async fn refresh_session(
             }
             Refreshed::Ok
         }
+        Err(failure) => refresh_refusal(failure),
+    }
+}
+
+/// Reads a refused refresh. Split out of `refresh_session` so every refusal the
+/// loop must not retry can be pinned without a server.
+fn refresh_refusal(failure: ApiFailure) -> Refreshed {
+    match failure {
         // `PROTOCOL.md` § Moderation: a banned account is a 403 with detail
-        // "banned" — the detail, not the status alone, is what identifies it,
-        // since a proxy/WAF 403 must fall through to the generic failure arm.
-        Err(ApiFailure::Status(403, detail)) if detail == "banned" => {
+        // "banned", and an account an admin disabled a 403 with detail
+        // "account disabled" — the detail, not the status alone, is what
+        // identifies each case, since a proxy/WAF 403 must fall through to the
+        // generic failure arm and back off instead of ending the loop.
+        ApiFailure::Status(403, detail) if detail == "banned" => {
             tracing::warn!("the account is banned; stopping the connection loop");
             Refreshed::Banned
         }
-        Err(ApiFailure::AuthChallenge(detail) | ApiFailure::Status(401, detail)) => {
+        ApiFailure::Status(403, detail) if detail == "account disabled" => {
+            tracing::warn!("the account is disabled; stopping the connection loop");
+            Refreshed::Disabled
+        }
+        ApiFailure::AuthChallenge(detail) | ApiFailure::Status(401, detail) => {
             tracing::warn!("the refresh token was refused; the user must sign in again");
             Refreshed::AuthRequired(detail)
         }
-        Err(failure) => {
+        failure => {
             tracing::warn!(error = %failure, "cannot refresh the access token");
             Refreshed::Failed(failure)
         }
@@ -1364,6 +1387,9 @@ async fn attempt(
                     }
                     Refreshed::Banned => {
                         return AfterAttempt::Stop(Some(DisconnectReason::Banned));
+                    }
+                    Refreshed::Disabled => {
+                        return AfterAttempt::Stop(Some(DisconnectReason::Disabled));
                     }
                     Refreshed::Failed(failure) => return refresh_failure_outcome(&failure),
                     Refreshed::UiGone => return AfterAttempt::Stop(None),
@@ -1689,6 +1715,9 @@ async fn recover_fetch(
         ))),
         Refreshed::Banned => {
             FetchRecovery::Stop(AfterAttempt::Stop(Some(DisconnectReason::Banned)))
+        }
+        Refreshed::Disabled => {
+            FetchRecovery::Stop(AfterAttempt::Stop(Some(DisconnectReason::Disabled)))
         }
         Refreshed::Failed(_) => FetchRecovery::Report(detail),
         Refreshed::UiGone => FetchRecovery::Stop(AfterAttempt::Stop(None)),
@@ -3434,5 +3463,43 @@ mod tests {
 
         let dropped = after_close(None, Retry::BackoffAfterSession);
         assert!(matches!(dropped, AfterAttempt::Reconnect { .. }));
+    }
+
+    #[test]
+    fn a_refused_refresh_stops_the_loop_for_a_disabled_or_banned_account() {
+        let disabled = refresh_refusal(ApiFailure::Status(403, "account disabled".to_owned()));
+        match refresh_outcome(disabled) {
+            Err(AfterAttempt::Stop(Some(DisconnectReason::Disabled))) => {}
+            _ => panic!("a disabled refresh must stop the loop with the disabled reason"),
+        }
+
+        let banned = refresh_refusal(ApiFailure::Status(403, "banned".to_owned()));
+        match refresh_outcome(banned) {
+            Err(AfterAttempt::Stop(Some(DisconnectReason::Banned))) => {}
+            _ => panic!("a banned refresh must stop the loop with the banned reason"),
+        }
+    }
+
+    #[test]
+    fn a_refresh_403_from_anywhere_else_only_backs_off() {
+        let other = refresh_refusal(ApiFailure::Status(403, "Forbidden by proxy".to_owned()));
+        assert!(
+            matches!(other, Refreshed::Failed(_)),
+            "an unknown 403 detail must not be read as an account state"
+        );
+
+        match refresh_outcome(other) {
+            Err(AfterAttempt::Reconnect {
+                after: Retry::Backoff,
+                ..
+            }) => {}
+            _ => panic!("an unknown 403 detail must back off rather than stop the loop"),
+        }
+
+        let challenged = refresh_refusal(ApiFailure::Status(401, "token expired".to_owned()));
+        match refresh_outcome(challenged) {
+            Err(AfterAttempt::Stop(Some(DisconnectReason::AuthRequired(_)))) => {}
+            _ => panic!("a 401 must ask for a new sign-in"),
+        }
     }
 }

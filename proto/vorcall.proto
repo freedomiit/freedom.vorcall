@@ -669,6 +669,7 @@ message Invite {
   int64 used_by = 4;                 // 0 = still unused
   string used_by_username = 5;
   int64 created_by = 6;              // 0 = created outside the API, by the admin CLI
+  int64 revoked_at_unix_ms = 7;      // 0 = not revoked
 }
 
 // REST: GET /api/invites

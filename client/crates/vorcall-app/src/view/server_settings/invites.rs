@@ -24,8 +24,9 @@ const DAYS: [u32; 6] = [1, 7, 14, 30, 90, 365];
 /// The table's columns.
 const CREATED: f32 = 140.0;
 const EXPIRES: f32 = 140.0;
-const USED_BY: f32 = 120.0;
-const MADE_BY: f32 = 120.0;
+const STATE: f32 = 90.0;
+const USED_BY: f32 = 110.0;
+const MADE_BY: f32 = 110.0;
 
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     Column::new()
@@ -103,6 +104,7 @@ fn list<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
             vec![
                 ("Created", CREATED),
                 ("Expires", EXPIRES),
+                ("State", STATE),
                 ("Used by", USED_BY),
                 ("Made by", MADE_BY),
                 ("", 0.0),
@@ -117,10 +119,28 @@ fn list<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     card("Invites", rows, tokens)
 }
 
-/// One invite: when it was made, when it dies, and who used it.
+/// One invite: when it was made, when it dies, which of the three states it is
+/// in, and who used it.
 fn invite_row<'a>(app: &'a App, main: &'a MainState, invite: &'a Invite) -> Element<'a, Message> {
     let tokens = &app.tokens;
     let used = invite.used_by != 0;
+    // Used is read first: revoking refuses a claimed invite, so that is the state
+    // worth showing even if someone tried afterwards.
+    let revoked = !used && invite.revoked_at_unix_ms != 0;
+    let (state, state_color) = if used {
+        ("Used", tokens.text_muted)
+    } else if revoked {
+        ("Revoked", tokens.danger)
+    } else {
+        ("Live", tokens.success)
+    };
+    let spent = if used {
+        "Already used"
+    } else if revoked {
+        "Already revoked"
+    } else {
+        ""
+    };
     let used_by = if used {
         if invite.used_by_username.is_empty() {
             main.server.display_name(invite.used_by).to_owned()
@@ -140,14 +160,18 @@ fn invite_row<'a>(app: &'a App, main: &'a MainState, invite: &'a Invite) -> Elem
     container(cells(vec![
         (cell(&stamp(invite.created_at_unix_ms), tokens), CREATED),
         (cell(&stamp(invite.expires_at_unix_ms), tokens), EXPIRES),
+        (
+            text(state).size(TEXT_BADGE).color(state_color).into(),
+            STATE,
+        ),
         (cell(&used_by, tokens), USED_BY),
         (cell(&made_by, tokens), MADE_BY),
         (
             action(
                 Kind::Ghost,
                 "Revoke",
-                (!used).then_some(Message::Admin(AdminMsg::InviteRevoke(invite.id))),
-                if used { "Already used" } else { "" },
+                (!used && !revoked).then_some(Message::Admin(AdminMsg::InviteRevoke(invite.id))),
+                spent,
                 tokens,
             ),
             0.0,

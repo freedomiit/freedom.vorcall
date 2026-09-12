@@ -37,7 +37,7 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 - `GET /api/attachments/{id}`: the bytes with `Content-Length`, a strong `ETag` (`"<id>-<size>"`), `Cache-Control: private, max-age=31536000, immutable`, and Range supported. `404` when the id is unknown; `403` when the caller may not see it (see Attachments).
 - `POST /api/images` and `GET /api/images/{id}`: see Profiles and images.
 - `GET /api/invites`, `POST /api/invites`, `DELETE /api/invites/{id}`, `GET /api/bans`: see Invites and bans.
-- `POST /api/auth/register`: `400` when the username, password or invite code fail the format rules; `403` when the invite is unknown, used or expired; `409` when the username is taken — and then the invite is **not** consumed; `429` when rate-limited.
+- `POST /api/auth/register`: `400` when the username, password or invite code fail the format rules; `403` when the invite is unknown, used, revoked or expired; `409` when the username is taken — and then the invite is **not** consumed; `429` when rate-limited.
 - `POST /api/auth/login`: `401` is always `ApiError{"invalid username or password"}`, the same body whether the user exists or not. `403` is `ApiError{"banned"}`. `429` carries `Retry-After: <seconds>` when the username is locked or the IP is rate-limited.
 - `POST /api/auth/refresh`: `401` when the token is unknown, expired, revoked or already rotated (see Sessions); `403` `ApiError{"banned"}` when the account is banned; `429` when rate-limited.
 - `POST /api/auth/logout`: always `204`, idempotent; it revokes the presented refresh token. No bearer needed.
@@ -73,7 +73,7 @@ Accounts are invite-only. Every account is a member of the one server from regis
 - **Password** — 8..128 Unicode scalars, no other rules.
 - **Invite code** — 20 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, shown as four groups of five separated by `-`. Input is uppercased and stripped of `-` and whitespace. Single use. The admin CLI creates one with a 7-day expiry by default; `POST /api/invites` takes an explicit validity of 1..365 days. The server stores only the code's hash, so the plaintext is shown once, at creation.
 
-Registration signs the user in and returns tokens. `Hello.nickname` is deprecated and ignored. An invite the admin CLI has revoked (`invites revoke <id>`) is refused like an unknown one (`403`).
+Registration signs the user in and returns tokens. `Hello.nickname` is deprecated and ignored. A revoked invite — `invites revoke <id>` or the Invites page, the same operation either way — is refused like an unknown one (`403`).
 
 **Disabled accounts** — an account lock the admin CLI writes, and a different thing from a ban: `users disable` sets `users.disabled_at`, revokes every refresh token of the account and closes its live connection with close code 4003 "account disabled". From then on login and refresh answer `403` `ApiError{"account disabled"}`, and a still-valid access token fails bearer validation with `401` within 30 s (`DisabledAccounts`, a 30 s cache the CLI's `refresh-account` call invalidates at once). `users enable` clears the flag; the sessions it revoked are not restored. A **ban** is moderation instead, issued from inside the app: a `bans` row, every message of the target tombstoned, the account out of the server — see Moderation.
 
@@ -279,9 +279,9 @@ All four endpoints need the door key, a bearer access token and the permission n
 
 | Endpoint | Permission | Behaviour |
 |---|---|---|
-| `GET /api/invites` | `MANAGE_INVITES` | `200 InviteList` — every invite, used ones included; `used_by` is 0 while unused, `created_by` is 0 for an invite the admin CLI made |
+| `GET /api/invites` | `MANAGE_INVITES` | `200 InviteList` — every invite, used and revoked ones included; `used_by` is 0 while unused, `created_by` is 0 for an invite the admin CLI made, `revoked_at_unix_ms` is 0 unless the invite was revoked |
 | `POST /api/invites` | `MANAGE_INVITES` | body `CreateInviteRequest{days}`, `days` 1..365 (`400` otherwise) → `201 InviteCreated{id, code, expires_at_unix_ms}`. The plaintext `code` appears here and nowhere else: the server keeps only its hash |
-| `DELETE /api/invites/{id}` | `MANAGE_INVITES` | `204`, also for an already-used invite; `404` when the id is unknown |
+| `DELETE /api/invites/{id}` | `MANAGE_INVITES` | `204` — revoking **marks** the row (`revoked_at_unix_ms`) and keeps it in the list; no row is ever deleted. Also `204` for an already-revoked invite, which changes nothing, and for a used one, which is not revocable at all: that row is the audit trail of the account it admitted. `404` when the id is unknown |
 | `GET /api/bans` | `BAN_MEMBERS` | `200 BanList` — `banned_by` is 0 when the account that issued the ban no longer exists |
 
 ## Voice

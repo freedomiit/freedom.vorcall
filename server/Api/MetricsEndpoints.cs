@@ -61,8 +61,9 @@ public static class MetricsEndpoints
         Declare(body, "vorcall_messages_total", "counter", "Chat messages appended.");
         Sample(body, "vorcall_messages_total", metrics.MessagesTotal);
 
-        Declare(body, "vorcall_uploads_total", "counter", "Attachments stored.");
-        Sample(body, "vorcall_uploads_total", metrics.UploadsTotal);
+        Declare(body, "vorcall_uploads_total", "counter", "Attachments and images stored.");
+        Sample(body, "vorcall_uploads_total", "kind=\"attachment\"", metrics.UploadsTotal);
+        Sample(body, "vorcall_uploads_total", "kind=\"image\"", metrics.ImageUploadsTotal);
 
         Declare(body, "vorcall_http_responses_total", "counter", "HTTP responses by status class.");
         Sample(body, "vorcall_http_responses_total", "class=\"2xx\"", metrics.Http2xx);

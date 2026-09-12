@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Vorcall.Server.Data;
+using Vorcall.Server.Metrics;
 
 namespace Vorcall.Server.Attachments;
 
@@ -32,6 +33,7 @@ public sealed record ImageSaveOutcome(ImageSaveOutcome.Kind Status, ImageRecord?
 public sealed class ImageStore(
     AttachmentsOptions options,
     IDbContextFactory<AppDbContext> contexts,
+    ServerMetrics metrics,
     ILogger<ImageStore> logger)
 {
     public const string SubDirectory = "images";
@@ -221,6 +223,7 @@ public sealed class ImageStore(
             uploaderId,
             purpose,
             row.Size);
+        metrics.CountImageUpload();
         return ImageSaveOutcome.Saved(ToRecord(row));
     }
 

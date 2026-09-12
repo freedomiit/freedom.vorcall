@@ -4,8 +4,8 @@ using Vorcall.Server.Data;
 
 namespace Vorcall.Server.Admin;
 
-// Every bearer-authenticated request asks whether the account behind the token is banned, which
-// is one query per request unless the answer is remembered. The cache is short-lived so a ban
+// Every bearer-authenticated request asks whether the account behind the token is disabled, which
+// is one query per request unless the answer is remembered. The cache is short-lived so a lock
 // lands within half a minute even if nothing invalidates it; the CLI's refresh-account call
 // makes it immediate.
 public sealed class DisabledAccounts(IDbContextFactory<AppDbContext> contexts)

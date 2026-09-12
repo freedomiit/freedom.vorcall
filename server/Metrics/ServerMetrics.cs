@@ -8,6 +8,7 @@ public sealed class ServerMetrics
 {
     private long _messagesTotal;
     private long _uploadsTotal;
+    private long _imageUploadsTotal;
     private long _http2xx;
     private long _http4xx;
     private long _http5xx;
@@ -19,6 +20,8 @@ public sealed class ServerMetrics
     public long MessagesTotal => Interlocked.Read(ref _messagesTotal);
 
     public long UploadsTotal => Interlocked.Read(ref _uploadsTotal);
+
+    public long ImageUploadsTotal => Interlocked.Read(ref _imageUploadsTotal);
 
     public long Http2xx => Interlocked.Read(ref _http2xx);
 
@@ -33,6 +36,8 @@ public sealed class ServerMetrics
     public void CountMessage() => Interlocked.Increment(ref _messagesTotal);
 
     public void CountUpload() => Interlocked.Increment(ref _uploadsTotal);
+
+    public void CountImageUpload() => Interlocked.Increment(ref _imageUploadsTotal);
 
     // Only the three classes the exposition carries: a 101 upgrade and a redirect belong to none
     // of them and are counted nowhere rather than folded into a class they are not.

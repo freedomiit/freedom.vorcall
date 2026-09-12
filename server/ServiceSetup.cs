@@ -119,7 +119,7 @@ public static class ServiceSetup
 
                 options.Events = new JwtBearerEvents
                 {
-                    // A ban has to reach the tokens already minted, and this is the one place
+                    // A lock has to reach the tokens already minted, and this is the one place
                     // every bearer goes through: the REST endpoints and the /ws upgrade alike.
                     OnTokenValidated = async context =>
                     {

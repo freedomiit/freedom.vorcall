@@ -43,6 +43,10 @@ public static class InvitesEndpoints
 
                 // 0 for an invite the admin CLI minted, which has no account behind it.
                 CreatedBy = record.CreatedBy ?? 0,
+
+                // 0 is the wire's "not revoked"; a revoked row stays in the list, it is never
+                // deleted.
+                RevokedAtUnixMs = record.RevokedAt is { } revokedAt ? UnixMs(revokedAt) : 0,
             });
         }
 
@@ -89,17 +93,13 @@ public static class InvitesEndpoints
             return refusal;
         }
 
-        if (await invites.RevokeAsync(id, context.RequestAborted))
-        {
-            return Results.NoContent();
-        }
-
-        // A used invite keeps its row as the audit trail of the account it let in, and it cannot be
-        // handed out again either way, so the caller gets what it asked for. Only an id that names
-        // no invite at all is a 404.
-        return await invites.ExistsAsync(id, context.RequestAborted)
-            ? Results.NoContent()
-            : ProtobufBody.Fail(StatusCodes.Status404NotFound, "no such invite");
+        // A used invite keeps its row as the audit trail of the account it let in, and a revoked one
+        // is already in the state the call asks for; neither can be handed out again, so both answer
+        // like a fresh revocation. Only an id that names no invite at all is a 404.
+        var outcome = await invites.RevokeAsync(id, DateTime.UtcNow, context.RequestAborted);
+        return outcome.Status == RevokeStatus.Unknown
+            ? ProtobufBody.Fail(StatusCodes.Status404NotFound, "no such invite")
+            : Results.NoContent();
     }
 
     // Null when the caller may proceed; userId is meaningful only then.

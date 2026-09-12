@@ -45,14 +45,14 @@ public static class AdminCli
         var now = DateTime.UtcNow;
         return args[0] switch
         {
-            "invites" => await RunInvitesAsync(app.Services, db, args, now),
+            "invites" => await RunInvitesAsync(app.Services, args, now),
             "users" => await RunUsersAsync(app.Services, db, args, now),
             "server" => await RunServerAsync(app.Services, db, args, now),
             _ => Usage(),
         };
     }
 
-    private static async Task<int> RunInvitesAsync(IServiceProvider services, AppDbContext db, string[] args, DateTime now)
+    private static async Task<int> RunInvitesAsync(IServiceProvider services, string[] args, DateTime now)
     {
         switch (Subcommand(args))
         {
@@ -74,26 +74,13 @@ public static class AdminCli
 
             case "list":
             {
-                var invites = await db.Invites
-                    .AsNoTracking()
-                    .OrderBy(i => i.Id)
-                    .Select(i => new
-                    {
-                        i.Id,
-                        i.CreatedAt,
-                        i.ExpiresAt,
-                        i.UsedAt,
-                        i.RevokedAt,
-                        Username = db.Users.Where(u => u.Id == i.UsedByUserId).Select(u => u.Username).FirstOrDefault(),
-                    })
-                    .ToListAsync();
-
-                foreach (var invite in invites)
+                var invites = services.GetRequiredService<InviteService>();
+                foreach (var invite in await invites.ListAsync(CancellationToken.None))
                 {
                     // Used first: an invite that was claimed can no longer be revoked, so that is
                     // the state worth seeing even if someone tried afterwards.
-                    var state = invite.UsedAt is not null
-                        ? $"used by {invite.Username ?? "(deleted account)"}"
+                    var state = invite.UsedBy is not null
+                        ? $"used by {invite.UsedByUsername ?? "(deleted account)"}"
                         : invite.RevokedAt is not null ? "revoked"
                         : invite.ExpiresAt <= now ? "expired" : "unused";
                     Console.WriteLine($"{invite.Id}  created {Format(invite.CreatedAt)}  expires {Format(invite.ExpiresAt)}  {state}");
@@ -110,35 +97,28 @@ public static class AdminCli
                     return Usage();
                 }
 
-                var invite = await db.Invites.FirstOrDefaultAsync(i => i.Id == id);
-                if (invite is null)
+                var invites = services.GetRequiredService<InviteService>();
+                var outcome = await invites.RevokeAsync(id, now, CancellationToken.None);
+                switch (outcome.Status)
                 {
-                    Console.Error.WriteLine("No such invite.");
-                    return 1;
-                }
+                    case RevokeStatus.Unknown:
+                        Console.Error.WriteLine("No such invite.");
+                        return 1;
 
-                if (invite.UsedAt is not null)
-                {
-                    Console.Error.WriteLine($"Invite {id} was already used on {Format(invite.UsedAt.Value)}.");
-                    return 1;
-                }
+                    // The row stays as the audit trail of the account it admitted, so there is
+                    // nothing to revoke and the operator is told why.
+                    case RevokeStatus.Used:
+                        Console.Error.WriteLine($"Invite {id} was already used on {Format(outcome.At!.Value)}.");
+                        return 1;
 
-                if (invite.RevokedAt is not null)
-                {
-                    Console.WriteLine($"Invite {id} was already revoked on {Format(invite.RevokedAt.Value)}.");
-                    return 0;
-                }
+                    case RevokeStatus.AlreadyRevoked:
+                        Console.WriteLine($"Invite {id} was already revoked on {Format(outcome.At!.Value)}.");
+                        return 0;
 
-                if (invite.ExpiresAt <= now)
-                {
-                    Console.Error.WriteLine($"Invite {id} expired on {Format(invite.ExpiresAt)} and cannot be used anyway.");
-                    return 1;
+                    default:
+                        Console.WriteLine($"Revoked invite {id}");
+                        return 0;
                 }
-
-                invite.RevokedAt = now;
-                await db.SaveChangesAsync();
-                Console.WriteLine($"Revoked invite {id}");
-                return 0;
             }
 
             default:
