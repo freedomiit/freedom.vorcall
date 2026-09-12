@@ -219,7 +219,14 @@ fn request_join(app: &mut App, channel_id: i64) -> bool {
         return false;
     };
     main.voice.joining = true;
-    if main.send_command(Command::JoinVoice { channel_id }) {
+    // The switches ride the join, so the channel never draws this client unmuted
+    // for the moment between the VoiceState and a VoiceSelfState of its own.
+    let (self_muted, self_deafened) = (main.voice.muted, main.voice.deafened);
+    if main.send_command(Command::JoinVoice {
+        channel_id,
+        self_muted,
+        self_deafened,
+    }) {
         return true;
     }
     main.voice.joining = false;
@@ -488,10 +495,13 @@ fn media_connected(app: &mut App, handoff: EngineHandoff) -> Task<Message> {
     main.voice.joining = false;
     main.voice.peer_audio = peer_audio;
 
-    // The thread outlives a session, so every flag it keeps is set again here.
+    // The switches may have moved between the JoinVoice and the session going live:
+    // the audio thread outlives a session and keeps its own copy of every flag, and
+    // the server heard only the values the join carried.
     app.send_audio(AudioCommand::SetMuted(muted));
     app.send_audio(AudioCommand::SetDeafened(deafened));
     app.send_audio(AudioCommand::SetPtt(ptt_held));
+    push_self_state(app, muted, deafened);
     // `Open` forgets every peer, so the stored tuning follows it rather than
     // preceding it.
     push_peers(app);
@@ -643,6 +653,7 @@ fn toggle_mute(app: &mut App) -> Task<Message> {
     }
     let (muted, deafened) = (voice.muted, voice.deafened);
     push_flags(app, muted, deafened);
+    push_self_state(app, muted, deafened);
     Task::none()
 }
 
@@ -660,6 +671,7 @@ fn toggle_deafen(app: &mut App) -> Task<Message> {
     }
     let (muted, deafened) = (voice.muted, voice.deafened);
     push_flags(app, muted, deafened);
+    push_self_state(app, muted, deafened);
     Task::none()
 }
 
@@ -958,6 +970,24 @@ fn push_flags(app: &App, muted: bool, deafened: bool) {
     }
     app.send_audio(AudioCommand::SetMuted(muted));
     app.send_audio(AudioCommand::SetDeafened(deafened));
+}
+
+/// Tells the channel what this user switched, for the other clients to draw. A send
+/// that fails gets no notice: the flags are local truth either way, and the next
+/// JoinVoice carries them.
+fn push_self_state(app: &mut App, muted: bool, deafened: bool) {
+    let Some(main) = app.main_mut() else {
+        return;
+    };
+    if !main.voice.is_live() {
+        return;
+    }
+    let channel_id = main.voice.channel_id;
+    main.send_command(Command::VoiceSelfState {
+        channel_id,
+        muted,
+        deafened,
+    });
 }
 
 fn push_transmit(app: &App) {

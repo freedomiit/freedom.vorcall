@@ -18,17 +18,27 @@ use crate::view::{AVATAR, TEXT_BODY, TEXT_ROW, TEXT_SECONDARY, TEXT_SECTION, bol
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let tokens = &app.tokens;
 
+    let name = main.server.display_name(main.member_id).to_owned();
+    let handle = format!("@{}", app.username());
     let identity = container(
         row![
             widgets::member_avatar(main, main.member_id, AVATAR, tokens),
             column![
-                text(main.server.display_name(main.member_id).to_owned())
-                    .size(TEXT_SECTION)
-                    .font(bold())
-                    .color(tokens.text_primary),
-                text(format!("@{}", app.username()))
-                    .size(TEXT_ROW)
-                    .color(tokens.text_secondary),
+                widgets::clipped_name(
+                    text(name.clone())
+                        .size(TEXT_SECTION)
+                        .font(bold())
+                        .color(tokens.text_primary),
+                    &name,
+                    tokens,
+                ),
+                widgets::clipped_name(
+                    text(handle.clone())
+                        .size(TEXT_ROW)
+                        .color(tokens.text_secondary),
+                    &handle,
+                    tokens,
+                ),
             ]
             .spacing(2),
         ]

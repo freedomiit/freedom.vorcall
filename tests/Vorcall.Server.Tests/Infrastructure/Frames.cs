@@ -31,9 +31,13 @@ internal static class Frames
     public static ClientFrame React(long messageId, string emoji, bool remove = false)
         => new() { React = new React { MessageId = messageId, Emoji = emoji, Remove = remove } };
 
-    public static ClientFrame JoinVoice(long channelId) => new() { JoinVoice = new JoinVoice { ChannelId = channelId } };
+    public static ClientFrame JoinVoice(long channelId, bool selfMuted = false, bool selfDeafened = false)
+        => new() { JoinVoice = new JoinVoice { ChannelId = channelId, SelfMuted = selfMuted, SelfDeafened = selfDeafened } };
 
     public static ClientFrame LeaveVoice(long channelId) => new() { LeaveVoice = new LeaveVoice { ChannelId = channelId } };
+
+    public static ClientFrame VoiceSelfState(long channelId, bool muted, bool deafened)
+        => new() { VoiceSelfState = new VoiceSelfState { ChannelId = channelId, Muted = muted, Deafened = deafened } };
 
     public static ClientFrame StartShare(long channelId, bool audio = false)
         => new() { StartShare = new StartShare { ChannelId = channelId, Audio = audio } };

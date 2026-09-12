@@ -11,6 +11,7 @@ use crate::app::{App, MainState};
 use crate::theme::ThemeTokens;
 use crate::theme::styles;
 use crate::view::server_settings::{Kind, action, card, cells, heads, rest_status};
+use crate::view::widgets;
 use crate::view::{TEXT_BADGE, TEXT_ROW};
 
 /// The table's columns.
@@ -79,10 +80,13 @@ fn ban_row<'a>(app: &'a App, main: &'a MainState, ban: &'a Ban) -> Element<'a, M
 
     container(cells(vec![
         (
-            text(ban.username.clone())
-                .size(TEXT_ROW)
-                .color(tokens.text_primary)
-                .into(),
+            widgets::clipped_name(
+                text(ban.username.clone())
+                    .size(TEXT_ROW)
+                    .color(tokens.text_primary),
+                &ban.username,
+                tokens,
+            ),
             WHO,
         ),
         (cell(&banned_by, tokens), BY),

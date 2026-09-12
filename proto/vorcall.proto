@@ -202,6 +202,7 @@ message ClientFrame {
     TransferOwnership transfer_ownership = 37;
     VoiceModerate voice_moderate = 38;
     UpdateProfile update_profile = 39;
+    VoiceSelfState voice_self_state = 40;
   }
 }
 
@@ -250,10 +251,20 @@ message React {
 
 message JoinVoice {
   int64 channel_id = 1;           // a voice or DM channel; requires CONNECT (a DM member always may)
+  bool self_muted = 2;            // the joiner's own switches, so nobody sees a flash of unmuted
+  bool self_deafened = 3;
 }
 
 message LeaveVoice {
   int64 channel_id = 1;
+}
+
+// A member's own mute/deafen switches. Display only: the relay's mute is moderation, and a
+// self-muted client simply stops sending.
+message VoiceSelfState {
+  int64 channel_id = 1;
+  bool muted = 2;
+  bool deafened = 3;
 }
 
 message CreateChannel {
@@ -497,6 +508,8 @@ message VoiceMember {
   bool server_muted = 6;
   bool server_deafened = 7;
   bool priority = 8;              // holds PRIORITY_SPEAKER in this channel
+  bool self_muted = 9;            // the member's own switches, unlike the moderator-imposed pair above
+  bool self_deafened = 10;
 }
 
 // Sent only to the joiner: where to send media and with which key.

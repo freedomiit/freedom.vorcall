@@ -325,6 +325,8 @@ fn preview<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
         0 => tokens.text_primary,
         rgb => widgets::color_of(rgb),
     };
+    let name = display_name(main, draft);
+    let handle = format!("@{}", app.username());
     let mut body = column![
         widgets::avatar(
             profile,
@@ -332,13 +334,21 @@ fn preview<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
             tokens,
             picture(main, draft.avatar_image_id),
         ),
-        text(display_name(main, draft))
-            .size(TEXT_SECTION)
-            .font(bold())
-            .color(name_color),
-        text(format!("@{}", app.username()))
-            .size(TEXT_SECONDARY)
-            .color(tokens.text_secondary),
+        widgets::clipped_name(
+            text(name.clone())
+                .size(TEXT_SECTION)
+                .font(bold())
+                .color(name_color),
+            &name,
+            tokens,
+        ),
+        widgets::clipped_name(
+            text(handle.clone())
+                .size(TEXT_SECONDARY)
+                .color(tokens.text_secondary),
+            &handle,
+            tokens,
+        ),
     ]
     .spacing(6);
 

@@ -2,7 +2,6 @@
 //! right.
 
 use iced::alignment::Vertical;
-use iced::widget::text::Wrapping;
 use iced::widget::{
     Space, button, column, container, hover, image, mouse_area, row, rule, scrollable, stack, text,
     tooltip,
@@ -103,7 +102,7 @@ fn ordered<'a>(app: &'a App, main: &'a MainState) -> Vec<&'a Channel> {
 fn search<'a>(app: &'a App, metrics: Metrics) -> Element<'a, Message> {
     let tokens = &app.tokens;
     container(
-        button(
+        button(widgets::row_body(
             row![
                 icons::icon(Icon::Search, widgets::ICON_MARK, tokens.text_muted),
                 text("Find a conversation")
@@ -112,7 +111,7 @@ fn search<'a>(app: &'a App, metrics: Metrics) -> Element<'a, Message> {
             ]
             .spacing(8)
             .align_y(Vertical::Center),
-        )
+        ))
         .width(Length::Fill)
         .height(metrics.height(widgets::ROW_HEIGHT))
         .padding([0.0, 10.0])
@@ -151,21 +150,29 @@ fn conversation<'a>(
             tokens,
         ));
     }
+    let title = main.server.channel_title(channel_id);
+    let last = preview(main, channel_id, partner);
     line = line.push(
         column![
-            text(main.server.channel_title(channel_id))
-                .size(metrics.text(TEXT_BODY))
-                .font(bold())
-                .color(color)
-                .wrapping(Wrapping::None),
-            text(preview(main, channel_id, partner))
-                .size(metrics.text(TEXT_SECONDARY))
-                .color(if unread > 0 {
-                    tokens.text_primary
-                } else {
-                    tokens.text_secondary
-                })
-                .wrapping(Wrapping::None),
+            widgets::clipped_name(
+                text(title.clone())
+                    .size(metrics.text(TEXT_BODY))
+                    .font(bold())
+                    .color(color),
+                &title,
+                tokens,
+            ),
+            widgets::clipped_name(
+                text(last.clone())
+                    .size(metrics.text(TEXT_SECONDARY))
+                    .color(if unread > 0 {
+                        tokens.text_primary
+                    } else {
+                        tokens.text_secondary
+                    }),
+                &last,
+                tokens,
+            ),
         ]
         .width(Length::Fill),
     );
@@ -175,7 +182,7 @@ fn conversation<'a>(
         .ui
         .context_menu
         .is_some_and(|menu| menu.target == MenuTarget::Channel(channel_id));
-    let entry = button(line)
+    let entry = button(widgets::row_body(line))
         .width(Length::Fill)
         .height(metrics.height(DM_ROW_HEIGHT))
         .padding([0.0, 8.0])
@@ -293,11 +300,14 @@ fn profile<'a>(
     let online = main.server.is_online(user_id);
     let mut body = column![
         column![
-            text(main.server.display_name(user_id))
-                .size(metrics.text(TEXT_SECTION))
-                .font(bold())
-                .color(color)
-                .wrapping(Wrapping::None),
+            widgets::clipped_name(
+                text(main.server.display_name(user_id))
+                    .size(metrics.text(TEXT_SECTION))
+                    .font(bold())
+                    .color(color),
+                main.server.display_name(user_id),
+                tokens,
+            ),
             text(match profile {
                 Some(profile) if owner => format!("@{} · Owner", profile.username),
                 Some(profile) => format!("@{}", profile.username),
@@ -460,7 +470,7 @@ fn call_button<'a>(
     let tokens = &app.tokens;
     let joined = main.voice.intent && main.voice.channel_id == channel_id;
 
-    let control = button(
+    let control = button(widgets::row_body(
         row![
             icons::icon(Icon::Speaker, widgets::ICON_MARK, tokens.text_on_accent),
             text("Call")
@@ -470,7 +480,7 @@ fn call_button<'a>(
         ]
         .spacing(8)
         .align_y(Vertical::Center),
-    )
+    ))
     .width(Length::Fill)
     .height(metrics.height(widgets::CONTROL_HEIGHT))
     .style(styles::button::primary(tokens))
@@ -520,10 +530,13 @@ fn in_this_call<'a>(
                     roster.speaking.contains(&user_id),
                     tokens,
                 ),
-                text(main.server.display_name(user_id))
-                    .size(metrics.text(TEXT_SECONDARY))
-                    .color(tokens.text_secondary)
-                    .wrapping(Wrapping::None),
+                widgets::clipped_name(
+                    text(main.server.display_name(user_id))
+                        .size(metrics.text(TEXT_SECONDARY))
+                        .color(tokens.text_secondary),
+                    main.server.display_name(user_id),
+                    tokens,
+                ),
             ]
             .spacing(8)
             .align_y(Vertical::Center),

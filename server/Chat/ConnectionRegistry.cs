@@ -72,6 +72,17 @@ public enum UnwatchShareOutcome
     Unwatched,
 }
 
+public enum VoiceSelfStateOutcome
+{
+    UnknownChannel,
+    NotInVoice,
+    NotLive,
+
+    // Already what the caller says it is, so nothing was broadcast.
+    Unchanged,
+    Set,
+}
+
 // Everything a scrape wants to know about the presence model, read in one pass so the six
 // figures describe the same moment rather than six different ones.
 public readonly record struct RegistrySnapshot(
@@ -659,7 +670,7 @@ public sealed partial class ConnectionRegistry
         CloseSlow(slow);
     }
 
-    public JoinVoiceOutcome JoinVoice(ClientConnection connection, long channelId)
+    public JoinVoiceOutcome JoinVoice(ClientConnection connection, long channelId, bool selfMuted, bool selfDeafened)
     {
         if (connection.UserId is not { } userId)
         {
@@ -710,7 +721,13 @@ public sealed partial class ConnectionRegistry
 
             // CreateSession takes the relay's own lock and calls nothing back into here.
             var session = _relay.CreateSession(channelId, userId, muted, deafened, priority);
-            var slot = new VoiceSlot(connection, session, muted, deafened, priority);
+            var slot = new VoiceSlot(connection, session, muted, deafened, priority)
+            {
+                // Display state the joiner brought with it: a client that rejoins muted must not
+                // flash as unmuted while its first VoiceSelfState is in flight.
+                SelfMuted = selfMuted,
+                SelfDeafened = selfDeafened,
+            };
             channel.Voice[userId] = slot;
 
             Enqueue(connection, VoiceReadyOf(channel, session), ref slow);
@@ -762,6 +779,51 @@ public sealed partial class ConnectionRegistry
         CloseSlow(slow);
         ReleaseVoice(removed);
         return LeaveVoiceOutcome.Left;
+    }
+
+    // The caller's own mute and deafen switches, which the other clients draw and nothing else
+    // reads: they never reach the relay, so a self-mute is never a moderator's to hold. There is no
+    // permission to check either — this is the caller describing itself.
+    public VoiceSelfStateOutcome SetVoiceSelfState(ClientConnection connection, long channelId, bool muted, bool deafened)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return VoiceSelfStateOutcome.NotLive;
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId) || !_memberById.TryGetValue(userId, out var member))
+            {
+                return VoiceSelfStateOutcome.NotLive;
+            }
+
+            if (!VisibleLocked(member, channelId, out var channel))
+            {
+                return VoiceSelfStateOutcome.UnknownChannel;
+            }
+
+            if (!channel.Voice.TryGetValue(userId, out var slot))
+            {
+                return VoiceSelfStateOutcome.NotInVoice;
+            }
+
+            // A client that re-asserts what it already said must not make the server fan a
+            // VoiceState out to the whole channel for nothing.
+            if (slot.SelfMuted == muted && slot.SelfDeafened == deafened)
+            {
+                return VoiceSelfStateOutcome.Unchanged;
+            }
+
+            slot.SelfMuted = muted;
+            slot.SelfDeafened = deafened;
+
+            BroadcastToChannelLocked(channel, VoiceStateOf(channel), except: null, ref slow);
+        }
+
+        CloseSlow(slow);
+        return VoiceSelfStateOutcome.Set;
     }
 
     // A share rides an existing voice session: the media travels on the ssrc the caller already
@@ -1606,6 +1668,8 @@ public sealed partial class ConnectionRegistry
             ServerMuted = slot.Muted,
             ServerDeafened = slot.Deafened,
             Priority = slot.Priority,
+            SelfMuted = slot.SelfMuted,
+            SelfDeafened = slot.SelfDeafened,
         };
 
     // Only ever enqueued to the joiner: it carries that session's media key.
@@ -1784,5 +1848,11 @@ public sealed partial class ConnectionRegistry
         public bool Deafened { get; set; } = deafened;
 
         public bool Priority { get; set; } = priority;
+
+        // The member's own switches, display state for the other clients only: they are never
+        // applied to the relay, so a self-mute stays the member's to undo.
+        public bool SelfMuted { get; set; }
+
+        public bool SelfDeafened { get; set; }
     }
 }

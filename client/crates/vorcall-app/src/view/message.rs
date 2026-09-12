@@ -42,6 +42,13 @@ const PLACEHOLDER_HEIGHT: f32 = 180.0;
 const PLACEHOLDER_ICON: f32 = 28.0;
 /// One button of the strip that appears over a hovered message.
 const ACTION_ICON: f32 = 16.0;
+/// How wide a group's first line draws the author's name before it is cut off.
+/// Left to the row's default wrapping a long name wraps and pushes the role icon,
+/// the crown and the timestamp onto a second line; letting it fill instead would
+/// shove the timestamp to the far right. Sixteen ems of the body's own size is
+/// about thirty characters at Latin text's average advance, so all but the
+/// longest of the 32-scalar names still fit whole.
+const AUTHOR_MAX_WIDTH: f32 = TEXT_BODY * 16.0;
 
 pub fn view<'a>(app: &'a App, main: &'a MainState, chat: &ChatMessage) -> Element<'a, Message> {
     let tokens = &app.tokens;
@@ -185,18 +192,21 @@ fn head<'a>(
         chat.author.clone()
     };
 
-    let mut line = row![
-        mouse_area(
-            text(name)
-                .size(metrics.text(TEXT_BODY))
-                .font(bold())
-                .color(color)
-        )
-        .interaction(mouse::Interaction::Pointer)
-        .on_press(Message::Ui(UiMsg::OpenProfileCard(author_id))),
-    ]
-    .spacing(8)
-    .align_y(Vertical::Bottom);
+    // The press has to cover the name the clip left, so the mouse area goes
+    // outside the clipped box rather than around the whole line.
+    let author = mouse_area(widgets::clipped_name_within(
+        text(name.clone())
+            .size(metrics.text(TEXT_BODY))
+            .font(bold())
+            .color(color),
+        &name,
+        AUTHOR_MAX_WIDTH,
+        tokens,
+    ))
+    .interaction(mouse::Interaction::Pointer)
+    .on_press(Message::Ui(UiMsg::OpenProfileCard(author_id)));
+
+    let mut line = row![author].spacing(8).align_y(Vertical::Bottom);
 
     if let Some(role) = main.server.member_badge_role(author_id) {
         line = line.push(widgets::tooltip_of(

@@ -167,12 +167,15 @@ fn role_row<'a>(
         button(
             row![
                 dot(role.color, tokens),
-                text(role.name.clone()).size(TEXT_ROW).color(if selected {
-                    tokens.text_primary
-                } else {
-                    tokens.text_secondary
-                }),
-                Space::new().width(Length::Fill),
+                widgets::clipped_name(
+                    text(role.name.clone()).size(TEXT_ROW).color(if selected {
+                        tokens.text_primary
+                    } else {
+                        tokens.text_secondary
+                    }),
+                    &role.name,
+                    tokens,
+                ),
                 text(count.to_string())
                     .size(TEXT_BADGE)
                     .color(tokens.text_muted),

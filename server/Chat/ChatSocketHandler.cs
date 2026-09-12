@@ -377,6 +377,9 @@ public sealed class ChatSocketHandler(
             case ClientFrame.PayloadOneofCase.LeaveVoice:
                 return Flow(HandleLeaveVoice(connection, frame.LeaveVoice));
 
+            case ClientFrame.PayloadOneofCase.VoiceSelfState:
+                return Flow(HandleVoiceSelfState(connection, frame.VoiceSelfState));
+
             case ClientFrame.PayloadOneofCase.StartShare:
                 return Flow(HandleStartShare(connection, frame.StartShare));
 
@@ -675,7 +678,7 @@ public sealed class ChatSocketHandler(
             return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
         }
 
-        switch (registry.JoinVoice(connection, channelId))
+        switch (registry.JoinVoice(connection, channelId, join.SelfMuted, join.SelfDeafened))
         {
             case JoinVoiceOutcome.UnknownChannel:
                 return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
@@ -716,6 +719,30 @@ public sealed class ChatSocketHandler(
             case LeaveVoiceOutcome.NotLive:
                 return Dropped(connection, "left voice");
 
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleVoiceSelfState(ClientConnection connection, VoiceSelfState self)
+    {
+        if (!Validation.TryParseChannelId(self.ChannelId, out var channelId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+        }
+
+        switch (registry.SetVoiceSelfState(connection, channelId, self.Muted, self.Deafened))
+        {
+            case VoiceSelfStateOutcome.UnknownChannel:
+                return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+
+            case VoiceSelfStateOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case VoiceSelfStateOutcome.NotLive:
+                return Dropped(connection, "set its own voice state");
+
+            // Unchanged and Set are both silent: the registry has already broadcast whatever moved.
             default:
                 return true;
         }

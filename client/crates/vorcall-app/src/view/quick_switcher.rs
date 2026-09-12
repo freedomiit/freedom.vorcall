@@ -23,6 +23,13 @@ const SWITCHER_WIDTH: f32 = 560.0;
 /// How far down the window the field sits.
 const SWITCHER_TOP: f32 = 80.0;
 const ROW_ICON: f32 = 14.0;
+/// How wide a match's name and the detail beside it may draw before they are cut
+/// off. The row hands its slack to the [`Space`] that holds the unread badge and
+/// the key hint against the right edge, so neither line may fill: half the card
+/// for the name and a quarter for the detail leaves the icon, the badge and the
+/// hint their own room at every width.
+const ROW_NAME_MAX: f32 = SWITCHER_WIDTH * 0.5;
+const ROW_DETAIL_MAX: f32 = SWITCHER_WIDTH * 0.25;
 
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let tokens = &app.tokens;
@@ -106,18 +113,26 @@ fn row_of<'a>(
 
     let mut line = row![
         icons::icon(icon, ROW_ICON, tokens.text_muted),
-        text(entry.name.clone())
-            .size(TEXT_ROW)
-            .color(tokens.text_primary),
+        widgets::clipped_name_within(
+            text(entry.name.clone())
+                .size(TEXT_ROW)
+                .color(tokens.text_primary),
+            &entry.name,
+            ROW_NAME_MAX,
+            tokens,
+        ),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
     if !entry.detail.is_empty() {
-        line = line.push(
+        line = line.push(widgets::clipped_name_within(
             text(entry.detail.clone())
                 .size(TEXT_SECONDARY)
                 .color(tokens.text_muted),
-        );
+            &entry.detail,
+            ROW_DETAIL_MAX,
+            tokens,
+        ));
     }
     line = line.push(Space::new().width(Length::Fill));
     line = line.push(widgets::badge(entry.unread, tokens));

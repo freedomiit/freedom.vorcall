@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::image::Handle;
-use iced::widget::{Space, button, column, container, image, row, stack, text, tooltip};
-use iced::{Background, Color, ContentFit, Element, Length, Theme, border};
+use iced::widget::text::Wrapping;
+use iced::widget::{Space, Text, button, column, container, image, row, stack, text, tooltip};
+use iced::{Background, Color, ContentFit, Element, Length, Renderer, Theme, border};
 use vorcall_core::config::Density;
 use vorcall_core::{Config, Profile, Role};
 
@@ -270,6 +271,69 @@ pub fn tooltip_of<'a>(
     .into()
 }
 
+/// One line of a name, kept inside the width it was given.
+///
+/// iced 0.14 has no measured ellipsis, and a view function has no renderer to
+/// measure with, so the cut is the honest end of the line. Turning wrapping off
+/// only clamps the layout node: a paragraph is still painted past it — over
+/// whatever sits beside it in the row — unless a container with `clip` narrows
+/// the viewport handed to the draw. The tooltip is what keeps the whole name
+/// one hover away.
+pub fn clipped_name<'a>(
+    line: Text<'a, Theme, Renderer>,
+    full: &str,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, Message> {
+    clipped_in(line, full, Bound::Fill, tokens)
+}
+
+/// The same, bounded by a width of its own instead of filling what it is given:
+/// a line that shares its row with whatever comes after it cannot take the slack.
+pub fn clipped_name_within<'a>(
+    line: Text<'a, Theme, Renderer>,
+    full: &str,
+    max_width: f32,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, Message> {
+    clipped_in(line, full, Bound::Within(max_width), tokens)
+}
+
+/// What bounds a clipped line: the width it is given, or one of its own.
+enum Bound {
+    Fill,
+    Within(f32),
+}
+
+/// The one implementation behind both clips, which is what keeps the wrapping off
+/// where no caller can forget it: a forgotten `Wrapping::None` wraps silently
+/// instead of clipping.
+fn clipped_in<'a>(
+    line: Text<'a, Theme, Renderer>,
+    full: &str,
+    bound: Bound,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, Message> {
+    let line = line.wrapping(Wrapping::None);
+    let clipped = match bound {
+        Bound::Fill => container(line.width(Length::Fill)).width(Length::Fill),
+        Bound::Within(max_width) => container(line).max_width(max_width),
+    };
+    tooltip_of(clipped.clip(true), full, tooltip::Position::Bottom, tokens)
+}
+
+/// The content of a fixed-height row, centred in it.
+///
+/// A button lays its content out at the top-left of its padded box — iced has no
+/// vertical alignment there — so a line inside one of the design's row heights
+/// sits against the top with the dead space below it unless something centres
+/// it.
+pub fn row_body<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .width(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+}
+
 /// An unread count. Nothing is drawn for zero.
 pub fn badge<'a>(count: u32, tokens: &'a ThemeTokens) -> Element<'a, Message> {
     if count == 0 {
@@ -522,6 +586,45 @@ pub fn owner_crown<'a>(tokens: &'a ThemeTokens) -> Element<'a, Message> {
     )
 }
 
+/// One of a voice member's mute flags, or nothing when neither is set. A
+/// moderator's flag is drawn loud and wins over the member's own switch, which
+/// is the one they cannot clear themselves; the tooltip says which it is, so the
+/// colour is never the only signal.
+pub fn voice_flag<'a>(
+    glyph: Icon,
+    by_moderator: bool,
+    by_self: bool,
+    moderator_tip: &str,
+    self_tip: &str,
+    position: tooltip::Position,
+    tokens: &'a ThemeTokens,
+) -> Option<Element<'a, Message>> {
+    let (color, tip) = flag_tone(by_moderator, by_self, moderator_tip, self_tip, tokens)?;
+    Some(tooltip_of(
+        icons::icon(glyph, ICON_MARK, color),
+        tip,
+        position,
+        tokens,
+    ))
+}
+
+/// The tone and the wording [`voice_flag`] draws, which is the whole of the rule.
+fn flag_tone<'t>(
+    by_moderator: bool,
+    by_self: bool,
+    moderator_tip: &'t str,
+    self_tip: &'t str,
+    tokens: &ThemeTokens,
+) -> Option<(Color, &'t str)> {
+    if by_moderator {
+        Some((tokens.danger, moderator_tip))
+    } else if by_self {
+        Some((tokens.text_muted, self_tip))
+    } else {
+        None
+    }
+}
+
 /// The colour a role paints what it marks, the theme's own where it has none.
 pub fn role_color(role: &Role, tokens: &ThemeTokens) -> Color {
     if role.color == 0 {
@@ -566,16 +669,27 @@ pub fn user_bar<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
         (Icon::Headphones, "Deafen", tokens.text_secondary)
     };
 
+    let name = main.server.display_name(main.member_id).to_owned();
+    let handle = format!("@{}", main.username);
+
     let bar = row![
         member_avatar_on(main, main.member_id, AVATAR_ROW, tokens.bg_rail, tokens),
         column![
-            text(main.server.display_name(main.member_id).to_owned())
-                .size(metrics.text(TEXT_ROW))
-                .font(bold())
-                .color(tokens.text_primary),
-            text(format!("@{}", main.username))
-                .size(metrics.text(TEXT_BADGE))
-                .color(tokens.text_secondary),
+            clipped_name(
+                text(name.clone())
+                    .size(metrics.text(TEXT_ROW))
+                    .font(bold())
+                    .color(tokens.text_primary),
+                &name,
+                tokens,
+            ),
+            clipped_name(
+                text(handle.clone())
+                    .size(metrics.text(TEXT_BADGE))
+                    .color(tokens.text_secondary),
+                &handle,
+                tokens,
+            ),
         ]
         .width(Length::Fill),
         icon_button_in(
@@ -718,9 +832,128 @@ mod tests {
         assert_eq!(label_count(100), "99+");
     }
 
+    /// A moderator's flag is the one the member cannot clear, so it is the one
+    /// drawn whenever both are set.
+    #[test]
+    fn a_moderators_voice_flag_wins_over_the_members_own_switch() {
+        let tokens = crate::theme::presets::by_name(crate::theme::presets::DARK_SLUG)
+            .expect("the dark preset");
+        assert_eq!(
+            flag_tone(true, true, "moderator", "self", tokens),
+            Some((tokens.danger, "moderator"))
+        );
+        assert_eq!(
+            flag_tone(true, false, "moderator", "self", tokens),
+            Some((tokens.danger, "moderator"))
+        );
+        assert_eq!(
+            flag_tone(false, true, "moderator", "self", tokens),
+            Some((tokens.text_muted, "self"))
+        );
+        assert_eq!(flag_tone(false, false, "moderator", "self", tokens), None);
+    }
+
     #[test]
     fn a_colour_the_server_sends_is_read_as_rgb() {
         assert_eq!(color_of(0x00_C8_10_2E), Color::from_rgb8(0xC8, 0x10, 0x2E));
         assert_eq!(color_of(0), Color::BLACK);
+    }
+
+    /// What [`crate::view::composer`]'s panel is keyed for: the mention picker,
+    /// the reply bar and the attachment strip are pushed **above** the editor
+    /// while the user is typing in it. A plain column reconciles its children by
+    /// index, so inserting one hands the editor's state to the new row and
+    /// rebuilds the editor from nothing — the focus is lost mid-word. A keyed
+    /// column compares the hints instead and the editor's state survives.
+    ///
+    /// `Tree::new` only calls `tag`, `state` and `children`, so none of this
+    /// needs a renderer instance.
+    mod continuity {
+        use iced::advanced::text::highlighter::PlainText;
+        use iced::advanced::widget::Tree;
+        use iced::advanced::widget::operation::Focusable;
+        use iced::advanced::widget::tree::Tag;
+        use iced::widget::{Column, keyed, text_editor};
+
+        use super::*;
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Slot {
+            Mentions,
+            Input,
+            Footer,
+        }
+
+        type EditorState = text_editor::State<PlainText>;
+
+        fn editor_state(tree: &Tree) -> Option<&EditorState> {
+            if tree.tag == Tag::of::<EditorState>() {
+                Some(tree.state.downcast_ref::<EditorState>())
+            } else {
+                tree.children.iter().find_map(editor_state)
+            }
+        }
+
+        fn editor_state_mut(tree: &mut Tree) -> Option<&mut EditorState> {
+            if tree.tag == Tag::of::<EditorState>() {
+                Some(tree.state.downcast_mut::<EditorState>())
+            } else {
+                tree.children.iter_mut().find_map(editor_state_mut)
+            }
+        }
+
+        fn focus(tree: &mut Tree) {
+            Focusable::focus(editor_state_mut(tree).expect("the editor's state"));
+        }
+
+        fn is_focused(tree: &Tree) -> bool {
+            editor_state(tree).expect("the editor's state").is_focused()
+        }
+
+        #[test]
+        fn a_keyed_column_keeps_the_editor_focused_when_a_row_is_inserted_above_it() {
+            let content = text_editor::Content::new();
+
+            let before: Element<'_, Message> = keyed::Column::new()
+                .width(Length::Fill)
+                .push(Slot::Input, text_editor(&content))
+                .push(Slot::Footer, text("footer"))
+                .into();
+            let mut tree = Tree::new(&before);
+            focus(&mut tree);
+
+            let after: Element<'_, Message> = keyed::Column::new()
+                .width(Length::Fill)
+                .push(Slot::Mentions, text("mentions"))
+                .push(Slot::Input, text_editor(&content))
+                .push(Slot::Footer, text("footer"))
+                .into();
+            tree.diff(&after);
+
+            assert!(is_focused(&tree));
+        }
+
+        #[test]
+        fn a_plain_column_loses_the_focus_when_a_row_is_inserted_above_it() {
+            let content = text_editor::Content::new();
+
+            let before: Element<'_, Message> = Column::new()
+                .width(Length::Fill)
+                .push(text_editor(&content))
+                .push(text("footer"))
+                .into();
+            let mut tree = Tree::new(&before);
+            focus(&mut tree);
+
+            let after: Element<'_, Message> = Column::new()
+                .width(Length::Fill)
+                .push(text("mentions"))
+                .push(text_editor(&content))
+                .push(text("footer"))
+                .into();
+            tree.diff(&after);
+
+            assert!(!is_focused(&tree));
+        }
     }
 }

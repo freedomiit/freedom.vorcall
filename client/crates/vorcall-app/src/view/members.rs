@@ -2,7 +2,6 @@
 //! role, then Online, then Offline.
 
 use iced::alignment::Vertical;
-use iced::widget::text::Wrapping;
 use iced::widget::{
     Space, button, column, container, mouse_area, row, rule, scrollable, text, tooltip,
 };
@@ -100,6 +99,7 @@ fn member_row<'a>(
         rgb => widgets::color_of(rgb),
     };
 
+    let name = main.server.display_name(user_id);
     let mut line = row![
         widgets::member_avatar_on(
             main,
@@ -108,12 +108,14 @@ fn member_row<'a>(
             tokens.bg_sidebar,
             tokens
         ),
-        text(main.server.display_name(user_id))
-            .size(metrics.text(TEXT_BODY))
-            .font(bold())
-            .color(color)
-            .wrapping(Wrapping::None)
-            .width(Length::Fill),
+        widgets::clipped_name(
+            text(name)
+                .size(metrics.text(TEXT_BODY))
+                .font(bold())
+                .color(color),
+            name,
+            tokens,
+        ),
     ]
     .spacing(10)
     .align_y(Vertical::Center);
@@ -137,15 +139,40 @@ fn member_row<'a>(
         .iter()
         .find_map(|(channel_id, roster)| Some((*channel_id, roster.members.get(&user_id)?)))
     {
-        if member.server_muted {
-            line = line.push(icons::icon(Icon::MicOff, widgets::ICON_MARK, tokens.danger));
+        // One's own switches are known here before the server has echoed them, so
+        // the icon flips on the press rather than on the round trip.
+        let self_muted = if user_id == main.member_id {
+            main.voice.muted
+        } else {
+            member.self_muted
+        };
+        let self_deafened = if user_id == main.member_id {
+            main.voice.deafened
+        } else {
+            member.self_deafened
+        };
+
+        if let Some(mark) = widgets::voice_flag(
+            Icon::MicOff,
+            member.server_muted,
+            self_muted,
+            "Muted by a moderator",
+            "Muted",
+            tooltip::Position::Left,
+            tokens,
+        ) {
+            line = line.push(mark);
         }
-        if member.server_deafened {
-            line = line.push(icons::icon(
-                Icon::HeadphonesOff,
-                widgets::ICON_MARK,
-                tokens.danger,
-            ));
+        if let Some(mark) = widgets::voice_flag(
+            Icon::HeadphonesOff,
+            member.server_deafened,
+            self_deafened,
+            "Deafened by a moderator",
+            "Deafened",
+            tooltip::Position::Left,
+            tokens,
+        ) {
+            line = line.push(mark);
         }
         if member.sharing {
             line = line.push(widgets::watch_badge(
@@ -167,7 +194,7 @@ fn member_row<'a>(
         .ui
         .context_menu
         .is_some_and(|menu| menu.target == MenuTarget::Member(user_id));
-    let entry = button(line)
+    let entry = button(widgets::row_body(line))
         .width(Length::Fill)
         .height(metrics.height(widgets::MEMBER_ROW_HEIGHT))
         .padding([0.0, 8.0])

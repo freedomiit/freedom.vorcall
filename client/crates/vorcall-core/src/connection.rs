@@ -34,7 +34,8 @@ use vorcall_proto::v1::{
     React, Reaction, ReorderCategories, ReorderChannels, ReorderRoles, Role, SendMessage, Server,
     ServerFrame, ServerSnapshot, SetMemberRoles, SetNickname, SetOverride, StartShare, StopShare,
     TransferOwnership, UnbanMember, UnwatchShare, UpdateCategory, UpdateChannel, UpdateProfile,
-    UpdateRole, UpdateServer, VoiceMember, VoiceModerate, WatchShare, client_frame, server_frame,
+    UpdateRole, UpdateServer, VoiceMember, VoiceModerate, VoiceSelfState, WatchShare, client_frame,
+    server_frame,
 };
 
 use crate::admin;
@@ -129,9 +130,20 @@ pub enum Command {
     },
     JoinVoice {
         channel_id: i64,
+        /// The joiner's own switches, so the channel never sees a flash of
+        /// unmuted while the first `VoiceSelfState` is in flight.
+        self_muted: bool,
+        self_deafened: bool,
     },
     LeaveVoice {
         channel_id: i64,
+    },
+    /// The caller's own mute and deafen, for the other clients to draw. Display
+    /// only: the relay is never told, so a self-mute stays this user's to undo.
+    VoiceSelfState {
+        channel_id: i64,
+        muted: bool,
+        deafened: bool,
     },
     /// Sent once the local capture is running; idempotent server-side.
     StartShare {
@@ -175,6 +187,7 @@ impl Command {
             Self::FetchImage { .. } => "FetchImage",
             Self::JoinVoice { .. } => "JoinVoice",
             Self::LeaveVoice { .. } => "LeaveVoice",
+            Self::VoiceSelfState { .. } => "VoiceSelfState",
             Self::StartShare { .. } => "StartShare",
             Self::StopShare { .. } => "StopShare",
             Self::WatchShare { .. } => "WatchShare",
@@ -1207,12 +1220,12 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
             tracing::debug!(kind, "cannot manage the server while disconnected");
             events.send(Event::AdminDropped { kind }).await.is_ok()
         }
-        // No event: the UI re-sends JoinVoice after every Connected.
-        Command::JoinVoice { channel_id } | Command::LeaveVoice { channel_id } => {
-            tracing::debug!(
-                channel_id,
-                "cannot change voice membership while disconnected"
-            );
+        // No event: the UI re-sends JoinVoice after every Connected, and it carries
+        // the self flags, so a dropped VoiceSelfState is re-asserted by that join.
+        Command::JoinVoice { channel_id, .. }
+        | Command::LeaveVoice { channel_id }
+        | Command::VoiceSelfState { channel_id, .. } => {
+            tracing::debug!(channel_id, "cannot change voice state while disconnected");
             true
         }
         // No event: the UI re-asserts the share state after the next VoiceReady.
@@ -2704,13 +2717,25 @@ where
                         'live, sink, "React",
                         client_frame::Payload::React(React { message_id, emoji, remove })
                     ),
-                    Command::JoinVoice { channel_id } => send_or_break!(
+                    Command::JoinVoice { channel_id, self_muted, self_deafened } => send_or_break!(
                         'live, sink, "JoinVoice",
-                        client_frame::Payload::JoinVoice(JoinVoice { channel_id })
+                        client_frame::Payload::JoinVoice(JoinVoice {
+                            channel_id,
+                            self_muted,
+                            self_deafened,
+                        })
                     ),
                     Command::LeaveVoice { channel_id } => send_or_break!(
                         'live, sink, "LeaveVoice",
                         client_frame::Payload::LeaveVoice(LeaveVoice { channel_id })
+                    ),
+                    Command::VoiceSelfState { channel_id, muted, deafened } => send_or_break!(
+                        'live, sink, "VoiceSelfState",
+                        client_frame::Payload::VoiceSelfState(VoiceSelfState {
+                            channel_id,
+                            muted,
+                            deafened,
+                        })
                     ),
                     Command::StartShare { channel_id, audio } => send_or_break!(
                         'live, sink, "StartShare",

@@ -3,7 +3,9 @@
 
 use iced::alignment::Vertical;
 use iced::widget::text_editor::{Binding, KeyPress};
-use iced::widget::{Id, Space, button, column, container, image, row, text, text_editor, tooltip};
+use iced::widget::{
+    Id, Space, button, column, container, image, keyed, row, text, text_editor, tooltip,
+};
 use iced::{Element, Length, Padding, keyboard};
 use vorcall_core::mentions::{self, PALETTE};
 use vorcall_core::{Attachment, attachments, permissions};
@@ -32,6 +34,26 @@ const EXCERPT_MAX: usize = 60;
 /// The thumbnail a pending attachment is drawn as.
 const THUMB: f32 = 40.0;
 
+/// Bound on a suggestion's display name, so the `@handle` beside it keeps its
+/// place next to the name instead of being pushed to the popover's right edge.
+/// Sixteen em is about thirty Latin characters, comfortably past the common
+/// case without letting the longest of the 32 a name may carry take the row.
+const MENTION_NAME_MAX: f32 = TEXT_SECONDARY * 16.0;
+
+/// The panel's slots, in the order they are drawn. The column is keyed by these
+/// because a positional `Column` rebuilds `text_editor::State` — and drops the
+/// focus mid-word — whenever a row above the editor appears or disappears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Mentions,
+    Banner,
+    Warning,
+    Strip,
+    Palette,
+    Input,
+    Footer,
+}
+
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let tokens = &app.tokens;
     let metrics = Metrics::of(&app.config);
@@ -43,30 +65,29 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let can_attach = allowed(permissions::ATTACH_FILES);
     let can_everyone = allowed(permissions::MENTION_EVERYONE);
 
-    let mut panel = column![]
+    let mentions = composer
+        .mention_query
+        .as_deref()
+        .and_then(|query| mention_list(app, main, query, metrics));
+    let attachment_strip = (!composer.attachments.is_empty() || composer.uploading > 0)
+        .then(|| strip(app, main, metrics));
+    let palette =
+        (main.chat.reacting == Some(COMPOSER_PALETTE)).then(|| emoji_palette(app, metrics));
+
+    let panel = keyed::Column::new()
         .spacing(6)
         .padding(Padding::ZERO.left(16.0).right(16.0).bottom(8.0))
-        .width(Length::Fill);
-
-    if let Some(query) = &composer.mention_query
-        && let Some(list) = mention_list(app, main, query, metrics)
-    {
-        panel = panel.push(list);
-    }
-    if let Some(banner) = banner(app, main, metrics) {
-        panel = panel.push(banner);
-    }
-    if let Some(warning) = everyone_warning(app, main, can_everyone, metrics) {
-        panel = panel.push(warning);
-    }
-    if !composer.attachments.is_empty() || composer.uploading > 0 {
-        panel = panel.push(strip(app, main, metrics));
-    }
-    if main.chat.reacting == Some(COMPOSER_PALETTE) {
-        panel = panel.push(emoji_palette(app, metrics));
-    }
-    panel = panel.push(input(app, main, can_send, can_attach, metrics));
-    panel = panel.push(footer(app, main, can_send, metrics));
+        .width(Length::Fill)
+        .push_maybe(Slot::Mentions, mentions)
+        .push_maybe(Slot::Banner, banner(app, main, metrics))
+        .push_maybe(
+            Slot::Warning,
+            everyone_warning(app, main, can_everyone, metrics),
+        )
+        .push_maybe(Slot::Strip, attachment_strip)
+        .push_maybe(Slot::Palette, palette)
+        .push(Slot::Input, input(app, main, can_send, can_attach, metrics))
+        .push(Slot::Footer, footer(app, main, can_send, metrics));
 
     container(panel)
         .width(Length::Fill)
@@ -366,11 +387,17 @@ fn mention_list<'a>(
 
     let mut list = column![].spacing(2).width(Length::Fill);
     for (user_id, username) in names {
+        let display = main.server.display_name(user_id);
         let line = row![
             widgets::member_avatar(main, user_id, widgets::AVATAR_OCCUPANT, tokens),
-            text(main.server.display_name(user_id))
-                .size(metrics.text(TEXT_SECONDARY))
-                .color(tokens.text_primary),
+            widgets::clipped_name_within(
+                text(display)
+                    .size(metrics.text(TEXT_SECONDARY))
+                    .color(tokens.text_primary),
+                display,
+                MENTION_NAME_MAX,
+                tokens,
+            ),
             text(format!("@{username}"))
                 .size(metrics.text(TEXT_BADGE))
                 .color(tokens.text_muted),

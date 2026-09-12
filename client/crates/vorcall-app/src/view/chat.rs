@@ -2,7 +2,6 @@
 //! the stage over a slimmer list, while a share is being watched here.
 
 use iced::alignment::Vertical;
-use iced::widget::text::Wrapping;
 use iced::widget::{Id, Space, button, column, container, row, rule, scrollable, stack, text};
 use iced::{Element, Length, Padding};
 use vorcall_core::ChannelKind;
@@ -29,6 +28,12 @@ const STAGE_PORTION: u16 = 3;
 const LIST_PORTION: u16 = 2;
 /// The separator between a channel's name and its topic.
 const SEPARATOR_HEIGHT: f32 = 20.0;
+/// How wide a channel's name may draw in the header before it is cut off. The
+/// name cannot take the rest of the bar the way a DM's title does — the topic and
+/// the header's switches sit after it — so it is bounded instead. Sixteen ems of
+/// the title's own size is about thirty characters at Latin text's average
+/// advance, so all but the longest of the 32-scalar names still fit whole.
+const TITLE_MAX_WIDTH: f32 = TEXT_TITLE * 16.0;
 
 pub fn pane<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let tokens = &app.tokens;
@@ -103,14 +108,15 @@ fn header<'a>(app: &'a App, main: &'a MainState, metrics: Metrics) -> Element<'a
                     tokens,
                 ));
             }
-            bar = bar.push(
-                text(main.server.channel_title(channel_id))
+            let title = main.server.channel_title(channel_id);
+            bar = bar.push(widgets::clipped_name(
+                text(title.clone())
                     .size(metrics.text(TEXT_TITLE))
                     .font(bold())
-                    .color(tokens.text_primary)
-                    .wrapping(Wrapping::None)
-                    .width(Length::Fill),
-            );
+                    .color(tokens.text_primary),
+                &title,
+                tokens,
+            ));
         }
         Some(channel_id) => {
             let kind = main.server.channel(channel_id).map(channel_kind);
@@ -123,13 +129,16 @@ fn header<'a>(app: &'a App, main: &'a MainState, metrics: Metrics) -> Element<'a
                 widgets::ICON_SIZE,
                 tokens.text_secondary,
             ));
-            bar = bar.push(
-                text(main.server.channel_title(channel_id))
+            let title = main.server.channel_title(channel_id);
+            bar = bar.push(widgets::clipped_name_within(
+                text(title.clone())
                     .size(metrics.text(TEXT_TITLE))
                     .font(bold())
-                    .color(tokens.text_primary)
-                    .wrapping(Wrapping::None),
-            );
+                    .color(tokens.text_primary),
+                &title,
+                TITLE_MAX_WIDTH,
+                tokens,
+            ));
             let topic = main
                 .server
                 .channel(channel_id)
@@ -142,13 +151,13 @@ fn header<'a>(app: &'a App, main: &'a MainState, metrics: Metrics) -> Element<'a
                     container(rule::vertical(1.0).style(styles::rule(tokens)))
                         .height(SEPARATOR_HEIGHT),
                 );
-                bar = bar.push(
-                    text(topic)
+                bar = bar.push(widgets::clipped_name(
+                    text(topic.clone())
                         .size(metrics.text(TEXT_ROW))
-                        .color(tokens.text_secondary)
-                        .wrapping(Wrapping::None)
-                        .width(Length::Fill),
-                );
+                        .color(tokens.text_secondary),
+                    &topic,
+                    tokens,
+                ));
             }
         }
         None => bar = bar.push(Space::new().width(Length::Fill)),

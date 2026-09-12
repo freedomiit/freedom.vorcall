@@ -681,7 +681,11 @@ async fn wait_for_voice(
                 tracing::info!(channel_id, %name, "joining voice");
                 resolved = Some((channel_id, name));
                 if commands
-                    .send(Command::JoinVoice { channel_id })
+                    .send(Command::JoinVoice {
+                        channel_id,
+                        self_muted: false,
+                        self_deafened: false,
+                    })
                     .await
                     .is_err()
                 {

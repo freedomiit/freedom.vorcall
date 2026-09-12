@@ -674,6 +674,8 @@ mod tests {
             server_muted: false,
             server_deafened: false,
             priority: false,
+            self_muted: false,
+            self_deafened: false,
         }
     }
 

@@ -25,6 +25,12 @@ const AVATAR_LEFT: f32 = 14.0;
 const BODY_TOP: f32 = CARD_AVATAR / 2.0 + 8.0;
 /// What the card is assumed to cost in height while it is being placed.
 const CARD_HEIGHT: f32 = 320.0;
+/// How wide the heading draws the member's name before it is cut off: the card's
+/// own width, less the 14 px of padding on either side of the body, less the
+/// ~80 px the heading's worst case spends after the name — the presence dot, the
+/// crown, the "Owner" label and the three gaps between them. Without the cap a
+/// long name pushes all three off the card.
+const HEAD_NAME_MAX: f32 = CARD_WIDTH - 28.0 - 80.0;
 
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let Some(card) = app.ui.profile_card else {
@@ -36,11 +42,17 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let me = user_id == main.member_id;
     let owner = user_id != 0 && user_id == main.server.server.owner_id;
 
+    let name = main.server.display_name(user_id).to_owned();
     let mut head = row![
-        text(main.server.display_name(user_id).to_owned())
-            .size(TEXT_SECTION)
-            .font(bold())
-            .color(name_color(app, main, user_id)),
+        widgets::clipped_name_within(
+            text(name.clone())
+                .size(TEXT_SECTION)
+                .font(bold())
+                .color(name_color(app, main, user_id)),
+            &name,
+            HEAD_NAME_MAX,
+            tokens,
+        ),
         widgets::presence_dot(main.server.is_online(user_id), tokens),
     ]
     .spacing(8)

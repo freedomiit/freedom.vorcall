@@ -26,7 +26,7 @@ directories = "6"
 futures = "0.3"
 # Already in the lock through zbus; used directly for key and signature encoding.
 hex = "0.4"
-iced = { version = "0.14", features = ["tokio", "canvas", "image-without-codecs", "svg"] }
+iced = { version = "0.14", features = ["tokio", "canvas", "image-without-codecs", "svg", "advanced"] }
 # Attachments are decoded off the UI thread, so iced only ever receives RGBA.
 image = { version = "0.25", default-features = false, features = [
     "png",

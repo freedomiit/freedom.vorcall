@@ -6,7 +6,6 @@
 //! a channel that is no longer readable.
 
 use iced::alignment::Vertical;
-use iced::widget::text::Wrapping;
 use iced::widget::tooltip;
 use iced::widget::{
     Column, Space, button, column, container, mouse_area, row, rule, scrollable, slider, text,
@@ -133,14 +132,14 @@ fn header<'a>(app: &'a App, main: &'a MainState, metrics: Metrics) -> Element<'a
         main.server.server.name.as_str()
     };
 
-    let mut bar = row![
+    let mut bar = row![widgets::clipped_name(
         text(name)
             .size(metrics.text(TEXT_TITLE))
             .font(bold())
-            .color(tokens.text_primary)
-            .wrapping(Wrapping::None)
-            .width(Length::Fill),
-    ]
+            .color(tokens.text_primary),
+        name,
+        tokens,
+    )]
     .spacing(8)
     .align_y(Vertical::Center);
 
@@ -265,9 +264,13 @@ fn channel_row<'a>(
     };
     let name = text(channel.name.as_str())
         .size(metrics.text(TEXT_ROW))
-        .color(color)
-        .wrapping(Wrapping::None)
-        .width(Length::Fill);
+        .color(color);
+    // Bold is what an unread text channel reads as, the way the design has it.
+    let name = if unread > 0 && !muted && !voice {
+        name.font(bold())
+    } else {
+        name
+    };
 
     let mut line = row![
         icons::icon(
@@ -275,12 +278,7 @@ fn channel_row<'a>(
             ROW_ICON,
             color
         ),
-        // Bold is what an unread text channel reads as, the way the design has it.
-        if unread > 0 && !muted && !voice {
-            name.font(bold())
-        } else {
-            name
-        },
+        widgets::clipped_name(name, channel.name.as_str(), tokens),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
@@ -320,7 +318,7 @@ fn channel_row<'a>(
     };
     let open = opened_menu(app, MenuTarget::Channel(channel.id));
 
-    let entry = button(line)
+    let entry = button(widgets::row_body(line))
         .width(Length::Fill)
         .height(metrics.height(widgets::ROW_HEIGHT))
         .padding([0.0, 8.0])
@@ -349,22 +347,31 @@ fn occupant<'a>(
     let roster = main.voice.rosters.get(&channel_id);
     let speaking = roster.is_some_and(|roster| roster.speaking.contains(&user_id));
     let sharing = roster.is_some_and(|roster| roster.sharing.contains_key(&user_id));
-    // The server's flags are what everyone sees; this account's own switches are
-    // live only for its own row.
-    let muted = member.server_muted || (me && main.voice.muted);
-    let deafened = member.server_deafened || (me && main.voice.deafened);
+    // One's own switches are known here before the server has echoed them, so the
+    // icon flips on the press rather than on the round trip.
+    let self_muted = if me {
+        main.voice.muted
+    } else {
+        member.self_muted
+    };
+    let self_deafened = if me {
+        main.voice.deafened
+    } else {
+        member.self_deafened
+    };
 
+    let name = main.server.display_name(user_id);
     let mut line = row![
         widgets::speaking_avatar(main, user_id, widgets::AVATAR_OCCUPANT, speaking, tokens),
-        text(main.server.display_name(user_id))
-            .size(metrics.text(TEXT_ROW))
-            .color(if speaking {
+        widgets::clipped_name(
+            text(name).size(metrics.text(TEXT_ROW)).color(if speaking {
                 tokens.text_primary
             } else {
                 tokens.text_secondary
-            })
-            .wrapping(Wrapping::None)
-            .width(Length::Fill),
+            }),
+            name,
+            tokens,
+        ),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
@@ -377,15 +384,27 @@ fn occupant<'a>(
             tokens,
         ));
     }
-    if muted {
-        line = line.push(icons::icon(Icon::MicOff, widgets::ICON_MARK, tokens.danger));
+    if let Some(mark) = widgets::voice_flag(
+        Icon::MicOff,
+        member.server_muted,
+        self_muted,
+        "Muted by a moderator",
+        "Muted",
+        tooltip::Position::Bottom,
+        tokens,
+    ) {
+        line = line.push(mark);
     }
-    if deafened {
-        line = line.push(icons::icon(
-            Icon::HeadphonesOff,
-            widgets::ICON_MARK,
-            tokens.danger,
-        ));
+    if let Some(mark) = widgets::voice_flag(
+        Icon::HeadphonesOff,
+        member.server_deafened,
+        self_deafened,
+        "Deafened by a moderator",
+        "Deafened",
+        tooltip::Position::Bottom,
+        tokens,
+    ) {
+        line = line.push(mark);
     }
     if sharing {
         line = line.push(widgets::watch_badge(main, channel_id, user_id, tokens));
@@ -527,18 +546,19 @@ fn voice_card<'a>(
         tokens,
     ));
 
+    let title = format!("{}{ping}", main.server.channel_title(voice.channel_id));
     let mut lines = column![
         text(state)
             .size(metrics.text(TEXT_SECONDARY))
             .font(bold())
             .color(state_color),
-        text(format!(
-            "{}{ping}",
-            main.server.channel_title(voice.channel_id)
-        ))
-        .size(metrics.text(TEXT_SECONDARY))
-        .color(tokens.text_secondary)
-        .wrapping(Wrapping::None),
+        widgets::clipped_name(
+            text(title.clone())
+                .size(metrics.text(TEXT_SECONDARY))
+                .color(tokens.text_secondary),
+            &title,
+            tokens,
+        ),
     ];
     if let Some(stats) = voice.share.stats.as_ref().filter(|_| voice.share.active) {
         let mut share_line = row![

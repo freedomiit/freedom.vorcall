@@ -22,7 +22,7 @@ pub mod toasts;
 pub mod widgets;
 
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{Id, Space, button, column, container, row, stack, text, text_input};
+use iced::widget::{Id, Space, button, column, container, keyed, row, stack, text, text_input};
 use iced::{Element, Font, Length, font, window};
 use vorcall_core::config;
 
@@ -62,6 +62,14 @@ pub const AVATAR: f32 = 40.0;
 pub const AVATAR_SMALL: f32 = 24.0;
 /// How wide a field on the sign-in screen is.
 const FIELD_WIDTH: f32 = 320.0;
+
+/// The shell's stacked layers, keyed so the update banner coming and going does
+/// not reset the state of everything under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    Banner,
+    Body,
+}
 
 pub fn bold() -> Font {
     Font {
@@ -141,17 +149,22 @@ fn shell<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
         .height(Length::Fill);
 
     // The banner belongs to the window, not to a page: it stays put while the
-    // settings are open.
-    let mut layers = column![].width(Length::Fill).height(Length::Fill);
-    if let Some(banner) = update_ui::banner(UpdateView {
-        state: &app.update,
-        notes: app.update_notes.as_ref(),
-        elapsed: app.loading_elapsed,
-        tokens: &app.tokens,
-    }) {
-        layers = layers.push(banner);
-    }
-    layers = layers.push(body);
+    // settings are open. Keyed, because a positional column would rebuild every
+    // widget's state below it — the composer's focus included — the moment the
+    // banner appears or goes.
+    let layers = keyed::Column::new()
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .push_maybe(
+            Layer::Banner,
+            update_ui::banner(UpdateView {
+                state: &app.update,
+                notes: app.update_notes.as_ref(),
+                elapsed: app.loading_elapsed,
+                tokens: &app.tokens,
+            }),
+        )
+        .push(Layer::Body, body);
 
     stack![
         container(layers).style(styles::container::chat(&app.tokens)),
