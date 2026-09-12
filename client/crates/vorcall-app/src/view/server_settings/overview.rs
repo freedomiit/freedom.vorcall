@@ -5,7 +5,7 @@ use std::fmt;
 
 use iced::alignment::Vertical;
 use iced::widget::{Column, Space, container, image, pick_list, row, text, text_input};
-use iced::{Element, Length, Theme, border};
+use iced::{ContentFit, Element, Length, Theme, border};
 use vorcall_core::ChannelKind;
 
 use crate::app::message::{AdminMsg, Message};
@@ -149,16 +149,19 @@ fn preview<'a>(
     tokens: &'a ThemeTokens,
 ) -> Element<'a, Message> {
     let inner: Element<'_, Message> = match picture {
-        Some(handle) => image(handle).width(ICON).height(ICON).into(),
+        Some(handle) => image(handle)
+            .width(ICON)
+            .height(ICON)
+            .content_fit(ContentFit::Cover)
+            .border_radius(ICON / 2.0)
+            .into(),
         None => icons::icon(Icon::Image, ICON / 2.0, tokens.text_muted),
     };
     let border_color = tokens.border_subtle;
     container(inner)
         .center(ICON)
         .style(move |_theme: &Theme| container::Style {
-            border: border::rounded(styles::RADIUS_CARD)
-                .width(1.0)
-                .color(border_color),
+            border: border::rounded(ICON / 2.0).width(1.0).color(border_color),
             ..container::Style::default()
         })
         .into()

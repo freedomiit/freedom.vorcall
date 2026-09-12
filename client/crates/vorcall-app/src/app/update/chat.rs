@@ -40,7 +40,18 @@ pub fn update(app: &mut App, message: ChatMsg) -> Task<Message> {
         ChatMsg::LoadOlder => load_older(app),
         // Under `Anchor::End` the offset is measured from the end of the list, so
         // zero is the bottom.
-        ChatMsg::Scrolled(viewport) => scrolled(app, viewport.absolute_offset().y <= 1.0),
+        ChatMsg::Scrolled(viewport) => {
+            let at_bottom = viewport.absolute_offset().y <= 1.0;
+            // TEMPORARY: diagnostics for the scroll investigation, remove once resolved.
+            tracing::debug!(
+                offset_y = viewport.absolute_offset().y,
+                viewport_h = viewport.bounds().height,
+                content_h = viewport.content_bounds().height,
+                at_bottom,
+                "the message list scrolled"
+            );
+            scrolled(app, at_bottom)
+        }
         ChatMsg::JumpToLatest => Task::batch([
             scrolled(app, true),
             operation::snap_to(

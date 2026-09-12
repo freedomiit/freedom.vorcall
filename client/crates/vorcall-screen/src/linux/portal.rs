@@ -62,8 +62,13 @@ impl Cast {
 
 /// Asks the portal for a source and for the PipeWire remote it lives on.
 ///
-/// Blocks on the user for as long as the picker is up.
-pub(super) async fn open(request: &CaptureRequest) -> Result<(Cast, OwnedFd), Unavailable> {
+/// Calls `opened` once the portal has answered with a session, which is the last
+/// thing here that happens without a human: from there on this blocks on the
+/// user for as long as the picker is up.
+pub(super) async fn open(
+    request: &CaptureRequest,
+    opened: impl FnOnce(),
+) -> Result<(Cast, OwnedFd), Unavailable> {
     let missing = || Unavailable::Unsupported("no desktop portal".to_string());
 
     let screencast = Screencast::new().await.map_err(|_| missing())?;
@@ -73,6 +78,7 @@ pub(super) async fn open(request: &CaptureRequest) -> Result<(Cast, OwnedFd), Un
         .create_session(CreateSessionOptions::default())
         .await
         .map_err(|_| missing())?;
+    opened();
 
     match cast(&screencast, &session, request).await {
         Ok((node_id, size, remote)) => Ok((
@@ -95,11 +101,10 @@ async fn cast(
     session: &Session<Screencast>,
     request: &CaptureRequest,
 ) -> Result<(u32, Option<(u32, u32)>, OwnedFd), Unavailable> {
-    // Held only long enough to copy: the picker below is a round trip to the
-    // user, and nothing else in this process may wait on it.
-    let token = super::restore_token().clone();
+    // No restore token and nothing for the portal to persist, so every share
+    // raises the picker: a share that repeated itself silently could put a
+    // window the user has forgotten was chosen in front of the room.
     tracing::debug!(
-        restored = token.is_some(),
         cursor = request.cursor,
         "opening a screen cast portal session"
     );
@@ -112,8 +117,7 @@ async fn cast(
         })
         .set_sources(SourceType::Monitor | SourceType::Window)
         .set_multiple(false)
-        .set_restore_token(token.as_deref())
-        .set_persist_mode(PersistMode::ExplicitlyRevoked);
+        .set_persist_mode(PersistMode::DoNot);
     screencast
         .select_sources(session, sources)
         .await
@@ -124,9 +128,6 @@ async fn cast(
         .await
         .and_then(|request| request.response())
         .map_err(refused)?;
-    // Whatever the user settled on, so the next share in this run can skip the
-    // picker. Never logged: it is the portal's handle on their screen.
-    *super::restore_token() = streams.restore_token().map(ToOwned::to_owned);
 
     let stream = streams
         .streams()

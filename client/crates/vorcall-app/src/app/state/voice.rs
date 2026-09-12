@@ -84,8 +84,12 @@ impl VoiceRoster {
 
     /// What this channel's priority speakers mean for the mixer right now: every
     /// other peer is quietened while one of them talks, and the priority
-    /// speakers themselves never are.
-    pub fn ducking(&self) -> Ducking {
+    /// speakers themselves never are. `enabled` is the local preference: with it
+    /// off nothing is ever quietened.
+    pub fn ducking(&self, enabled: bool) -> Ducking {
+        if !enabled {
+            return Ducking::default();
+        }
         Ducking {
             active: self
                 .members
@@ -757,16 +761,22 @@ mod tests {
         };
         let mut voice = joined(10, vec![priority, member_with_ssrc(9, 90)]);
 
-        let quiet = voice.roster().expect("the joined roster").ducking();
+        let quiet = voice.roster().expect("the joined roster").ducking(true);
         assert!(!quiet.active);
         assert_eq!(quiet.exempt, vec![40]);
 
         // The other member talking is nobody's priority.
         voice.set_speaking(10, 9, true);
-        assert!(!voice.roster().expect("the joined roster").ducking().active);
+        assert!(
+            !voice
+                .roster()
+                .expect("the joined roster")
+                .ducking(true)
+                .active
+        );
 
         voice.set_speaking(10, 4, true);
-        let ducked = voice.roster().expect("the joined roster").ducking();
+        let ducked = voice.roster().expect("the joined roster").ducking(true);
         assert!(ducked.active);
         assert_eq!(ducked.exempt, vec![40]);
 
@@ -780,7 +790,38 @@ mod tests {
             }],
         );
         voice.set_speaking(11, 7, true);
-        assert!(!voice.roster().expect("the joined roster").ducking().active);
+        assert!(
+            !voice
+                .roster()
+                .expect("the joined roster")
+                .ducking(true)
+                .active
+        );
+    }
+
+    /// The preference is a local playback choice: the roster still says who the
+    /// priority speakers are, the mixer is just never told to quieten anybody.
+    #[test]
+    fn the_preference_off_leaves_a_talking_priority_speaker_ducking_nothing() {
+        let priority = VoiceMember {
+            priority: true,
+            ..member_with_ssrc(4, 40)
+        };
+        let mut voice = joined(10, vec![priority, member_with_ssrc(9, 90)]);
+        voice.set_speaking(10, 4, true);
+
+        assert!(
+            voice
+                .roster()
+                .expect("the joined roster")
+                .ducking(true)
+                .active
+        );
+
+        let off = voice.roster().expect("the joined roster").ducking(false);
+        assert!(!off.active);
+        assert!(off.exempt.is_empty());
+        assert_eq!(off, Ducking::default());
     }
 
     /// A `VoiceState` lands between a `VoiceReady` and the engine answering it, so

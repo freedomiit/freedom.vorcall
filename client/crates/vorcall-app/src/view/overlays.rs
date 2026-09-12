@@ -13,14 +13,16 @@
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
     Id, Space, TextInput, button, column, container, image, mouse_area, opaque, row, scrollable,
-    stack, text, text_input, toggler,
+    slider, stack, text, text_input, toggler,
 };
-use iced::{ContentFit, Element, Length};
+use iced::{ContentFit, Element, Length, mouse};
 use vorcall_core::ChannelKind;
+use vorcall_core::images::ImagePurpose;
 use vorcall_screen::{Source, SourceId, SourceKind};
 
-use crate::app::message::{AdminMsg, AuthMsg, Message, SettingsMsg, ShareMsg, UiMsg};
+use crate::app::message::{AdminMsg, AuthMsg, CropMsg, Message, SettingsMsg, ShareMsg, UiMsg};
 use crate::app::state::chat::ImageState;
+use crate::app::state::crop::{self, CropState, FRAME_WIDTH, ZOOM_MAX, ZOOM_MIN};
 use crate::app::state::ui::{Dialog, DialogAction, SourcesState, validate_long, validate_name};
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
@@ -163,6 +165,13 @@ fn modal<'a>(app: &'a App, main: &'a MainState, dialog: &'a Dialog) -> Element<'
             ban(app, main.server.display_name(*user_id), reason)
         }
         Dialog::Nickname { user_id, draft } => nickname(app, main, *user_id, draft),
+        Dialog::CropImage {
+            purpose,
+            handle,
+            source,
+            crop,
+            ..
+        } => crop_image(app, *purpose, handle, *source, *crop),
         Dialog::SharePicker {
             sources,
             selected,
@@ -698,6 +707,79 @@ fn share_picker<'a>(
     .spacing(8);
 
     sized_frame(app, "Share a screen", rows, actions.into(), PICKER_WIDTH)
+}
+
+/// The crop adjuster: the picked picture under a frame of the shape it is going
+/// to be drawn in, moved by dragging and tightened by the slider.
+///
+/// `Image::crop` scissors the preview as it renders rather than cutting any
+/// pixels, so a drag costs a redraw and nothing is encoded until the action
+/// button.
+fn crop_image<'a>(
+    app: &'a App,
+    purpose: ImagePurpose,
+    handle: &'a iced::widget::image::Handle,
+    source: (u32, u32),
+    state: CropState,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    // The aspect is the upload box: 512 by 512 is 1:1, 1600 by 600 is 8:3.
+    let aspect = purpose.max_size();
+    let frame_height = FRAME_WIDTH * aspect.1 as f32 / aspect.0 as f32;
+    // A square frame is a circle at half its width, which is how the three round
+    // purposes are drawn everywhere else.
+    let radius = if aspect.0 == aspect.1 {
+        FRAME_WIDTH / 2.0
+    } else {
+        styles::RADIUS_CARD
+    };
+
+    let preview = mouse_area(
+        image(handle.clone())
+            .crop(crop::region(source, aspect, state))
+            .width(FRAME_WIDTH)
+            .height(frame_height)
+            .content_fit(ContentFit::Cover)
+            .border_radius(radius),
+    )
+    .interaction(mouse::Interaction::Grab)
+    .on_press(Message::Crop(CropMsg::PanStart))
+    .on_move(|at| Message::Crop(CropMsg::PanMove(at)))
+    .on_release(Message::Crop(CropMsg::PanEnd))
+    // A release outside the frame never arrives, so leaving it ends the drag
+    // rather than leaving one armed.
+    .on_exit(Message::Crop(CropMsg::PanEnd));
+
+    let tighten = slider(ZOOM_MIN..=ZOOM_MAX, state.zoom, |value| {
+        Message::Crop(CropMsg::Zoom(value))
+    })
+    .step(0.01_f32)
+    .width(Length::Fill)
+    .style(styles::slider(tokens));
+
+    let zoom = row![
+        text("Zoom").size(TEXT_ROW).color(tokens.text_secondary),
+        tighten,
+    ]
+    .spacing(12)
+    .align_y(Vertical::Center);
+
+    let rows: Vec<Element<'_, Message>> = vec![
+        container(preview).center_x(Length::Fill).into(),
+        zoom.into(),
+        note(
+            tokens,
+            "Drag the picture to choose what the frame keeps.".to_owned(),
+        ),
+    ];
+
+    sized_frame(
+        app,
+        "Adjust the picture",
+        rows,
+        actions(app, "Use picture", true, false),
+        PICKER_WIDTH,
+    )
 }
 
 /// The displays first, then the windows: sharing a whole screen is the common

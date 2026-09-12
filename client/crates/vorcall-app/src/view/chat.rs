@@ -308,26 +308,30 @@ fn messages<'a>(
         .height(Length::Fill)
         .style(styles::scrollable(tokens));
 
-    if channel.at_bottom {
-        return scroller.into();
-    }
-
-    let label = match channel.pending_new {
-        0 => "Jump to the latest ↓".to_owned(),
-        1 => "1 new message ↓".to_owned(),
-        count => format!("{count} new messages ↓"),
+    // iced matches widget state by position and tag in a tree mirroring this one, so a
+    // conditional wrapper around the scrollable would rebuild it with a fresh state and
+    // snap the offset back to the bottom on every scroll: the shape has to stay constant,
+    // only the pill's content may change.
+    let overlay: Element<'a, Message> = if channel.at_bottom {
+        Space::new().into()
+    } else {
+        let label = match channel.pending_new {
+            0 => "Jump to the latest ↓".to_owned(),
+            1 => "1 new message ↓".to_owned(),
+            count => format!("{count} new messages ↓"),
+        };
+        button(text(label).size(metrics.text(TEXT_SECONDARY)))
+            .padding([4.0, 12.0])
+            .style(styles::button::primary(tokens))
+            .on_press(Message::Chat(ChatMsg::JumpToLatest))
+            .into()
     };
     stack![
         scroller,
-        container(
-            button(text(label).size(metrics.text(TEXT_SECONDARY)))
-                .padding([4.0, 12.0])
-                .style(styles::button::primary(tokens))
-                .on_press(Message::Chat(ChatMsg::JumpToLatest)),
-        )
-        .center_x(Length::Fill)
-        .align_bottom(Length::Fill)
-        .padding(Padding::ZERO.bottom(8.0)),
+        container(overlay)
+            .center_x(Length::Fill)
+            .align_bottom(Length::Fill)
+            .padding(Padding::ZERO.bottom(8.0)),
     ]
     .into()
 }

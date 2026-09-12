@@ -9,6 +9,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use iced::Rectangle;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageEncoder as _, ImageFormat};
@@ -139,6 +140,80 @@ pub fn resize_for_upload(
     Ok(("image/png", png))
 }
 
+/// Cuts `region` out of a picked file, scales what is left into the box its
+/// purpose allows and re-encodes it, so what leaves this machine is exactly what
+/// the user framed and never larger than what will ever be drawn. Answers the
+/// content type the upload must declare along with the bytes.
+///
+/// A region covering the whole picture is no crop at all and goes through
+/// [`resize_for_upload`], which is also the only way an animated GIF keeps its
+/// animation: cutting a rectangle out of one means decoding it, and a decode
+/// keeps its first frame only. A real crop of a GIF therefore uploads a still
+/// PNG — deliberately, because the frame the user chose matters more than the
+/// animation.
+///
+/// A region reaching outside the picture is clamped rather than refused: the
+/// rectangle was worked out from what the adjuster was holding, and a decoder
+/// that reads the size differently must not cost the upload.
+pub fn crop_for_upload(
+    bytes: &[u8],
+    purpose: ImagePurpose,
+    region: Rectangle<u32>,
+) -> Result<(&'static str, Vec<u8>), String> {
+    // The header alone says how large the picture is, which is all it takes to
+    // tell an untouched pick from a crop.
+    let (width, height) = dimensions(bytes)?;
+    if width == 0 || height == 0 {
+        return Err("the image has no pixels".to_string());
+    }
+
+    let region = clamp_region(region, width, height);
+    if region.width == width && region.height == height {
+        return resize_for_upload(bytes, purpose);
+    }
+
+    let (box_width, box_height) = upload_box(purpose);
+    let cropped = image::load_from_memory(bytes)
+        .map_err(|e| e.to_string())?
+        .crop_imm(region.x, region.y, region.width, region.height);
+    // `resize` fits the box by the smaller of the two ratios, which is below one
+    // whenever a side is over it, so this only ever shrinks: a crop already
+    // inside the box goes up at its own size rather than stretched to fill it.
+    let scaled = if region.width > box_width || region.height > box_height {
+        cropped.resize(box_width, box_height, FilterType::Triangle)
+    } else {
+        cropped
+    };
+
+    let rgba = scaled.to_rgba8();
+    let png = encode_png(rgba.width(), rgba.height(), rgba.as_raw())?;
+    Ok(("image/png", png))
+}
+
+/// The part of `region` that lies inside a `width` by `height` picture, never
+/// less than one pixel of it. Both sides are at least one: the caller has
+/// already refused a picture without pixels.
+fn clamp_region(region: Rectangle<u32>, width: u32, height: u32) -> Rectangle<u32> {
+    let x = region.x.min(width - 1);
+    let y = region.y.min(height - 1);
+    Rectangle {
+        x,
+        y,
+        width: region.width.clamp(1, width - x),
+        height: region.height.clamp(1, height - y),
+    }
+}
+
+/// How large one encoded picture is without decoding it: the header is read and
+/// the pixels are left alone.
+fn dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_dimensions()
+        .map_err(|e| e.to_string())
+}
+
 /// Deletes the oldest cached files until the cache fits `limit_bytes`.
 pub fn prune(limit_bytes: u64) {
     let Some(dir) = cache_dir() else {
@@ -242,6 +317,124 @@ mod tests {
                 .expect("the fixture encodes");
         }
         gif
+    }
+
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> Rectangle<u32> {
+        Rectangle {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A wide photograph can never fill a round frame, which is what the crop is
+    /// for: the square the adjuster hands over is the square that goes up.
+    #[test]
+    fn a_square_crop_of_a_wide_source_is_uploaded_square() {
+        let (content_type, cropped) = crop_for_upload(
+            &png_fixture(2000, 1000),
+            ImagePurpose::Avatar,
+            rect(300, 0, 1000, 1000),
+        )
+        .expect("the avatar is cropped");
+
+        assert_eq!(content_type, "image/png");
+        let image = image::load_from_memory(&cropped).expect("the avatar decodes");
+        assert_eq!((image.width(), image.height()), (512, 512));
+    }
+
+    /// The fixture's pixels name their own coordinates, so the corner says which
+    /// part of the source survived.
+    #[test]
+    fn a_crop_under_the_box_is_never_upscaled() {
+        let (_, cropped) = crop_for_upload(
+            &png_fixture(600, 400),
+            ImagePurpose::Avatar,
+            rect(100, 50, 200, 200),
+        )
+        .expect("the avatar is cropped");
+
+        let image = image::load_from_memory(&cropped).expect("the avatar decodes");
+        assert_eq!((image.width(), image.height()), (200, 200));
+        assert_eq!(
+            image.to_rgba8().get_pixel(0, 0),
+            &image::Rgba([100, 50, 0x40, 0xFF])
+        );
+    }
+
+    /// 2000 by 750 is 8:3 already, and 1600 by 600 is the box: 0.8 on both sides.
+    #[test]
+    fn a_banner_crop_keeps_its_eight_by_three() {
+        let (_, cropped) = crop_for_upload(
+            &png_fixture(2000, 2000),
+            ImagePurpose::Banner,
+            rect(0, 500, 2000, 750),
+        )
+        .expect("the banner is cropped");
+
+        let image = image::load_from_memory(&cropped).expect("the banner decodes");
+        assert_eq!((image.width(), image.height()), (1600, 600));
+    }
+
+    #[test]
+    fn a_crop_over_the_box_is_scaled_into_it() {
+        let (_, cropped) = crop_for_upload(
+            &png_fixture(1200, 1200),
+            ImagePurpose::RoleIcon,
+            rect(100, 100, 600, 600),
+        )
+        .expect("the role icon is cropped");
+
+        let image = image::load_from_memory(&cropped).expect("the role icon decodes");
+        assert_eq!((image.width(), image.height()), (128, 128));
+    }
+
+    /// A pick nobody moved is no crop at all, so the animation survives exactly
+    /// as [`resize_for_upload`] keeps it.
+    #[test]
+    fn an_untouched_gif_that_fits_is_uploaded_as_it_came() {
+        let gif = gif_fixture(64, 64);
+
+        let (content_type, uploaded) =
+            crop_for_upload(&gif, ImagePurpose::Avatar, rect(0, 0, 64, 64))
+                .expect("the gif is accepted");
+
+        assert_eq!(content_type, "image/gif");
+        assert_eq!(uploaded, gif);
+    }
+
+    /// The honest trade: a real crop has to decode, and a decoded GIF is one
+    /// frame.
+    #[test]
+    fn a_cropped_gif_gives_up_its_animation() {
+        let (content_type, cropped) = crop_for_upload(
+            &gif_fixture(64, 64),
+            ImagePurpose::Avatar,
+            rect(8, 8, 32, 32),
+        )
+        .expect("the gif is cropped");
+
+        assert_eq!(content_type, "image/png");
+        let image = image::load_from_memory(&cropped).expect("the frame decodes");
+        assert_eq!((image.width(), image.height()), (32, 32));
+    }
+
+    #[test]
+    fn a_region_reaching_past_the_edge_is_clamped() {
+        let (_, cropped) = crop_for_upload(
+            &png_fixture(100, 100),
+            ImagePurpose::Avatar,
+            rect(80, 80, 400, 400),
+        )
+        .expect("the crop is clamped");
+
+        let image = image::load_from_memory(&cropped).expect("the crop decodes");
+        assert_eq!((image.width(), image.height()), (20, 20));
+        assert_eq!(
+            image.to_rgba8().get_pixel(0, 0),
+            &image::Rgba([80, 80, 0x40, 0xFF])
+        );
     }
 
     /// 2:1 inside 1600×600 is height-bound: 600 tall, so 1200 wide.

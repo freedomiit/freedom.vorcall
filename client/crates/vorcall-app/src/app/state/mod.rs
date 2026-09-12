@@ -5,6 +5,7 @@
 //! `app::update` is the only thing that changes any of it.
 
 pub mod chat;
+pub mod crop;
 pub mod rules;
 pub mod server;
 pub mod settings;

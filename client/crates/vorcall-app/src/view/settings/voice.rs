@@ -124,6 +124,17 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
                 ),
             ],
         ),
+        section(
+            "Playback",
+            tokens,
+            vec![toggle_row(
+                "Quieten others for priority speakers",
+                "Drops every other voice by 12 dB while a priority speaker talks. Off by default, and set on this machine only.",
+                config.priority_ducking,
+                |on| Message::Voice(VoiceMsg::SetPriorityDucking(on)),
+                tokens,
+            )],
+        ),
         share(app, main),
     ]
     .spacing(24)

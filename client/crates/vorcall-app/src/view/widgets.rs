@@ -9,7 +9,7 @@ use std::time::Duration;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::image::Handle;
 use iced::widget::{Space, button, column, container, image, row, stack, text, tooltip};
-use iced::{Background, Color, Element, Length, Theme, border};
+use iced::{Background, Color, ContentFit, Element, Length, Theme, border};
 use vorcall_core::config::Density;
 use vorcall_core::{Config, Profile, Role};
 
@@ -122,7 +122,12 @@ pub fn avatar<'a>(
     };
 
     let inner: Element<'_, Message> = match picture {
-        Some(handle) => image(handle).width(size).height(size).into(),
+        Some(handle) => image(handle)
+            .width(size)
+            .height(size)
+            .content_fit(ContentFit::Cover)
+            .border_radius(radius)
+            .into(),
         None => text(initials(profile))
             .size((size * 0.4).max(TEXT_BADGE))
             .into(),
@@ -497,7 +502,12 @@ pub fn role_icon<'a>(
     if role.icon_image_id != 0
         && let Some(handle) = image_handle(&main.chat, ImageKey::Image(role.icon_image_id))
     {
-        return image(handle).width(size).height(size).into();
+        return image(handle)
+            .width(size)
+            .height(size)
+            .content_fit(ContentFit::Cover)
+            .border_radius(size / 2.0)
+            .into();
     }
     icons::icon(Icon::Shield, size, role_color(role, tokens))
 }

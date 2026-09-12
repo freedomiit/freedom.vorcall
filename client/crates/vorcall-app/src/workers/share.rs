@@ -9,6 +9,10 @@
 //! capture carries the room's own voices straight back out otherwise) and sent
 //! as 20 ms Opus frames.
 //!
+//! Opening the capture is a thread of its own, and a short-lived one: the
+//! portal's picker keeps it for as long as the user takes to answer it, and a
+//! `Stop` has to reach the pipeline thread while it does.
+//!
 //! The viewer's decode thread is the mirror of it: reassembled access units in,
 //! pictures out, skipping to the next keyframe rather than falling behind.
 //!
@@ -21,7 +25,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,7 +36,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use vorcall_screen::codec::{EncoderSettings, Picture, VideoDecoder, VideoEncoder};
 use vorcall_screen::preset::Preset;
 use vorcall_screen::scale::scale_bgra;
-use vorcall_screen::{AudioChunk, AudioMode, CaptureEvent, CaptureRequest, Capturer, VideoFrame};
+use vorcall_screen::{
+    AudioChunk, AudioMode, CaptureEvent, CaptureRequest, Capturer, Unavailable, VideoFrame,
+};
 use vorcall_voice::cleanup::FAR_END_MAX_SAMPLES;
 use vorcall_voice::{
     AccessUnit, FrameSender, SAMPLE_RATE, STEREO_FRAME_SAMPLES, ShareCleanup, StereoEncoder,
@@ -167,6 +173,7 @@ fn run(requests: Receiver<ShareCommand>, events: async_mpsc::UnboundedSender<Sha
     let mut state = ShareThread {
         events,
         pipeline: None,
+        starting: None,
     };
     loop {
         match requests.recv_timeout(TICK) {
@@ -174,6 +181,7 @@ fn run(requests: Receiver<ShareCommand>, events: async_mpsc::UnboundedSender<Sha
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        state.collect();
         state.pump();
     }
 }
@@ -181,6 +189,25 @@ fn run(requests: Receiver<ShareCommand>, events: async_mpsc::UnboundedSender<Sha
 struct ShareThread {
     events: async_mpsc::UnboundedSender<ShareEvent>,
     pipeline: Option<Pipeline>,
+    /// The capture being opened on the opener thread, while it is.
+    starting: Option<Starting>,
+}
+
+/// A [`ShareCommand::Start`] whose capture is still being opened, and
+/// everything its pipeline needs once it is.
+struct Starting {
+    /// The capture, or why there is none. Dropping this receiver is what cancels
+    /// a start: the opener's send then fails, and the capturer it was handing
+    /// over is dropped there, which stops the capture.
+    opened: Receiver<Result<Capturer, Unavailable>>,
+    frames: async_mpsc::UnboundedReceiver<CaptureEvent>,
+    preset: Preset,
+    sender: FrameSender,
+    share_far_end: Arc<Mutex<VecDeque<f32>>>,
+    /// A pause that arrived while the capture was still opening. The app sends
+    /// the share's first one right behind the start, and a pipeline that never
+    /// hears it encodes nothing for the watchers it already has.
+    paused: Option<bool>,
 }
 
 impl ShareThread {
@@ -195,34 +222,93 @@ impl ShareThread {
                 // One capture at a time, and the old backend has to be stopped
                 // before another picker dialog opens.
                 self.pipeline = None;
+                self.starting = None;
 
                 let (frames, events) = async_mpsc::unbounded();
-                match Capturer::start(request, frames) {
-                    Ok(capturer) => {
-                        self.pipeline = Some(Pipeline::new(
-                            self.events.clone(),
-                            capturer,
-                            events,
+                let (handles, opened) = std::sync::mpsc::channel();
+                // `Capturer::start` blocks on the portal's own dialog for as
+                // long as the user leaves it up, and this loop has to stay able
+                // to read a `Stop` while it does.
+                let spawned = std::thread::Builder::new()
+                    .name("vorcall-opener".to_string())
+                    .spawn(move || {
+                        let _ = handles.send(Capturer::start(request, frames));
+                    });
+                match spawned {
+                    Ok(_) => {
+                        self.starting = Some(Starting {
+                            opened,
+                            frames: events,
                             preset,
                             sender,
                             share_far_end,
-                        ));
+                            paused: None,
+                        });
                     }
-                    Err(error) => self.emit(ShareEvent::Failed(error.to_string())),
+                    Err(error) => {
+                        let failed = format!("cannot start the capture: {error}");
+                        self.emit(ShareEvent::Failed(failed));
+                    }
                 }
             }
             ShareCommand::SetPaused(paused) => {
                 if let Some(pipeline) = self.pipeline.as_mut() {
                     pipeline.set_paused(paused);
+                } else if let Some(starting) = self.starting.as_mut() {
+                    starting.paused = Some(paused);
                 }
             }
             ShareCommand::ForceKeyframe => {
+                // A capture still opening needs nothing: the first unit its
+                // pipeline encodes is a keyframe anyway.
                 if let Some(pipeline) = self.pipeline.as_mut() {
                     pipeline.keyframe_pending = true;
                 }
             }
-            ShareCommand::Stop => self.pipeline = None,
+            ShareCommand::Stop => {
+                self.pipeline = None;
+                self.starting = None;
+            }
         }
+    }
+
+    /// Takes over a capture the opener has finished with. A start this loop has
+    /// cancelled since is not here to take it any more, and the capturer is
+    /// dropped on the opener thread instead.
+    fn collect(&mut self) {
+        let Some(starting) = self.starting.take() else {
+            return;
+        };
+        let opened = starting.opened.try_recv();
+        match opened {
+            Ok(Ok(capturer)) => self.start_pipeline(capturer, starting),
+            Ok(Err(error)) => self.emit(ShareEvent::Failed(error.to_string())),
+            Err(TryRecvError::Empty) => self.starting = Some(starting),
+            Err(TryRecvError::Disconnected) => {
+                // Nothing but a panic inside the backend ends that thread
+                // without an answer.
+                let lost = "the capture could not be started".to_string();
+                self.emit(ShareEvent::Failed(lost));
+            }
+        }
+    }
+
+    /// Builds the pipeline on a capture that has just opened, carrying over what
+    /// the app asked for while it was opening.
+    fn start_pipeline(&mut self, capturer: Capturer, starting: Starting) {
+        let paused = starting.paused;
+        let mut pipeline = Pipeline::new(
+            self.events.clone(),
+            capturer,
+            starting.frames,
+            starting.preset,
+            starting.sender,
+            starting.share_far_end,
+        );
+        if let Some(paused) = paused {
+            pipeline.set_paused(paused);
+        }
+        self.pipeline = Some(pipeline);
     }
 
     fn pump(&mut self) {

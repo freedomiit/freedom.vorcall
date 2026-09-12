@@ -446,50 +446,79 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 return;
             }
 
-            if (!TryAuthenticate(buffer, received.ReceivedBytes, received.RemoteEndPoint, plaintext, out var inbound))
+            try
             {
-                continue;
+                await HandleDatagramAsync(socket, buffer, received, scratch, plaintext, stoppingToken);
             }
-
-            switch (inbound.Header.Type)
+            catch (Exception ex) when (ex is ObjectDisposedException or OperationCanceledException)
             {
-                case MediaHeader.TypeAudio:
-                    if (inbound.Session.MarkAudio(Stopwatch.GetTimestamp()))
+                // Shutdown reached the handler instead of the read: the socket is gone or the host
+                // is stopping, and the loop ends for the same reason it does above.
+                return;
+            }
+            catch (Exception ex)
+            {
+                // No datagram may end this loop. The relay is a BackgroundService, so a faulted
+                // ExecuteAsync stops the host under the default StopHost behaviour — every
+                // connected client reset at once for one packet nobody could forward.
+                logger.LogError(ex, "Voice relay dropped a datagram from {Source}", received.RemoteEndPoint);
+            }
+        }
+    }
+
+    // Everything one datagram provokes, authentication included, in one place so the receive loop
+    // can guard the whole of it and still end on cancellation.
+    private async Task HandleDatagramAsync(
+        Socket socket,
+        byte[] buffer,
+        SocketReceiveFromResult received,
+        byte[] scratch,
+        byte[] plaintext,
+        CancellationToken stoppingToken)
+    {
+        if (!TryAuthenticate(buffer, received.ReceivedBytes, received.RemoteEndPoint, plaintext, out var inbound))
+        {
+            return;
+        }
+
+        switch (inbound.Header.Type)
+        {
+            case MediaHeader.TypeAudio:
+                if (inbound.Session.MarkAudio(Stopwatch.GetTimestamp()))
+                {
+                    // The session was looked up before RemoveSession could have taken it out,
+                    // so a blind raise here can land after the channel already saw
+                    // VoiceMemberLeft and leave a talker nobody ever silences. A removed
+                    // session simply goes quiet.
+                    if (_sessions.ContainsKey(inbound.Session.Ssrc))
                     {
-                        // The session was looked up before RemoveSession could have taken it out,
-                        // so a blind raise here can land after the channel already saw
-                        // VoiceMemberLeft and leave a talker nobody ever silences. A removed
-                        // session simply goes quiet.
-                        if (_sessions.ContainsKey(inbound.Session.Ssrc))
-                        {
-                            RaiseSpeakingChanged(inbound.Session, true);
-                        }
-                        else
-                        {
-                            inbound.Session.StopSpeaking();
-                        }
+                        RaiseSpeakingChanged(inbound.Session, true);
                     }
+                    else
+                    {
+                        inbound.Session.StopSpeaking();
+                    }
+                }
 
-                    await ForwardAsync(socket, inbound, buffer, scratch, plaintext, stoppingToken);
-                    break;
+                await ForwardAsync(socket, inbound, buffer, scratch, plaintext, stoppingToken);
+                break;
 
-                case MediaHeader.TypePing:
-                    await PongAsync(socket, inbound, scratch, plaintext, stoppingToken);
-                    break;
+            case MediaHeader.TypePing:
+                await PongAsync(socket, inbound, scratch, plaintext, stoppingToken);
+                break;
 
-                case MediaHeader.TypeVideo:
-                case MediaHeader.TypeShareAudio:
-                    EnqueueShare(inbound, buffer, plaintext);
-                    break;
+            case MediaHeader.TypeVideo:
+            case MediaHeader.TypeShareAudio:
+                EnqueueShare(inbound, buffer, plaintext);
+                break;
 
-                case MediaHeader.TypeKeyframeRequest:
-                    await RequestKeyframeAsync(socket, inbound, scratch, plaintext, stoppingToken);
-                    break;
+            case MediaHeader.TypeKeyframeRequest:
+                await RequestKeyframeAsync(socket, inbound, scratch, plaintext, stoppingToken);
+                break;
 
-                default:
-                    // Unreachable: TryParse admits no other type.
-                    break;
-            }
+            default:
+                // Unreachable: TryParse admits no other type.
+                break;
         }
     }
 
@@ -781,12 +810,17 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
 
         inbound.Header.Write(scratch);
-        if (TrySeal(target, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
+
+        // As in ForwardAsync: the target went away while this request was in flight.
+        if (!TrySeal(target, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
         {
-            var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
-            await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
-            Bump(ref counters.KeyframeRequests, ref _totals.KeyframeRequests);
+            Bump(ref counters.DropSealFailed, ref _totals.DropSealFailed);
+            return;
         }
+
+        var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
+        await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
+        Bump(ref counters.KeyframeRequests, ref _totals.KeyframeRequests);
     }
 
     private async Task PongAsync(Socket socket, Inbound inbound, byte[] scratch, byte[] plaintext, CancellationToken stoppingToken)
@@ -806,11 +840,15 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         };
         header.Write(scratch);
 
-        if (TrySeal(inbound.Session, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
+        // As in ForwardAsync: the session was removed while its ping was in flight.
+        if (!TrySeal(inbound.Session, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
         {
-            var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
-            await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
+            Bump(ref counters.DropSealFailed, ref _totals.DropSealFailed);
+            return;
         }
+
+        var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
+        await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
     }
 
     private async Task SendAsync(Socket socket, byte[] datagram, int length, IPEndPoint destination, ChannelCounters counters, CancellationToken stoppingToken)

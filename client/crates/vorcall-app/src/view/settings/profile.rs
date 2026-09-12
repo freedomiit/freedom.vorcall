@@ -4,7 +4,7 @@
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::image::Handle;
 use iced::widget::{Space, button, column, container, image, row, text, text_input};
-use iced::{Background, Color, Element, Length, Theme, border};
+use iced::{Background, Color, ContentFit, Element, Length, Theme, border};
 use vorcall_core::{Role, permissions};
 
 use crate::app::message::{Message, SettingsMsg};
@@ -148,7 +148,12 @@ fn banner_picker<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> 
     let draft = &main.settings.profile;
 
     let ground: Element<'_, Message> = match picture(main, draft.banner_image_id) {
-        Some(handle) => image(handle).width(Length::Fill).height(FORM_BANNER).into(),
+        Some(handle) => image(handle)
+            .width(Length::Fill)
+            .height(FORM_BANNER)
+            .content_fit(ContentFit::Cover)
+            .border_radius(styles::RADIUS_CARD)
+            .into(),
         None => container(Space::new())
             .width(Length::Fill)
             .height(FORM_BANNER)
@@ -303,11 +308,16 @@ fn preview<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let accent = accent_of(draft, tokens.accent);
 
     let banner: Element<'_, Message> = match picture(main, draft.banner_image_id) {
-        Some(handle) => image(handle).width(Length::Fill).height(CARD_BANNER).into(),
+        Some(handle) => image(handle)
+            .width(Length::Fill)
+            .height(CARD_BANNER)
+            .content_fit(ContentFit::Cover)
+            .border_radius(border::top(styles::RADIUS_POPOVER))
+            .into(),
         None => container(Space::new())
             .width(Length::Fill)
             .height(CARD_BANNER)
-            .style(block(accent, 0.0))
+            .style(block(accent, border::top(styles::RADIUS_POPOVER)))
             .into(),
     };
 
@@ -405,7 +415,11 @@ fn picture(main: &MainState, id: i64) -> Option<Handle> {
 }
 
 /// A flat block of colour, for a banner nobody has uploaded yet.
-fn block(color: Color, radius: f32) -> impl Fn(&Theme) -> iced::widget::container::Style {
+fn block(
+    color: Color,
+    radius: impl Into<iced::border::Radius>,
+) -> impl Fn(&Theme) -> iced::widget::container::Style {
+    let radius = radius.into();
     move |_theme| iced::widget::container::Style {
         background: Some(Background::Color(color)),
         border: border::rounded(radius),

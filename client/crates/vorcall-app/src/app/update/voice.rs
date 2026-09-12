@@ -66,6 +66,12 @@ pub fn update(app: &mut App, message: VoiceMsg) -> Task<Message> {
             push_cleanup(app);
             Task::none()
         }
+        VoiceMsg::SetPriorityDucking(value) => {
+            app.config.priority_ducking = value;
+            app.save_config();
+            push_ducking(app);
+            Task::none()
+        }
         VoiceMsg::SetPeerVolume(user_id, volume) => {
             set_peer_audio(app, user_id, |audio| audio.volume = volume);
             Task::none()
@@ -995,6 +1001,7 @@ fn send_peer(app: &App, ssrc: u32, audio: PeerAudio) {
 
 /// Quietens the room while a priority speaker talks, and only when that changes.
 fn push_ducking(app: &mut App) {
+    let enabled = app.config.priority_ducking;
     let Some(main) = app.main_mut() else {
         return;
     };
@@ -1004,7 +1011,7 @@ fn push_ducking(app: &mut App) {
     }
     let wanted = voice
         .roster()
-        .map(|roster| roster.ducking())
+        .map(|roster| roster.ducking(enabled))
         .unwrap_or_default();
     if wanted == voice.ducking {
         return;

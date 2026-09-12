@@ -8,6 +8,7 @@ pub mod admin;
 pub mod auth;
 pub mod channels;
 pub mod chat;
+pub mod crop;
 pub mod drag;
 pub mod events;
 pub mod keys;
@@ -37,6 +38,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Share(message) => share::update(app, message),
         Message::Settings(message) => settings::update(app, message),
         Message::Admin(message) => admin::update(app, message),
+        Message::Crop(message) => crop::update(app, message),
         Message::Ui(message) => ui::update(app, message),
         Message::Keys(message) => keys::update(app, message),
         Message::Update(message) => updates(app, message),

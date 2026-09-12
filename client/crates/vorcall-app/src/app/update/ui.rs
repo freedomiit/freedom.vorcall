@@ -12,8 +12,8 @@ use vorcall_core::connection::{AdminCommand, Command};
 
 use crate::app::App;
 use crate::app::message::{
-    AdminMsg, AuthMsg, ChannelsMsg, ChatMsg, DragMsg, Message, SettingsMsg, ShareMsg, ToastKind,
-    UiMsg, VoiceMsg,
+    AdminMsg, AuthMsg, ChannelsMsg, ChatMsg, CropMsg, DragMsg, Message, SettingsMsg, ShareMsg,
+    ToastKind, UiMsg, VoiceMsg,
 };
 use crate::app::state::ui::{
     ContextMenu, Dialog, DialogAction, ProfileCard, Route, SwitchEntry, SwitchTarget,
@@ -211,6 +211,9 @@ fn submit(app: &mut App) -> Task<Message> {
             Task::done(Message::Settings(SettingsMsg::ThemeSaveAsConfirm))
         }
         Dialog::SharePicker { .. } => Task::done(Message::Share(ShareMsg::Confirm)),
+        // The adjuster owns the crop and the upload that follows it; pressing
+        // through is all this dialog had to say.
+        Dialog::CropImage { .. } => Task::done(Message::Crop(CropMsg::Apply)),
         // The diagnostics section owns the upload; this only answered the offer.
         Dialog::CrashReport => Task::done(Message::Settings(SettingsMsg::SendCrashReport)),
         Dialog::CreateChannel {

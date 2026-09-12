@@ -159,6 +159,11 @@ public sealed class VoiceSession : IDisposable
         }
     }
 
+    // The outbound half of the same pair, and it fails the same two ways: a disposed cipher means
+    // the recipient was removed while this packet was in flight, and the provider itself can
+    // refuse an operation. Both are one dropped copy of one datagram, counted as DropSealFailed,
+    // never an error — this runs on the relay's receive loop, and a throw there faults
+    // ExecuteAsync, which stops the host and every connected client with it.
     internal bool TrySeal(
         ReadOnlySpan<byte> nonce,
         ReadOnlySpan<byte> plaintext,
@@ -171,7 +176,7 @@ public sealed class VoiceSession : IDisposable
             Cipher.Encrypt(nonce, plaintext, ciphertext, tag, associatedData);
             return true;
         }
-        catch (ObjectDisposedException)
+        catch (Exception ex) when (ex is CryptographicException or ObjectDisposedException)
         {
             return false;
         }

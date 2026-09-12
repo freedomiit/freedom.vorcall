@@ -45,7 +45,9 @@ const CRASH_SUFFIX: &str = ".txt";
 const FILE_FILTER_ENV: &str = "RUST_LOG_FILE";
 /// Debug from our own crates, info from everyone else's: the file exists to
 /// answer "what was the client doing", which needs more than the console shows.
-const FILE_FILTER: &str = "info,vorcall_app=debug,vorcall_core=debug,vorcall_voice=debug,vorcall_screen=debug,vorcall_hotkey=debug";
+/// The GUI crate has no library target, so its tracing target is the bin name
+/// `vorcall`, not the crate directory `vorcall_app`.
+const FILE_FILTER: &str = "info,vorcall=debug,vorcall_core=debug,vorcall_voice=debug,vorcall_screen=debug,vorcall_hotkey=debug";
 
 /// Set by [`init`] so the panic hook can quote the log without reading it back
 /// — the disk may be exactly what is broken.
@@ -616,6 +618,14 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// `vorcall-app` is a binary-only crate, so its tracing target is the bin
+    /// name `vorcall` — `vorcall_app` (the crate directory) would match nothing.
+    #[test]
+    fn the_file_filter_names_the_gui_binary_not_the_crate() {
+        assert!(FILE_FILTER.contains("vorcall=debug"), "{FILE_FILTER}");
+        assert!(!FILE_FILTER.contains("vorcall_app"), "{FILE_FILTER}");
     }
 
     #[test]

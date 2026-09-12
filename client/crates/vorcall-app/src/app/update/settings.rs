@@ -4,8 +4,9 @@
 //! Every preference is written to disk the moment it changes — a setting that is
 //! not in `config.toml` is a setting that did not happen — and the ones that are
 //! visible repaint the window through [`App::reload_theme`]. The file dialog, the
-//! file reads, the image resizing, the theme JSON and the problem report all run
-//! off the UI thread.
+//! file reads, the theme JSON and the problem report all run off the UI thread;
+//! a picked picture goes to the crop adjuster, which owns the decode and the
+//! scaling.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,7 @@ use vorcall_core::images::ImagePurpose;
 use vorcall_core::{Endpoints, Image, Profile, config, diagnostics, report};
 
 use crate::app::message::{
-    AdminMsg, ChannelsMsg, Message, SettingsMsg, ToastKind, UiMsg, VoiceMsg,
+    AdminMsg, ChannelsMsg, CropMsg, Message, SettingsMsg, ToastKind, UiMsg, VoiceMsg,
 };
 use crate::app::state::rules::describe;
 use crate::app::state::settings::{
@@ -25,7 +26,7 @@ use crate::app::state::settings::{
 use crate::app::state::ui::{Dialog, Route};
 use crate::app::{App, MainState, Screen};
 use crate::theme::{self, ThemeTokens};
-use crate::workers::images::{self, ImageKey};
+use crate::workers::images::ImageKey;
 use crate::workers::voice;
 
 /// A cancelled file dialog answers with this rather than a complaint: nothing was
@@ -216,7 +217,10 @@ pub fn update(app: &mut App, message: SettingsMsg) -> Task<Message> {
         }
         SettingsMsg::ProfilePickAvatar => pick_image(ImagePurpose::Avatar),
         SettingsMsg::ProfilePickBanner => pick_image(ImagePurpose::Banner),
-        SettingsMsg::ProfileImagePicked(purpose, Ok((_, bytes))) => upload(app, purpose, bytes),
+        // Nothing is uploaded until the adjuster has framed it.
+        SettingsMsg::ProfileImagePicked(purpose, Ok((_, bytes))) => {
+            Task::done(Message::Crop(CropMsg::Open { purpose, bytes }))
+        }
         SettingsMsg::ProfileImagePicked(purpose, Err(error)) => {
             if error == CANCELLED {
                 return Task::none();
@@ -500,14 +504,15 @@ fn read_file(path: &Path) -> Result<(String, Vec<u8>), String> {
     Ok((name, bytes))
 }
 
-/// Scales the picked file into the box its purpose allows and uploads it. Nothing
-/// larger than what will ever be drawn leaves this machine, and neither the
-/// decode nor the re-encode runs on the UI thread.
-fn upload(app: &mut App, purpose: ImagePurpose, bytes: Blob) -> Task<Message> {
-    let Some(mut cmd) = app.main().and_then(|main| main.cmd.clone()) else {
-        app.toast(ToastKind::Error, "Not connected".to_owned());
-        return Task::none();
-    };
+/// Uploads a picture the crop adjuster has already framed and scaled. The
+/// adjuster is the only place either happens now, so the bytes go up as they
+/// came out of it.
+pub fn upload_cropped(
+    app: &mut App,
+    purpose: ImagePurpose,
+    content_type: &'static str,
+    bytes: Blob,
+) -> Task<Message> {
     let Some(main) = app.main_mut() else {
         return Task::none();
     };
@@ -518,29 +523,18 @@ fn upload(app: &mut App, purpose: ImagePurpose, bytes: Blob) -> Task<Message> {
         .pending
         .retain(|_, pending| *pending != purpose);
     let request_id = main.next_request_id();
-    main.settings.pending.insert(request_id, purpose);
+    if main.send_command(Command::UploadImage {
+        request_id,
+        purpose,
+        content_type,
+        bytes,
+    }) {
+        main.settings.pending.insert(request_id, purpose);
+        return Task::none();
+    }
 
-    Task::perform(
-        async move {
-            let resized =
-                tokio::task::spawn_blocking(move || images::resize_for_upload(&bytes, purpose))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            let (content_type, bytes) = resized?;
-
-            cmd.try_send(Command::UploadImage {
-                request_id,
-                purpose,
-                content_type,
-                bytes: Blob::from(bytes),
-            })
-            .map_err(|_| "Not connected".to_owned())
-        },
-        move |result| match result {
-            Ok(()) => Message::Noop,
-            Err(error) => Message::Settings(SettingsMsg::ProfileImagePicked(purpose, Err(error))),
-        },
-    )
+    app.toast(ToastKind::Error, "Not connected".to_owned());
+    Task::none()
 }
 
 /// One upload this page asked for landed: `None` when the id belongs to somebody

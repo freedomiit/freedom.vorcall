@@ -19,8 +19,8 @@ mod video;
 use std::cell::Cell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,10 @@ use crate::{
 
 const BACKEND: &str = "pipewire";
 
+/// How long the portal itself has to answer with a session, before a picker is
+/// even raised. Nobody is looking at a dialog yet, so a silence past a few
+/// seconds is a portal that has stopped answering rather than a user thinking.
+const SESSION_BUDGET: Duration = Duration::from_secs(5);
 /// How long the portal's picker may keep the user. It is a dialog with a human
 /// in front of it, so this is generous on purpose; `Capturer::start` says as
 /// much.
@@ -57,18 +61,43 @@ const ITERATION: Duration = Duration::from_millis(250);
 /// And how much of the thread the portal's D-Bus connection gets afterwards.
 const PORTAL_SLICE: Duration = Duration::from_millis(1);
 
-/// What the capture thread tells `start`: first that the portal answered, then
-/// that the stream runs.
+/// What the capture thread tells `start`, in this order: the portal opened a
+/// session, the user answered the picker, the stream runs.
 type Report = Result<(), Unavailable>;
 
-/// The portal's handle on the source this process shared last. Reusing it is
-/// what keeps a second share in the same run from asking the user again.
-static RESTORE_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+/// Capture threads that have not returned yet. A stop that runs out of budget
+/// leaves one behind still owning the portal session it has to close, and a
+/// second session on top of that one would put a second picker in front of the
+/// user.
+static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-fn restore_token() -> MutexGuard<'static, Option<String>> {
-    RESTORE_TOKEN
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Holds one slot in [`LIVE_THREADS`] for as long as it lives, so a capture
+/// thread that returns early or panics gives its slot back all the same.
+struct Live;
+
+impl Live {
+    fn claim() -> Live {
+        LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
+        Live
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether a capture may start with `live` capture threads still running.
+/// Nothing here can hurry an abandoned one along — it owns a portal session
+/// until its own D-Bus call returns — so the only honest answer is to wait.
+fn admit(live: usize) -> Result<(), Unavailable> {
+    if live > 0 {
+        return Err(Unavailable::Failed(
+            "a previous capture is still shutting down, try again in a moment".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn enumerate() -> Result<Vec<Source>, Unavailable> {
@@ -93,12 +122,19 @@ pub(crate) fn start(
             "there is no graphical session to capture".to_string(),
         ));
     }
+    admit(LIVE_THREADS.load(Ordering::SeqCst))?;
 
     let (reports, report) = mpsc::channel::<Report>();
     let (stop, stopped) = channel::channel::<()>();
+    let live = Live::claim();
     let thread = std::thread::Builder::new()
         .name("vorcall-capture".to_string())
-        .spawn(move || capture(request, events, &reports, stopped))
+        .spawn(move || {
+            // Bound rather than merely captured, so the slot is given back when
+            // this body returns, however it returns.
+            let _live = live;
+            capture(request, events, &reports, stopped)
+        })
         .map_err(|error| {
             Unavailable::Failed(format!("cannot start the capture thread: {error}"))
         })?;
@@ -107,9 +143,7 @@ pub(crate) fn start(
         stop: Some(stop),
         thread: Some(thread),
     };
-    let started = await_report(&report, PICKER_BUDGET, "the desktop portal did not answer")
-        .and_then(|()| await_report(&report, STREAM_BUDGET, "PipeWire stream did not start"));
-    match started {
+    match await_started(&report) {
         Ok(()) => Ok(Capturer::new(BACKEND, Box::new(handle))),
         Err(err) => {
             handle.stop();
@@ -118,7 +152,15 @@ pub(crate) fn start(
     }
 }
 
-/// Waits for one of the capture thread's two reports, turning a silence into
+/// Waits out the three steps of a start in turn, each against the budget of
+/// what it is actually waiting on: the portal, then the user, then PipeWire.
+fn await_started(report: &mpsc::Receiver<Report>) -> Result<(), Unavailable> {
+    await_report(report, SESSION_BUDGET, "the desktop portal did not answer")?;
+    await_report(report, PICKER_BUDGET, "the source picker was not answered")?;
+    await_report(report, STREAM_BUDGET, "the PipeWire stream did not start")
+}
+
+/// Waits for one of the capture thread's reports, turning a silence into
 /// `failure`.
 fn await_report(
     report: &mpsc::Receiver<Report>,
@@ -158,13 +200,19 @@ fn capture(
     // the runtime itself.
     let _context = runtime.enter();
 
-    let (cast, remote) = match runtime.block_on(portal::open(&request)) {
+    // Sent from inside `open`, the moment the portal has a session: everything
+    // after it is the user in front of the picker, whose budget is its own.
+    let opened_session = || {
+        let _ = reports.send(Ok(()));
+    };
+    let (cast, remote) = match runtime.block_on(portal::open(&request, opened_session)) {
         Ok(opened) => opened,
         Err(err) => {
             let _ = reports.send(Err(err));
             return;
         }
     };
+    // The second report: the user has answered the picker.
     if reports.send(Ok(())).is_err() {
         runtime.block_on(cast.close());
         return;
@@ -355,4 +403,46 @@ fn serialise(object: Object) -> Option<Vec<u8>> {
     PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(object))
         .map(|(cursor, _)| cursor.into_inner())
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_capture_starts_with_no_thread_of_its_own_left() {
+        assert!(admit(0).is_ok());
+    }
+
+    #[test]
+    fn an_abandoned_capture_thread_refuses_the_next_start() {
+        let Err(refused) = admit(1) else {
+            panic!("a live capture thread must refuse a start");
+        };
+        assert!(matches!(refused, Unavailable::Failed(_)), "{refused:?}");
+        assert!(refused.to_string().contains("try again"), "{refused}");
+    }
+
+    #[test]
+    fn a_silent_capture_thread_fails_with_the_budget_s_own_message() {
+        // Kept alive, so the wait really does run out rather than seeing the
+        // channel close.
+        let (_reports, report) = mpsc::channel::<Report>();
+
+        let waited = await_report(&report, Duration::from_millis(1), "nothing was said");
+        assert_eq!(
+            waited,
+            Err(Unavailable::Failed("nothing was said".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_reported_failure_reaches_the_caller_as_it_was_sent() {
+        let (reports, report) = mpsc::channel::<Report>();
+        let refused = Unavailable::PermissionDenied("no source selected".to_string());
+        let _ = reports.send(Err(refused.clone()));
+
+        let waited = await_report(&report, Duration::from_millis(1), "nothing was said");
+        assert_eq!(waited, Err(refused));
+    }
 }

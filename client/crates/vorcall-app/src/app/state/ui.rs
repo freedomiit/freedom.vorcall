@@ -9,12 +9,15 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use iced::{Point, Size};
+use vorcall_core::connection::Blob;
+use vorcall_core::images::ImagePurpose;
 use vorcall_core::permissions;
 use vorcall_core::{ChannelKind, Config};
 use vorcall_screen::{Source, SourceId};
 
 use crate::app::MainState;
 use crate::app::message::{DragItem, DragSlot, MenuTarget, Message, ToastKind};
+use crate::app::state::crop::{CropDrag, CropState};
 use crate::app::state::settings::{ServerTab, SettingsTab};
 
 /// How long a toast stays up, and how many are stacked at once.
@@ -187,6 +190,20 @@ pub enum Dialog {
     },
     /// One attachment at full size.
     Image(i64),
+    /// The crop adjuster a picked picture goes through before it is uploaded.
+    CropImage {
+        purpose: ImagePurpose,
+        /// The file exactly as it was picked: the crop is cut out of these
+        /// bytes, never out of the preview.
+        bytes: Blob,
+        handle: iced::widget::image::Handle,
+        /// The preview's size, which is the source's own — the rectangle the
+        /// frame is scissored with is in these pixels.
+        source: (u32, u32),
+        crop: CropState,
+        /// The pan in flight, while the pointer is down on the frame.
+        drag: Option<CropDrag>,
+    },
     /// What to share, before any capture starts. A system whose own picker
     /// chooses the source has nothing to list here.
     SharePicker {
@@ -269,6 +286,20 @@ impl fmt::Debug for Dialog {
                 .field("user_id", user_id)
                 .finish_non_exhaustive(),
             Self::Image(id) => f.debug_tuple("Image").field(id).finish(),
+            // A picked picture is somebody's own: its size, never its pixels.
+            Self::CropImage {
+                purpose,
+                bytes,
+                source,
+                crop,
+                ..
+            } => f
+                .debug_struct("CropImage")
+                .field("purpose", purpose)
+                .field("bytes", &bytes.len())
+                .field("source", source)
+                .field("crop", crop)
+                .finish_non_exhaustive(),
             Self::SharePicker {
                 selected, audio, ..
             } => f

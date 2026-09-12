@@ -43,6 +43,8 @@ pub enum Message {
     Share(ShareMsg),
     Settings(SettingsMsg),
     Admin(AdminMsg),
+    /// Framing a picked picture before it is uploaded.
+    Crop(CropMsg),
     Ui(UiMsg),
     Keys(KeyMsg),
     Update(UpdateMsg),
@@ -181,6 +183,7 @@ pub enum VoiceMsg {
     SetNoiseSuppression(bool),
     SetEchoCancellation(bool),
     SetAutoGain(bool),
+    SetPriorityDucking(bool),
     SetPeerVolume(i64, f32),
     PeerVolumeReleased(i64),
     TogglePeerMute(i64),
@@ -353,6 +356,79 @@ pub enum DragMsg {
     DragOver(DragSlot),
     DragEnd,
     DragCancel,
+}
+
+/// The crop adjuster every picked picture goes through, whichever page picked
+/// it.
+#[derive(Clone)]
+pub enum CropMsg {
+    /// A file was read: decode it for the preview, off the UI thread.
+    Open {
+        purpose: ImagePurpose,
+        bytes: Blob,
+    },
+    /// The preview, decoded in the source's own pixels: open the dialog.
+    Ready {
+        purpose: ImagePurpose,
+        bytes: Blob,
+        handle: iced::widget::image::Handle,
+        source: (u32, u32),
+    },
+    /// The decode or the crop did not work out.
+    Failed(String),
+    /// A press inside the frame, which anchors the drag.
+    PanStart,
+    /// Where the pointer is inside the frame.
+    PanMove(Point),
+    PanEnd,
+    Zoom(f32),
+    /// Cut the crop out and scale it, off the UI thread.
+    Apply,
+    /// What the page that picked the file is to upload.
+    Applied {
+        purpose: ImagePurpose,
+        content_type: &'static str,
+        bytes: Blob,
+    },
+}
+
+impl fmt::Debug for CropMsg {
+    /// A picked picture is somebody's own and a debug file log always exists:
+    /// the variant and a byte count are all a log line gets, never the bytes.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open { purpose, bytes } => {
+                write!(f, "Open({purpose:?}, {} bytes)", bytes.len())
+            }
+            Self::Ready {
+                purpose,
+                bytes,
+                source,
+                ..
+            } => write!(
+                f,
+                "Ready({purpose:?}, {} bytes, {} * {})",
+                bytes.len(),
+                source.0,
+                source.1
+            ),
+            Self::Failed(error) => write!(f, "Failed({error})"),
+            Self::PanStart => f.write_str("PanStart"),
+            Self::PanMove(at) => write!(f, "PanMove({at:?})"),
+            Self::PanEnd => f.write_str("PanEnd"),
+            Self::Zoom(zoom) => write!(f, "Zoom({zoom})"),
+            Self::Apply => f.write_str("Apply"),
+            Self::Applied {
+                purpose,
+                content_type,
+                bytes,
+            } => write!(
+                f,
+                "Applied({purpose:?}, {content_type}, {} bytes)",
+                bytes.len()
+            ),
+        }
+    }
 }
 
 /// Everything about the window itself: overlays, the pointer, the panes.

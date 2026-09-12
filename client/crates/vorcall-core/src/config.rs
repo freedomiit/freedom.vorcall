@@ -163,6 +163,11 @@ pub struct Config {
     pub echo_cancellation: bool,
     #[serde(default)]
     pub auto_gain: bool,
+    /// Whether a priority speaker quietens every other voice while they talk;
+    /// off by default. A playback preference on this machine only: the server
+    /// still marks priority speakers and the member pane still shows them.
+    #[serde(default)]
+    pub priority_ducking: bool,
     /// One of [`SHARE_RESOLUTIONS`]; anything else falls back to the default on load.
     #[serde(default = "default_share_resolution")]
     pub share_resolution: String,
@@ -241,6 +246,7 @@ impl Default for Config {
             noise_suppression: true,
             echo_cancellation: true,
             auto_gain: false,
+            priority_ducking: false,
             share_resolution: SHARE_DEFAULT_RESOLUTION.to_owned(),
             share_fps: SHARE_DEFAULT_FPS,
             share_bitrate_kbps: None,
@@ -590,6 +596,7 @@ mod tests {
         assert!(config.noise_suppression);
         assert!(config.echo_cancellation);
         assert!(!config.auto_gain);
+        assert!(!config.priority_ducking);
     }
 
     #[test]
@@ -627,6 +634,7 @@ mod tests {
         assert!(config.noise_suppression);
         assert!(config.echo_cancellation);
         assert!(!config.auto_gain);
+        assert!(!config.priority_ducking);
 
         assert_eq!(config.theme, DEFAULT_THEME);
         assert_eq!(config.density, Density::Cosy);
@@ -1018,6 +1026,7 @@ mod tests {
         assert!(raw.contains("noise_suppression = true"));
         assert!(raw.contains("echo_cancellation = true"));
         assert!(raw.contains("auto_gain = false"));
+        assert!(raw.contains("priority_ducking = false"));
     }
 
     /// Like `input_device`, an unset bitrate leaves no key behind at all.

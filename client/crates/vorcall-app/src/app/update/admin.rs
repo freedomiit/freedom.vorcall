@@ -18,7 +18,7 @@ use vorcall_core::images::ImagePurpose;
 use vorcall_core::{Channel, Image, Override, Role, attachments, permissions};
 
 use crate::app::message::{
-    AdminMsg, DragItem, Message, OverrideTargetKind, RoleIconDraft, ToastKind, TriState,
+    AdminMsg, CropMsg, DragItem, Message, OverrideTargetKind, RoleIconDraft, ToastKind, TriState,
 };
 use crate::app::state::server::channel_kind;
 use crate::app::state::settings::{
@@ -27,7 +27,7 @@ use crate::app::state::settings::{
 use crate::app::state::ui::Dialog;
 use crate::app::update::drag;
 use crate::app::{App, MainState};
-use crate::workers::images::{self, ImageKey};
+use crate::workers::images::ImageKey;
 
 /// `PROTOCOL.md` § Channels and § Roles and permissions: what the server refuses
 /// to exceed. The page mirrors them so a create that cannot succeed is not
@@ -64,9 +64,7 @@ pub fn update(app: &mut App, message: AdminMsg) -> Task<Message> {
             draft.description = description;
             main.admin.overview = draft;
         }),
-        AdminMsg::OverviewPickIcon => {
-            pick_image(ImagePurpose::ServerIcon, AdminMsg::OverviewIconPicked)
-        }
+        AdminMsg::OverviewPickIcon => pick_image(AdminMsg::OverviewIconPicked),
         AdminMsg::OverviewIconPicked(picked) => match picked {
             // No bytes is how the page says "no icon"; see [`clear_icon`].
             Ok((_, bytes)) if bytes.is_empty() => with_main(app, |main| {
@@ -287,7 +285,7 @@ pub fn update(app: &mut App, message: AdminMsg) -> Task<Message> {
                 }
             })
         }
-        AdminMsg::RolePickIcon => pick_image(ImagePurpose::RoleIcon, AdminMsg::RoleIconPicked),
+        AdminMsg::RolePickIcon => pick_image(AdminMsg::RoleIconPicked),
         AdminMsg::RoleIconPicked(picked) => picked_image(app, ImagePurpose::RoleIcon, picked),
 
         AdminMsg::MemberSearch(query) => with_main(app, |main| main.admin.member_search = query),
@@ -668,12 +666,9 @@ fn rest(main: &mut MainState, kind: RestKind) {
     }
 }
 
-/// The file dialog, the read and the downscale, none of them on the UI thread.
-/// Cancelling the dialog picks nothing, which is not an error.
-fn pick_image(
-    purpose: ImagePurpose,
-    into: fn(Result<(String, Blob), String>) -> AdminMsg,
-) -> Task<Message> {
+/// The file dialog and the read, neither of them on the UI thread. Cancelling
+/// the dialog picks nothing, which is not an error.
+fn pick_image(into: fn(Result<(String, Blob), String>) -> AdminMsg) -> Task<Message> {
     Task::perform(
         async move {
             let picked = rfd::AsyncFileDialog::new()
@@ -682,7 +677,7 @@ fn pick_image(
                 .await;
             let path = picked?.path().to_path_buf();
             Some(
-                tokio::task::spawn_blocking(move || read_and_resize(&path, purpose))
+                tokio::task::spawn_blocking(move || read_picked(&path))
                     .await
                     .unwrap_or_else(|e| Err(e.to_string())),
             )
@@ -694,9 +689,9 @@ fn pick_image(
     )
 }
 
-/// One picked file, read and scaled into the box its purpose allows, so nothing
-/// larger than what will ever be drawn leaves this machine.
-fn read_and_resize(path: &Path, purpose: ImagePurpose) -> Result<(String, Blob), String> {
+/// One picked file, as it lies on the disk: the crop adjuster is what decodes
+/// and scales it afterwards.
+fn read_picked(path: &Path) -> Result<(String, Blob), String> {
     let name = file_name(path);
     // Asked before the read: nothing the server would refuse belongs in memory.
     let size = std::fs::metadata(path)
@@ -707,8 +702,12 @@ fn read_and_resize(path: &Path, purpose: ImagePurpose) -> Result<(String, Blob),
     }
 
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read that file: {e}"))?;
-    let (_content_type, scaled) = images::resize_for_upload(&bytes, purpose)?;
-    Ok((name, Blob::from(scaled)))
+    // No bytes is how the Overview page says "no icon" (see [`clear_icon`]), so
+    // an empty file must not reach that reading.
+    if bytes.is_empty() {
+        return Err("that file is empty".to_owned());
+    }
+    Ok((name, Blob::from(bytes)))
 }
 
 fn file_name(path: &Path) -> String {
@@ -718,26 +717,37 @@ fn file_name(path: &Path) -> String {
         .to_owned()
 }
 
-/// What one picked image does: go up, or say why it cannot.
+/// What one picked image does: go to the crop adjuster, or say why it cannot.
 fn picked_image(
     app: &mut App,
     purpose: ImagePurpose,
     picked: Result<(String, Blob), String>,
 ) -> Task<Message> {
-    with_main(app, |main| match picked {
-        Ok((_name, bytes)) => upload_image(main, purpose, bytes),
-        Err(error) => main.notice = Some(error),
+    match picked {
+        Ok((_name, bytes)) => Task::done(Message::Crop(CropMsg::Open { purpose, bytes })),
+        Err(error) => with_main(app, |main| main.notice = Some(error)),
+    }
+}
+
+/// Uploads a picture the crop adjuster has already framed and scaled.
+pub fn upload_cropped(
+    app: &mut App,
+    purpose: ImagePurpose,
+    content_type: &'static str,
+    bytes: Blob,
+) -> Task<Message> {
+    with_main(app, |main| {
+        upload_image(main, purpose, content_type, bytes);
     })
 }
 
-/// Starts one image upload. The content type is read back off the scaled bytes:
-/// a `&'static str` cannot travel inside the picked message's `(String, Blob)`.
-fn upload_image(main: &mut MainState, purpose: ImagePurpose, bytes: Blob) {
-    let Some(content_type) = attachments::sniff(&bytes) else {
-        main.notice = Some("that is not a PNG, JPEG, GIF or WebP".to_owned());
-        return;
-    };
-
+/// Starts one image upload.
+fn upload_image(
+    main: &mut MainState,
+    purpose: ImagePurpose,
+    content_type: &'static str,
+    bytes: Blob,
+) {
     let request_id = main.next_request_id();
     if main.send_command(Command::UploadImage {
         request_id,

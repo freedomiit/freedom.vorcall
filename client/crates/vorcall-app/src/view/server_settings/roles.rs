@@ -402,7 +402,13 @@ fn icon_row<'a>(
                 .then(|| widgets::image_handle(&main.chat, ImageKey::Image(*id)))
                 .flatten()
             {
-                bar = bar.push(iced::widget::image(handle).width(SWATCH).height(SWATCH));
+                bar = bar.push(
+                    iced::widget::image(handle)
+                        .width(SWATCH)
+                        .height(SWATCH)
+                        .content_fit(iced::ContentFit::Cover)
+                        .border_radius(SWATCH / 2.0),
+                );
             } else {
                 bar = bar.push(icons::icon(Icon::Image, SWATCH, tokens.text_muted));
             }

@@ -144,6 +144,7 @@ fn banner<'a>(app: &'a App, main: &'a MainState, user_id: i64) -> Element<'a, Me
             .width(CARD_WIDTH)
             .height(BANNER_HEIGHT)
             .content_fit(iced::ContentFit::Cover)
+            .border_radius(border::top(styles::RADIUS_POPOVER))
             .into();
     }
 
