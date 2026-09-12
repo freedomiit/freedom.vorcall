@@ -1,6 +1,7 @@
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Vorcall.Server.Data;
+using Vorcall.Server.Metrics;
 
 namespace Vorcall.Server.Attachments;
 
@@ -30,6 +31,7 @@ public sealed record StoreOutcome(StoreOutcome.Kind Status, Protocol.Attachment?
 public sealed class AttachmentStore(
     AttachmentsOptions options,
     IDbContextFactory<AppDbContext> contexts,
+    ServerMetrics metrics,
     ILogger<AttachmentStore> logger)
 {
     public const int MaxFileNameLength = 128;
@@ -220,6 +222,7 @@ public sealed class AttachmentStore(
             uploaderId,
             channelId,
             row.Size);
+        metrics.CountUpload();
         return StoreOutcome.Stored(new Protocol.Attachment
         {
             Id = row.Id,

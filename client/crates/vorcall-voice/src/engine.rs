@@ -39,11 +39,21 @@ const RECV_BUFFER: usize = 2048;
 /// However many holes a viewer sees, it asks the sharer this often at most.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 /// Fragments handed to the kernel before the sender pauses: a keyframe is a
-/// burst of hundreds of datagrams and the send buffer is not infinite.
-const VIDEO_BURST: usize = 16;
+/// burst of hundreds of datagrams and the send buffer is not infinite. Halving
+/// the instantaneous burst only spreads it out; [`retry_send`] is what absorbs
+/// a queue that is full anyway.
+const VIDEO_BURST: usize = 8;
 /// Long enough for the kernel to drain a burst, short enough to be invisible
 /// inside a frame interval.
 const BURST_PAUSE: Duration = Duration::from_millis(1);
+/// Extra attempts a video fragment gets when the socket refuses it for a
+/// reason that passes on its own: 40 × [`RETRY_PAUSE`] bounds one fragment to
+/// about 40 ms, well under the second a watcher would otherwise spend frozen
+/// waiting for the next keyframe.
+const MAX_SEND_RETRIES: u32 = 40;
+/// The same millisecond as [`BURST_PAUSE`], for the same reason: it is roughly
+/// what an interface queue needs to drain.
+const RETRY_PAUSE: Duration = Duration::from_millis(1);
 /// 4 MiB each way: a keyframe arrives as one burst, and the few hundred KiB a
 /// socket gets by default would lose most of it.
 const SOCKET_BUFFER_BYTES: usize = 4 << 20;
@@ -76,7 +86,8 @@ pub struct Stats {
     pub rejected: u64,
     /// Video and share audio from a sharer this client is not watching.
     pub ignored: u64,
-    /// Datagrams the socket refused, usually a full send buffer.
+    /// Datagrams the socket refused for good, usually a full send buffer;
+    /// a video fragment is only counted here once its retries ran out.
     pub send_failures: u64,
     pub rtt_last_ms: Option<f64>,
     pub rtt_min_ms: Option<f64>,
@@ -192,14 +203,17 @@ impl FrameSender {
         send(&self.socket, &self.shared, &self.cipher.seal(&header, opus))
     }
 
-    /// Cuts one encoded access unit into fragments and puts them all on the
-    /// wire under one timestamp, returning how many there were.
+    /// Cuts one encoded access unit into fragments and sends them under one
+    /// timestamp, returning how many it attempted.
     ///
     /// This blocks: every [`VIDEO_BURST`] fragments it sleeps for a
-    /// millisecond, so it belongs on a worker thread and never on the UI or
-    /// audio thread. A fragment the socket refuses is counted in
-    /// [`Stats::send_failures`] and the rest of the unit still goes out; the
-    /// call only fails when every one of them did.
+    /// millisecond, and a refused fragment is retried for up to
+    /// [`MAX_SEND_RETRIES`] more, so it belongs on a worker thread and never on
+    /// the UI or audio thread. A fragment the socket refuses for good is
+    /// counted in [`Stats::send_failures`] and ends the unit; the fragments
+    /// already out are harmless and the watcher asks for a keyframe. The count
+    /// returned is how many were attempted, and the call only fails when not
+    /// one of them went out.
     pub fn send_video(
         &self,
         frame_id: u32,
@@ -229,13 +243,19 @@ impl FrameSender {
                 ts,
             };
             count += 1;
-            match send(
+            match send_with_retry(
                 &self.socket,
                 &self.shared,
                 &self.cipher.seal(&header, &plaintext),
             ) {
                 Ok(()) => sent += 1,
-                Err(EngineError::Send(error)) => last_error = Some(error),
+                // A unit missing a fragment cannot be decoded anyway, so the
+                // rest would only spend bandwidth, and a retry's worth of
+                // milliseconds each, on a socket that just proved unwritable.
+                Err(EngineError::Send(error)) => {
+                    last_error = Some(error);
+                    break;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -261,6 +281,13 @@ impl FrameSender {
     /// sharer. Requests arriving between two calls coalesce into one.
     pub fn take_keyframe_request(&self) -> bool {
         self.shared.keyframe_request.swap(false, Ordering::Relaxed)
+    }
+
+    /// [`Stats::send_failures`] without the rest of the report, for a sender
+    /// that has no engine to ask: every datagram this session gave up on,
+    /// retries included.
+    pub fn send_failures(&self) -> u64 {
+        self.shared.send_failures.load(Ordering::Relaxed)
     }
 }
 
@@ -295,15 +322,11 @@ fn watched(shared: &Shared) -> Option<u32> {
 
 fn send(socket: &UdpSocket, shared: &Shared, datagram: &[u8]) -> Result<(), EngineError> {
     if datagram.len() < MIN_DATAGRAM {
-        return Err(EngineError::Send(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "sealing produced no datagram",
-        )));
+        return Err(undersized());
     }
     match socket.try_send(datagram) {
         Ok(sent) => {
-            shared.packets_sent.fetch_add(1, Ordering::Relaxed);
-            shared.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+            count_sent(shared, sent);
             Ok(())
         }
         Err(error) => {
@@ -311,6 +334,83 @@ fn send(socket: &UdpSocket, shared: &Shared, datagram: &[u8]) -> Result<(), Engi
             Err(EngineError::Send(error))
         }
     }
+}
+
+/// [`send`] for a caller that can afford to wait: a datagram the socket refuses
+/// for a transient reason is offered again after [`RETRY_PAUSE`] instead of
+/// being lost. One dropped fragment costs a whole access unit, and a dropped
+/// keyframe fragment freezes every watcher until the next keyframe — which a
+/// still-full queue would lose the same way.
+///
+/// It sleeps, so it belongs on a worker thread; the audio path keeps [`send`].
+fn send_with_retry(
+    socket: &UdpSocket,
+    shared: &Shared,
+    datagram: &[u8],
+) -> Result<(), EngineError> {
+    if datagram.len() < MIN_DATAGRAM {
+        return Err(undersized());
+    }
+    match retry_send(|| socket.try_send(datagram), std::thread::sleep) {
+        Ok(sent) => {
+            count_sent(shared, sent);
+            Ok(())
+        }
+        Err(error) => {
+            shared.send_failures.fetch_add(1, Ordering::Relaxed);
+            Err(EngineError::Send(error))
+        }
+    }
+}
+
+/// Calls `attempt` until it succeeds, fails for a reason waiting cannot fix, or
+/// has used all [`MAX_SEND_RETRIES`] retries, pausing in between.
+///
+/// The socket and the clock are both parameters so the loop can be tested
+/// without either.
+fn retry_send(
+    mut attempt: impl FnMut() -> std::io::Result<usize>,
+    mut pause: impl FnMut(Duration),
+) -> std::io::Result<usize> {
+    let mut retries_left = MAX_SEND_RETRIES;
+    loop {
+        match attempt() {
+            Ok(sent) => return Ok(sent),
+            Err(error) if is_transient(&error) && retries_left > 0 => {
+                retries_left -= 1;
+                pause(RETRY_PAUSE);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether the datagram was refused by a queue that drains rather than by
+/// anything about the datagram itself. macOS answers a full interface queue
+/// with `ENOBUFS` where Linux buffers, and `std` gives it no `ErrorKind`, so it
+/// is matched on the raw code.
+fn is_transient(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    const ENOBUFS: i32 = libc::ENOBUFS;
+    // `WSAENOBUFS`, Winsock's own code for the same condition.
+    #[cfg(windows)]
+    const ENOBUFS: i32 = 10055;
+
+    error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(ENOBUFS)
+}
+
+fn count_sent(shared: &Shared, bytes: usize) {
+    shared.packets_sent.fetch_add(1, Ordering::Relaxed);
+    shared.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// Sealing always produces a header and a tag, so anything shorter means the
+/// caller built the datagram wrong; it never reaches the wire.
+fn undersized() -> EngineError {
+    EngineError::Send(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "sealing produced no datagram",
+    ))
 }
 
 /// What the [`MediaEngine`] knows about the video stream it is watching.
@@ -1024,6 +1124,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_fragment_ends_the_unit() {
+        let (_relay, engine) = Relay::start(11).await;
+        let refused_before = engine.stats().send_failures;
+
+        // A socket with no peer refuses every datagram it is handed, so the
+        // first fragment is the only one this unit ever attempts.
+        let mut sender = engine.sender();
+        sender.socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a socket"));
+
+        let unit: Vec<u8> = (0..5_000u32).map(|index| index as u8).collect();
+        let error = sender
+            .send_video(9, true, &unit)
+            .expect_err("the unit reported success");
+        assert!(matches!(error, EngineError::Send(_)), "{error}");
+        assert_eq!(
+            engine.stats().send_failures - refused_before,
+            1,
+            "the unit carried on past a fragment the socket refused"
+        );
+        engine.close().await;
+    }
+
+    #[tokio::test]
     async fn watching_a_sharer_asks_it_for_a_keyframe() {
         let (relay, engine) = Relay::start(11).await;
         engine.watch(Some(77));
@@ -1292,6 +1415,76 @@ mod tests {
         engine.watch(None);
         assert!(lock(&playout).share_stats().is_none());
         engine.close().await;
+    }
+
+    /// The code a full interface queue answers with, which is what the retry
+    /// exists for.
+    #[cfg(unix)]
+    const ENOBUFS: i32 = libc::ENOBUFS;
+    #[cfg(windows)]
+    const ENOBUFS: i32 = 10055;
+
+    #[test]
+    fn a_transient_refusal_is_retried_until_the_datagram_goes_out() {
+        let mut pauses = Vec::new();
+        let mut attempts = 0;
+        let sent = retry_send(
+            || {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(std::io::Error::from_raw_os_error(ENOBUFS))
+                } else {
+                    Ok(10)
+                }
+            },
+            |pause| pauses.push(pause),
+        );
+
+        assert_eq!(sent.expect("the third attempt goes out"), 10);
+        assert_eq!(attempts, 3);
+        assert_eq!(pauses, vec![RETRY_PAUSE; 2]);
+    }
+
+    #[test]
+    fn a_queue_that_never_drains_gives_up_after_the_last_retry() {
+        let mut pauses = Vec::new();
+        let mut attempts = 0;
+        let sent = retry_send(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            },
+            |pause| pauses.push(pause),
+        );
+
+        let error = sent.expect_err("a socket that never takes it");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        // One attempt, then one more for every retry.
+        assert_eq!(attempts, MAX_SEND_RETRIES + 1);
+        assert_eq!(pauses.len() as u32, MAX_SEND_RETRIES);
+        // 40 ms of waiting at most, whatever the socket says.
+        assert_eq!(
+            pauses.iter().sum::<Duration>(),
+            Duration::from_millis(u64::from(MAX_SEND_RETRIES))
+        );
+    }
+
+    #[test]
+    fn an_error_waiting_cannot_fix_comes_straight_back() {
+        let mut pauses = Vec::new();
+        let mut attempts = 0;
+        let sent = retry_send(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            },
+            |pause| pauses.push(pause),
+        );
+
+        let error = sent.expect_err("a refusal no pause changes");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+        assert!(pauses.is_empty(), "a permanent error was waited on");
     }
 
     #[test]

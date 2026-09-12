@@ -72,6 +72,16 @@ public enum UnwatchShareOutcome
     Unwatched,
 }
 
+// Everything a scrape wants to know about the presence model, read in one pass so the six
+// figures describe the same moment rather than six different ones.
+public readonly record struct RegistrySnapshot(
+    int Connections,
+    int OnlineUsers,
+    int Channels,
+    int VoiceSessions,
+    int Sharers,
+    int Watchers);
+
 // What a caller outside the registry needs to know about one channel without reaching into the
 // model: its kind, where it sits, and a DM's two members.
 public sealed record ChannelInfo(long Id, Data.ChannelKind Kind, string Name, long? CategoryId, long? DmLow, long? DmHigh);
@@ -192,6 +202,43 @@ public sealed partial class ConnectionRegistry
             {
                 return _everyoneRoleId;
             }
+        }
+    }
+
+    // One pass under the lock every mutation already takes: a scrape costs the mirror a single
+    // traversal of the channels and never holds the gate across anything that can block.
+    public RegistrySnapshot Snapshot()
+    {
+        lock (_gate)
+        {
+            var voiceSessions = 0;
+            var sharers = 0;
+            var watchers = 0;
+
+            foreach (var channel in _channelById.Values)
+            {
+                voiceSessions += channel.Voice.Count;
+                foreach (var slot in channel.Voice.Values)
+                {
+                    if (slot.Sharing)
+                    {
+                        sharers++;
+                    }
+
+                    if (slot.Watching is not null)
+                    {
+                        watchers++;
+                    }
+                }
+            }
+
+            return new RegistrySnapshot(
+                _connections.Count,
+                _online.Count,
+                _channelById.Count,
+                voiceSessions,
+                sharers,
+                watchers);
         }
     }
 
@@ -945,6 +992,32 @@ public sealed partial class ConnectionRegistry
         CloseSlow(slow);
         ReleaseVoice(removed);
         AnnounceSilenced(silenced);
+    }
+
+    // The admin endpoint's reach into a live session. Nothing is sent ahead of the close: the
+    // client has to see the close code itself, where an Error frame would read as a failure to
+    // reconnect from. Presence, voice and any share are released by the handler's own Detach
+    // when its receive loop unwinds, exactly as on any other close.
+    public async Task<bool> DisconnectAsync(long userId, WebSocketCloseStatus status, string reason)
+    {
+        ClientConnection? connection;
+        lock (_gate)
+        {
+            _online.TryGetValue(userId, out connection);
+        }
+
+        if (connection is null)
+        {
+            return false;
+        }
+
+        _logger.LogInformation(
+            "Admin closed the connection of user {UserId} with {CloseCode} {CloseReason}",
+            userId,
+            (int)status,
+            reason);
+        await CloseQuietlyAsync(connection, status, reason);
+        return true;
     }
 
     public Task CloseAllAsync(WebSocketCloseStatus status, string reason)

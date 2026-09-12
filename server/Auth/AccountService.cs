@@ -24,14 +24,19 @@ public enum LoginStatus
 
     // The credentials were right and the account is banned: 403, not 401.
     Banned,
+
+    // Likewise, but an admin lock on the account rather than moderation.
+    Disabled,
     LoggedIn,
 }
 
-// Rotated is the only status that carries tokens; Banned is the ban gate on the refresh path.
+// Rotated is the only status that carries tokens; Banned and Disabled are the two account gates
+// on the refresh path.
 public enum AccountRefreshStatus
 {
     Invalid,
     Banned,
+    Disabled,
     Rotated,
 }
 
@@ -57,6 +62,8 @@ public readonly record struct LoginOutcome(LoginStatus Status, TokenResponse? To
 
     public static LoginOutcome Banned { get; } = new(LoginStatus.Banned, null, 0);
 
+    public static LoginOutcome Disabled { get; } = new(LoginStatus.Disabled, null, 0);
+
     public static LoginOutcome LockedFor(int retryAfterSeconds) => new(LoginStatus.Locked, null, retryAfterSeconds);
 
     public static LoginOutcome LoggedIn(TokenResponse tokens) => new(LoginStatus.LoggedIn, tokens, 0);
@@ -68,6 +75,8 @@ public readonly record struct AccountRefreshOutcome(AccountRefreshStatus Status,
     public static AccountRefreshOutcome Invalid { get; } = new(AccountRefreshStatus.Invalid, null);
 
     public static AccountRefreshOutcome Banned { get; } = new(AccountRefreshStatus.Banned, null);
+
+    public static AccountRefreshOutcome Disabled { get; } = new(AccountRefreshStatus.Disabled, null);
 
     public static AccountRefreshOutcome Rotated(TokenResponse tokens) => new(AccountRefreshStatus.Rotated, tokens);
 }
@@ -112,7 +121,7 @@ public sealed class AccountService(
         await using var transaction = await db.Database.BeginTransactionAsync();
 
         var invite = await db.Invites.AsNoTracking().FirstOrDefaultAsync(i => i.CodeHash == codeHash);
-        if (invite is null || invite.UsedAt is not null || invite.ExpiresAt <= now)
+        if (invite is null || invite.UsedAt is not null || invite.RevokedAt is not null || invite.ExpiresAt <= now)
         {
             return RegisterOutcome.Rejected(RegisterStatus.InviteUnusable);
         }
@@ -143,7 +152,7 @@ public sealed class AccountService(
         // Conditional claim rather than a write on the row we read: another registration may
         // have consumed the invite between the two statements.
         var claimed = await db.Invites
-            .Where(i => i.Id == invite.Id && i.UsedAt == null)
+            .Where(i => i.Id == invite.Id && i.UsedAt == null && i.RevokedAt == null)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(i => i.UsedAt, (DateTime?)now)
                 .SetProperty(i => i.UsedByUserId, (long?)user.Id));
@@ -192,6 +201,13 @@ public sealed class AccountService(
             return LoginOutcome.Invalid;
         }
 
+        // After the verification, not before: a disabled account has to cost exactly what a live
+        // one does, or the answer time says which names are disabled.
+        if (user.DisabledAt is not null)
+        {
+            return LoginOutcome.Disabled;
+        }
+
         if (verification == PasswordVerificationResult.SuccessRehashNeeded)
         {
             user.PasswordHash = hasher.HashPassword(user, presented);
@@ -212,7 +228,7 @@ public sealed class AccountService(
     }
 
     // Invalid covers every token failure: an unknown, expired, revoked or replayed token all
-    // answer 401. Banned is the account gate, which answers 403 instead.
+    // answer 401. Banned and Disabled are the account gates, which answer 403 instead.
     public async Task<AccountRefreshOutcome> RefreshAsync(string? plaintext, DateTime now)
     {
         if (string.IsNullOrEmpty(plaintext))
@@ -222,16 +238,23 @@ public sealed class AccountService(
 
         await using var db = await contextFactory.CreateDbContextAsync();
 
-        // The ban is checked before the rotation, from the account the token row names, because
-        // banning revokes every refresh token the account has: a banned client therefore always
-        // presents a revoked token, which rotation reads as family reuse and reports as Invalid,
-        // so a check after it would never see the ban. The lookup spends nothing and a token no
-        // row carries falls through to Invalid below, so this tells a caller nothing it could not
-        // already learn.
-        if (await tokens.FindUserIdAsync(db, plaintext) is { } bearerId
-            && await db.Bans.AnyAsync(b => b.UserId == bearerId))
+        // Both account gates are checked before the rotation, from the account the token row names,
+        // because banning and disabling each revoke every refresh token the account has: such a
+        // client therefore always presents a revoked token, which rotation reads as family reuse
+        // and reports as Invalid, so a check after it would never see either state. The lookup
+        // spends nothing and a token no row carries falls through to Invalid below, so this tells
+        // a caller nothing it could not already learn.
+        if (await tokens.FindUserIdAsync(db, plaintext) is { } bearerId)
         {
-            return AccountRefreshOutcome.Banned;
+            if (await db.Bans.AnyAsync(b => b.UserId == bearerId))
+            {
+                return AccountRefreshOutcome.Banned;
+            }
+
+            if (await db.Users.AnyAsync(u => u.Id == bearerId && u.DisabledAt != null))
+            {
+                return AccountRefreshOutcome.Disabled;
+            }
         }
 
         var outcome = await tokens.RefreshAsync(plaintext, now);
@@ -240,10 +263,15 @@ public sealed class AccountService(
             return AccountRefreshOutcome.Invalid;
         }
 
-        // Again afterwards, in case a ban landed while the rotation was in flight.
+        // Again afterwards, in case a ban or a disable landed while the rotation was in flight.
         if (await db.Bans.AnyAsync(b => b.UserId == user.Id))
         {
             return AccountRefreshOutcome.Banned;
+        }
+
+        if (user.DisabledAt is not null)
+        {
+            return AccountRefreshOutcome.Disabled;
         }
 
         return AccountRefreshOutcome.Rotated(BuildTokens(user, refreshToken, now));

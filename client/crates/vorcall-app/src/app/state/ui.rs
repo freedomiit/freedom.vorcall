@@ -201,6 +201,9 @@ pub enum Dialog {
     InviteCreated {
         code: String,
     },
+    /// The offer made once a run when the last one left a crash report behind.
+    /// Answering it either way is what puts it away.
+    CrashReport,
     /// Not a modal: what a control in an overlay asks for. `UiMsg::OpenDialog` is
     /// the only message that carries a [`Dialog`] into `update`, and `UiMsg` has
     /// no submit or clipboard of its own, so those travel as one of these.
@@ -277,6 +280,7 @@ impl fmt::Debug for Dialog {
                 f.debug_struct("ThemeSaveAs").field("name", name).finish()
             }
             Self::InviteCreated { .. } => f.write_str("InviteCreated { code: <redacted> }"),
+            Self::CrashReport => f.write_str("CrashReport"),
             Self::Action(action) => f.debug_tuple("Action").field(action).finish(),
         }
     }

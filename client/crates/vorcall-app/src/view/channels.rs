@@ -527,28 +527,43 @@ fn voice_card<'a>(
         tokens,
     ));
 
-    let card = container(
-        column![
-            column![
-                text(state)
-                    .size(metrics.text(TEXT_SECONDARY))
-                    .font(bold())
-                    .color(state_color),
-                text(format!(
-                    "{}{ping}",
-                    main.server.channel_title(voice.channel_id)
-                ))
+    let mut lines = column![
+        text(state)
+            .size(metrics.text(TEXT_SECONDARY))
+            .font(bold())
+            .color(state_color),
+        text(format!(
+            "{}{ping}",
+            main.server.channel_title(voice.channel_id)
+        ))
+        .size(metrics.text(TEXT_SECONDARY))
+        .color(tokens.text_secondary)
+        .wrapping(Wrapping::None),
+    ];
+    if let Some(stats) = voice.share.stats.as_ref().filter(|_| voice.share.active) {
+        let mut share_line = row![
+            text(format!("Sharing {} kbit/s", stats.kbps))
                 .size(metrics.text(TEXT_SECONDARY))
                 .color(tokens.text_secondary)
-                .wrapping(Wrapping::None),
-            ],
-            switches,
         ]
-        .spacing(8),
-    )
-    .width(Length::Fill)
-    .padding([10.0, 12.0])
-    .style(styles::container::card(tokens));
+        .spacing(4)
+        .align_y(Vertical::Center);
+        // Datagrams the socket refuses are what a frozen watcher looks like from
+        // this side, so the sharer is the one told about them.
+        if stats.send_failures > 0 {
+            share_line = share_line.push(
+                text(format!("· {} datagrams lost", stats.send_failures))
+                    .size(metrics.text(TEXT_SECONDARY))
+                    .color(tokens.warning),
+            );
+        }
+        lines = lines.push(share_line);
+    }
+
+    let card = container(column![lines, switches].spacing(8))
+        .width(Length::Fill)
+        .padding([10.0, 12.0])
+        .style(styles::container::card(tokens));
 
     Some(
         container(card)

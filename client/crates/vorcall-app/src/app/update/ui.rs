@@ -211,6 +211,8 @@ fn submit(app: &mut App) -> Task<Message> {
             Task::done(Message::Settings(SettingsMsg::ThemeSaveAsConfirm))
         }
         Dialog::SharePicker { .. } => Task::done(Message::Share(ShareMsg::Confirm)),
+        // The diagnostics section owns the upload; this only answered the offer.
+        Dialog::CrashReport => Task::done(Message::Settings(SettingsMsg::SendCrashReport)),
         Dialog::CreateChannel {
             category_id,
             kind,

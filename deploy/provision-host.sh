@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provision the Oracle host for Vorcall: certbot, nginx site, TLS renewal hook,
-# the voice media UDP port, the production .env and (optionally) the deploy
-# SSH key.
+# the voice media UDP port, the nightly database backup, the backup/log/diagnostics
+# directories, the production .env and (optionally) the deploy SSH key.
 #
 # Runs ON THE HOST as the `ubuntu` user, from /opt/vorcall/deploy/:
 #   scp -r deploy .env.production.example user@<host>:/opt/vorcall/
@@ -160,7 +160,18 @@ net.core.wmem_max = 16777216
 EOF
 sudo sysctl --system >/dev/null
 
-# --- 9. production .env -----------------------------------------------------
+# --- 9. backups, logs and diagnostics ----------------------------------------
+step "backups, logs and diagnostics directories"
+mkdir -p "$APP_DIR/backups" "$APP_DIR/logs" "$APP_DIR/diagnostics"
+sudo install -m 0755 "$SCRIPT_DIR/backup-db.sh" /usr/local/bin/vorcall-backup-db
+sudo tee /etc/cron.d/vorcall-backup >/dev/null <<EOF
+SHELL=/bin/bash
+15 3 * * * ubuntu APP_DIR=$APP_DIR /usr/local/bin/vorcall-backup-db >> $APP_DIR/backups/cron.log 2>&1
+EOF
+sudo chmod 0644 /etc/cron.d/vorcall-backup
+echo "nightly dump at 03:15 UTC via /etc/cron.d/vorcall-backup (restore procedure: head of deploy/backup-db.sh)"
+
+# --- 10. production .env -----------------------------------------------------
 step "production .env"
 mkdir -p "$APP_DIR"
 # Bind-mounted read-only into the backend; the release workflow scps manifests and binaries here.
@@ -169,6 +180,7 @@ mkdir -p "$APP_DIR/releases"
 mkdir -p "$APP_DIR/attachments"
 if [ -f "$APP_DIR/.env" ]; then
     echo "$APP_DIR/.env already exists, left untouched"
+    echo "add Vorcall__AdminKey=<openssl rand -hex 32> and Vorcall__AdminUrl=http://backend:5000 to $APP_DIR/.env if missing (see .env.production.example)"
 elif [ ! -f "$APP_DIR/.env.production.example" ]; then
     echo "ERROR: $APP_DIR/.env.production.example is missing; copy it from the repo" >&2
     echo "and re-run, or write $APP_DIR/.env by hand." >&2
@@ -179,16 +191,18 @@ else
         pg_pass="$(openssl rand -hex 24)"
         server_key="$(openssl rand -hex 32)"
         jwt_key="$(openssl rand -base64 32)"
+        admin_key="$(openssl rand -hex 32)"
         sed -e "s|__POSTGRES_PASSWORD__|$pg_pass|g" \
             -e "s|__SERVER_KEY__|$server_key|g" \
             -e "s|__JWT_SIGNING_KEY__|$jwt_key|g" \
+            -e "s|__ADMIN_KEY__|$admin_key|g" \
             "$APP_DIR/.env.production.example" > "$APP_DIR/.env"
     )
     echo "generated $APP_DIR/.env"
     echo "bake the same Vorcall__ServerKey into client builds via VORCALL_SERVER_KEY"
 fi
 
-# --- 10. deploy public key ---------------------------------------------------
+# --- 11. deploy public key ---------------------------------------------------
 step "deploy SSH key"
 if [ -n "${DEPLOY_PUBKEY:-}" ]; then
     mkdir -p ~/.ssh
@@ -207,7 +221,7 @@ else
     echo "DEPLOY_PUBKEY not set, skipping"
 fi
 
-# --- 11. summary ------------------------------------------------------------
+# --- 12. summary ------------------------------------------------------------
 step "summary"
 sudo certbot certificates -d "$DOMAIN" 2>/dev/null | grep -i 'expiry date' || \
     echo "certificate expiry: unknown"

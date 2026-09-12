@@ -171,6 +171,7 @@ fn modal<'a>(app: &'a App, main: &'a MainState, dialog: &'a Dialog) -> Element<'
         Dialog::ThemeSaveAs { name } => theme_save_as(app, name),
         // The code is shown once: the server never sends it again.
         Dialog::InviteCreated { code } => invite_created(app, code),
+        Dialog::CrashReport => crash_report(app),
         // Never stored: an action is performed and dropped.
         Dialog::Image(_) | Dialog::Action(_) => Space::new().into(),
     };
@@ -589,6 +590,31 @@ fn theme_save_as<'a>(app: &'a App, name: &'a str) -> Element<'a, Message> {
     .spacing(8);
 
     frame(app, "Save the theme as…", rows, actions.into())
+}
+
+/// The offer made once a run when the last one left a crash report behind. "Not
+/// now" is not a Cancel: it answers the offer, which is what puts it away until
+/// the next sign-in, and the files stay on disk for the Account page to send.
+fn crash_report<'a>(app: &'a App) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let rows = vec![note(
+        tokens,
+        "Send the crash report and the tail of the log to the server?".to_owned(),
+    )];
+
+    let actions = row![
+        button(text("Send").size(TEXT_BODY))
+            .padding([6.0, 14.0])
+            .style(styles::button::primary(tokens))
+            .on_press(submit()),
+        button(text("Not now").size(TEXT_BODY))
+            .padding([6.0, 14.0])
+            .style(styles::button::secondary(tokens))
+            .on_press(Message::Settings(SettingsMsg::DismissCrashReport)),
+    ]
+    .spacing(8);
+
+    frame(app, "Vorcall crashed last time", rows, actions.into())
 }
 
 fn invite_created<'a>(app: &'a App, code: &'a str) -> Element<'a, Message> {

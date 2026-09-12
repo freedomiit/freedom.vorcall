@@ -1,18 +1,19 @@
-//! The Account page: who is signed in, the password, the way out and the
-//! updater.
+//! The Account page: who is signed in, the password, the diagnostics this
+//! installation can hand over, the way out and the updater.
 
 use iced::alignment::Vertical;
 use iced::widget::{button, column, container, row, text};
 use iced::{Element, Length};
 
-use crate::app::message::{AuthMsg, Message, UiMsg};
+use crate::app::message::{AuthMsg, Message, SettingsMsg, UiMsg};
+use crate::app::state::settings::ReportState;
 use crate::app::state::ui::Dialog;
 use crate::app::{App, MainState};
-use crate::theme::styles;
+use crate::theme::{ThemeTokens, styles};
 use crate::update_ui::{self, UpdateView};
 use crate::view::settings::{field, section};
 use crate::view::widgets;
-use crate::view::{AVATAR, TEXT_BODY, TEXT_ROW, TEXT_SECTION, bold};
+use crate::view::{AVATAR, TEXT_BODY, TEXT_ROW, TEXT_SECONDARY, TEXT_SECTION, bold};
 
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let tokens = &app.tokens;
@@ -49,6 +50,13 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
             busy: false,
         })));
 
+    // Listing the directory is all this reads: nothing is opened until the button
+    // is pressed, and then off the UI thread.
+    let log = match vorcall_core::diagnostics::log_path() {
+        Some(path) => format!("Log file: {}", path.display()),
+        None => "No log file on this system".to_owned(),
+    };
+
     let logout = button(text("Log out").size(TEXT_ROW))
         .padding([6.0, 14.0])
         .style(styles::button::danger(tokens))
@@ -65,6 +73,16 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
                 Some("You stay signed in on this machine; other machines are not signed out."),
                 tokens,
             ),],
+        ),
+        section(
+            "Diagnostics",
+            tokens,
+            vec![field(
+                "Problem report",
+                report(main, tokens),
+                Some(&log),
+                tokens,
+            )],
         ),
         section(
             "Updates",
@@ -91,4 +109,32 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     .spacing(24)
     .width(Length::Fill)
     .into()
+}
+
+/// The one button that hands the log and every crash report to the server, with
+/// what the last press came to beside it.
+fn report<'a>(main: &'a MainState, tokens: &'a ThemeTokens) -> Element<'a, Message> {
+    let sending = main.settings.report == ReportState::Sending;
+    let send = button(text("Report a problem").size(TEXT_ROW))
+        .padding([6.0, 14.0])
+        .style(styles::button::secondary(tokens))
+        .on_press_maybe((!sending).then_some(Message::Settings(SettingsMsg::ReportProblem)));
+
+    row![send, report_line(&main.settings.report, tokens)]
+        .spacing(12)
+        .align_y(Vertical::Center)
+        .into()
+}
+
+fn report_line<'a>(state: &ReportState, tokens: &'a ThemeTokens) -> Element<'a, Message> {
+    let (line, color) = match state {
+        ReportState::Idle => (
+            "Sends the log and any crash reports to the server".to_owned(),
+            tokens.text_muted,
+        ),
+        ReportState::Sending => ("Sending…".to_owned(), tokens.text_muted),
+        ReportState::Sent(count) => (format!("Sent {count} files"), tokens.text_secondary),
+        ReportState::Failed(error) => (error.clone(), tokens.warning),
+    };
+    text(line).size(TEXT_SECONDARY).color(color).into()
 }

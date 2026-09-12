@@ -621,6 +621,7 @@ enum ErrorCode {
   ERROR_CODE_UNKNOWN_ROLE = 24;      // non-fatal: role id unknown
   ERROR_CODE_UNKNOWN_CATEGORY = 25;  // non-fatal: category id unknown
   ERROR_CODE_UNKNOWN_IMAGE = 26;     // non-fatal: image id unknown, not the caller's, or of the wrong purpose
+  ERROR_CODE_RATE_LIMITED = 27;      // non-fatal: too many write frames from this account; retry after a moment
 }
 
 message Error {

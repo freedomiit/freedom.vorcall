@@ -64,6 +64,12 @@ pub fn update(app: &mut App, event: Event) -> Task<Message> {
         } => {
             return app.sign_out(Some("You are banned from this server.".to_owned()));
         }
+        Event::Disconnected {
+            reason: DisconnectReason::Disabled,
+            ..
+        } => {
+            return app.sign_out(Some("This account is disabled.".to_owned()));
+        }
         _ => {}
     }
 

@@ -10,12 +10,14 @@ pub mod attachments;
 pub mod auth;
 pub mod config;
 pub mod connection;
+pub mod diagnostics;
 pub mod endpoints;
 pub mod history;
 pub mod http;
 pub mod images;
 pub mod mentions;
 pub mod permissions;
+pub mod report;
 pub mod session;
 pub mod update;
 

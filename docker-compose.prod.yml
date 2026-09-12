@@ -26,6 +26,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   backend:
     image: ghcr.io/freedomiit/vorcall-backend:${IMAGE_TAG:-latest}
@@ -46,6 +51,10 @@ services:
       # image attachments uploaded through /api/attachments; written by the
       # backend, so not read-only. Quota is Vorcall__AttachmentsMaxBytes.
       - ./attachments:/attachments
+      # daily JSON logs written by the backend, kept 31 days by the server itself
+      - ./logs:/logs
+      # problem reports uploaded through /api/diagnostics; swept after 30 days
+      - ./diagnostics:/diagnostics
     depends_on:
       db:
         condition: service_healthy
@@ -56,6 +65,11 @@ services:
       timeout: 5s
       retries: 12
       start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 volumes:
   pgdata:

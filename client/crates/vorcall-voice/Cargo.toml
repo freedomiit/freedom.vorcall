@@ -12,3 +12,7 @@ socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# `ENOBUFS` has no `std::io::ErrorKind`, so the raw code is matched instead.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

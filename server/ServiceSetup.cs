@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Threading.RateLimiting;
 using Google.Protobuf;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -6,11 +7,14 @@ using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
+using Vorcall.Server.Admin;
 using Vorcall.Server.Api;
 using Vorcall.Server.Attachments;
 using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
+using Vorcall.Server.Diagnostics;
+using Vorcall.Server.Metrics;
 using Vorcall.Server.Protocol;
 using Vorcall.Server.Updates;
 using Vorcall.Server.Voice;
@@ -22,8 +26,8 @@ namespace Vorcall.Server;
 public static class ServiceSetup
 {
     private const int PasswordHashIterations = 210_000;
-    private const int AuthRequestsPerWindow = 10;
-    private const int UploadRequestsPerWindow = 20;
+    private const int DefaultAuthRequestsPerWindow = 10;
+    private const int DefaultUploadRequestsPerWindow = 20;
 
     public static void Configure(WebApplicationBuilder builder)
     {
@@ -52,16 +56,27 @@ public static class ServiceSetup
         // back to a default that fills the disk.
         var attachments = AttachmentsOptions.FromConfiguration(builder.Configuration);
 
+        // Both rate-limit windows are knobs so a test host can turn them down to something it can
+        // actually trip; a typo fails the boot like every other Vorcall setting rather than
+        // silently widening a limit.
+        var authRequestsPerWindow = ReadPositiveInt(
+            builder.Configuration, "Vorcall:AuthRequestsPerWindow", DefaultAuthRequestsPerWindow);
+        var uploadRequestsPerWindow = ReadPositiveInt(
+            builder.Configuration, "Vorcall:UploadRequestsPerWindow", DefaultUploadRequestsPerWindow);
+
         builder.Services.AddDbContextFactory<AppDbContext>(o => o.UseNpgsql(connectionString));
         builder.Services.AddSingleton(new ServerKeyValidator(serverKey));
         builder.Services.AddSingleton(jwt);
         builder.Services.AddSingleton(voice);
         builder.Services.AddSingleton(updates);
         builder.Services.AddSingleton(attachments);
+        builder.Services.AddSingleton<ServerMetrics>();
         builder.Services.AddSingleton<UpdateManifestStore>();
         builder.Services.AddSingleton<AttachmentStore>();
         builder.Services.AddSingleton<ImageStore>();
         builder.Services.AddHostedService<AttachmentSweeper>();
+        DiagnosticsSetup.Configure(builder);
+        AdminSetup.Configure(builder);
 
         // One instance in both roles: the registry signals over the very relay the host runs.
         builder.Services.AddSingleton<VoiceRelay>();
@@ -101,6 +116,25 @@ public static class ServiceSetup
                     ClockSkew = TimeSpan.FromSeconds(30),
                     NameClaimType = "name",
                 };
+
+                options.Events = new JwtBearerEvents
+                {
+                    // A ban has to reach the tokens already minted, and this is the one place
+                    // every bearer goes through: the REST endpoints and the /ws upgrade alike.
+                    OnTokenValidated = async context =>
+                    {
+                        if (context.Principal is not { } principal || !BearerIdentity.TryGetUserId(principal, out var userId))
+                        {
+                            return;
+                        }
+
+                        var accounts = context.HttpContext.RequestServices.GetRequiredService<DisabledAccounts>();
+                        if (await accounts.IsDisabledAsync(userId, context.HttpContext.RequestAborted))
+                        {
+                            context.Fail("account disabled");
+                        }
+                    },
+                };
             });
         builder.Services.AddAuthorization();
 
@@ -112,6 +146,7 @@ public static class ServiceSetup
                 context.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
                 context.HttpContext.Response.Headers.RetryAfter = "60";
                 context.HttpContext.Response.ContentType = ProtobufBody.ContentType;
+                context.HttpContext.RequestServices.GetRequiredService<ServerMetrics>().CountHttpRateLimited();
                 await context.HttpContext.Response.Body.WriteAsync(
                     new ApiError { Detail = "too many requests" }.ToByteArray(),
                     cancellationToken);
@@ -124,7 +159,7 @@ public static class ServiceSetup
                     context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
                     _ => new SlidingWindowRateLimiterOptions
                     {
-                        PermitLimit = AuthRequestsPerWindow,
+                        PermitLimit = authRequestsPerWindow,
                         Window = TimeSpan.FromMinutes(1),
                         SegmentsPerWindow = 6,
                         QueueLimit = 0,
@@ -138,11 +173,29 @@ public static class ServiceSetup
                         : $"ip:{context.Connection.RemoteIpAddress?.ToString() ?? "unknown"}",
                     _ => new SlidingWindowRateLimiterOptions
                     {
-                        PermitLimit = UploadRequestsPerWindow,
+                        PermitLimit = uploadRequestsPerWindow,
                         Window = TimeSpan.FromMinutes(1),
                         SegmentsPerWindow = 6,
                         QueueLimit = 0,
                     }));
         });
+    }
+
+    // Absent is the default; present and unusable fails the boot, the same way an unusable
+    // attachment quota does.
+    private static int ReadPositiveInt(IConfiguration configuration, string key, int fallback)
+    {
+        var configured = configuration[key];
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            return fallback;
+        }
+
+        if (!int.TryParse(configured.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) || value < 1)
+        {
+            throw new InvalidOperationException($"Invalid configuration '{key}' (expected a whole number of at least 1).");
+        }
+
+        return value;
     }
 }

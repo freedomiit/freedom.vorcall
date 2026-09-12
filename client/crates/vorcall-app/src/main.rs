@@ -15,7 +15,6 @@ mod workers;
 use std::ffi::OsStr;
 
 use iced::Theme;
-use tracing_subscriber::EnvFilter;
 use vorcall_core::Config;
 use vorcall_core::update::{self, PublicKey, Version};
 
@@ -43,11 +42,17 @@ fn main() -> iced::Result {
     // first request. An Err only means someone already installed a provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let setup = vorcall_core::diagnostics::init("info");
+    vorcall_core::diagnostics::install_panic_hook();
+    tracing::info!(
+        version = %Version::current(),
+        platform = %update::platform(),
+        log_file = ?setup.file,
+        "vorcall starting"
+    );
+    if let Some(error) = &setup.error {
+        tracing::warn!(%error, "no log file");
+    }
 
     let endpoints = match vorcall_core::endpoints::resolve() {
         Ok(endpoints) => endpoints,

@@ -4,23 +4,26 @@
 //! Every preference is written to disk the moment it changes — a setting that is
 //! not in `config.toml` is a setting that did not happen — and the ones that are
 //! visible repaint the window through [`App::reload_theme`]. The file dialog, the
-//! file reads, the image resizing and the theme JSON all run off the UI thread.
+//! file reads, the image resizing, the theme JSON and the problem report all run
+//! off the UI thread.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use iced::Task;
 use vorcall_core::connection::{AdminCommand, Blob, Command};
 use vorcall_core::images::ImagePurpose;
-use vorcall_core::{Image, Profile, config};
+use vorcall_core::{Endpoints, Image, Profile, config, diagnostics, report};
 
 use crate::app::message::{
     AdminMsg, ChannelsMsg, Message, SettingsMsg, ToastKind, UiMsg, VoiceMsg,
 };
+use crate::app::state::rules::describe;
 use crate::app::state::settings::{
-    OverviewDraft, ProfileDraft, ServerTab, SettingsTab, ThemeDraft, ThemeEntry, image_sentinel,
+    OverviewDraft, ProfileDraft, ReportState, ServerTab, SettingsTab, ThemeDraft, ThemeEntry,
+    image_sentinel,
 };
 use crate::app::state::ui::{Dialog, Route};
-use crate::app::{App, MainState};
+use crate::app::{App, MainState, Screen};
 use crate::theme::{self, ThemeTokens};
 use crate::workers::images::{self, ImageKey};
 use crate::workers::voice;
@@ -271,6 +274,18 @@ pub fn update(app: &mut App, message: SettingsMsg) -> Task<Message> {
             if let Some(main) = app.main_mut() {
                 main.settings.capturing = None;
             }
+            Task::none()
+        }
+
+        SettingsMsg::ReportProblem => report_problem(app),
+        SettingsMsg::ReportFinished(result) => on_report_finished(app, result),
+        SettingsMsg::SendCrashReport => {
+            close_crash_offer(app);
+            report_problem(app)
+        }
+        SettingsMsg::DismissCrashReport => {
+            // The files stay on disk: the diagnostics section can still send them.
+            close_crash_offer(app);
             Task::none()
         }
     }
@@ -661,6 +676,161 @@ pub fn unmute(channel_id: i64) -> Message {
     Message::Channels(ChannelsMsg::UnmuteChannel(channel_id))
 }
 
+/// Opens the offer on entering the shell, never over another dialog, until it is
+/// answered; from then on the diagnostics section is the only way to send. Keeping
+/// the offer until an answer is what lets it survive a stale stored session, whose
+/// shell gives way to sign-in before anybody can act on it.
+pub fn offer_crash_report(app: &mut App) {
+    if !app.crash_offer || app.session.is_none() || !matches!(app.screen, Screen::Main(_)) {
+        return;
+    }
+    if app.ui.dialog.is_none() {
+        app.ui.dialog = Some(Dialog::CrashReport);
+    }
+}
+
+fn close_crash_offer(app: &mut App) {
+    app.crash_offer = false;
+    if matches!(app.ui.dialog, Some(Dialog::CrashReport)) {
+        app.ui.dialog = None;
+    }
+}
+
+/// Sends the log files and every crash report, one upload at a time. The token is
+/// a clone taken now: a 401 comes back as a failure the reader can press again,
+/// the same way an update check does.
+fn report_problem(app: &mut App) -> Task<Message> {
+    let Some(token) = app
+        .session
+        .as_ref()
+        .map(|session| session.access_token.clone())
+    else {
+        return Task::none();
+    };
+    if reporting(app) {
+        return Task::none();
+    }
+
+    let endpoints = app.endpoints.clone();
+    if let Some(main) = app.main_mut() {
+        main.settings.report = ReportState::Sending;
+    }
+    Task::perform(send_report(endpoints, token), |result| {
+        Message::Settings(SettingsMsg::ReportFinished(result))
+    })
+}
+
+/// Whether a report is already on its way. The page itself need not be open for
+/// that: the crash offer sends from wherever the window is.
+fn reporting(app: &App) -> bool {
+    app.main()
+        .is_some_and(|main| main.settings.report == ReportState::Sending)
+}
+
+fn on_report_finished(app: &mut App, result: Result<usize, String>) -> Task<Message> {
+    let (state, kind, note) = report_outcome(result);
+    if let Some(main) = app.main_mut() {
+        main.settings.report = state;
+    }
+    app.toast(kind, note);
+    Task::none()
+}
+
+/// What a finished report leaves behind: the diagnostics section's state, and the
+/// toast that says so wherever the reader happens to be.
+fn report_outcome(result: Result<usize, String>) -> (ReportState, ToastKind, String) {
+    match result {
+        Ok(count) => (
+            ReportState::Sent(count),
+            ToastKind::Info,
+            format!("Report sent ({count} files)"),
+        ),
+        Err(error) => (
+            ReportState::Failed(error.clone()),
+            ToastKind::Error,
+            format!("Report failed: {error}"),
+        ),
+    }
+}
+
+/// One file of a report, as it goes over the wire.
+struct ReportFile {
+    kind: &'static str,
+    name: String,
+    path: PathBuf,
+    body: Vec<u8>,
+}
+
+/// Collects the files off the UI thread and uploads them one at a time, stopping
+/// at the first refusal: a half-sent report is still worth reading. A crash file
+/// goes away as soon as its own upload lands, so a report the server's hourly
+/// limit cut short picks up where it stopped on the next press instead of
+/// replaying files already sent.
+async fn send_report(endpoints: Endpoints, token: String) -> Result<usize, String> {
+    let files = tokio::task::spawn_blocking(collect_report)
+        .await
+        .map_err(|e| e.to_string())?;
+    if files.is_empty() {
+        return Err("there is nothing to send".to_owned());
+    }
+
+    let count = files.len();
+    let bytes: usize = files.iter().map(|file| file.body.len()).sum();
+    tracing::info!(files = count, bytes, "sending a problem report");
+
+    for file in files {
+        report::upload(&endpoints, &token, file.kind, &file.name, file.body)
+            .await
+            .map_err(|failure| describe(&failure))?;
+        if file.kind != "crash" {
+            continue;
+        }
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(file.path))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result.map_err(|e| e.to_string()));
+        if let Err(error) = removed {
+            tracing::warn!(error = %error, "could not delete a sent crash report");
+        }
+    }
+
+    Ok(count)
+}
+
+/// The live log, the generation behind it and every crash report on disk. A file
+/// that cannot be read is left out rather than losing the whole report.
+fn collect_report() -> Vec<ReportFile> {
+    let mut files = Vec::new();
+
+    if let Some(live) = diagnostics::log_path() {
+        let mut rotated = live.clone().into_os_string();
+        rotated.push(".1");
+        for path in [live, PathBuf::from(rotated)] {
+            files.extend(read_report(&path, "log"));
+        }
+    }
+    for path in diagnostics::crash_reports() {
+        files.extend(read_report(&path, "crash"));
+    }
+
+    files
+}
+
+fn read_report(path: &Path, kind: &'static str) -> Option<ReportFile> {
+    let body = std::fs::read(path).ok()?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)?
+        .to_owned();
+
+    Some(ReportFile {
+        kind,
+        name,
+        path: path.to_path_buf(),
+        body: report::tail(body, report::MAX_BYTES),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +848,24 @@ mod tests {
         assert_eq!(theme_name("vorcall-dark"), "Vorcall Dark");
         assert_eq!(theme_name("vorcall-light"), "Vorcall Light");
         assert_eq!(theme_name("custom:midnight-oil"), "Midnight Oil");
+    }
+
+    /// The count is what the reader can quote back; a failure says what went
+    /// wrong, and both reach the page and a toast.
+    #[test]
+    fn a_finished_report_says_how_it_went() {
+        let (state, kind, note) = report_outcome(Ok(3));
+        assert_eq!(state, ReportState::Sent(3));
+        assert_eq!(kind, ToastKind::Info);
+        assert_eq!(note, "Report sent (3 files)");
+
+        let (state, kind, note) = report_outcome(Err("Cannot reach the server".to_owned()));
+        assert_eq!(
+            state,
+            ReportState::Failed("Cannot reach the server".to_owned())
+        );
+        assert_eq!(kind, ToastKind::Error);
+        assert_eq!(note, "Report failed: Cannot reach the server");
     }
 
     /// Only the three the listener captures system-wide restart it.

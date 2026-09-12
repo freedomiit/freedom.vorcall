@@ -90,7 +90,10 @@ public sealed class TokenService(
         await using var transaction = await db.Database.BeginTransactionAsync();
 
         var presented = await db.RefreshTokens.Include(t => t.User).FirstOrDefaultAsync(t => t.TokenHash == hash);
-        if (presented is null || presented.ExpiresAt <= now)
+
+        // A banned account answers like an unknown token: the ban is not something a refresh
+        // loop gets told about, and the rows it still holds are revoked by "users ban" anyway.
+        if (presented is null || presented.ExpiresAt <= now || presented.User.DisabledAt is not null)
         {
             return RefreshOutcome.Invalid;
         }

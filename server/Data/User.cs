@@ -38,4 +38,9 @@ public class User
     public string? LastClientPlatform { get; set; }
 
     public DateTime? LastSeenAt { get; set; }
+
+    // Set by "users ban": login, refresh and every bearer-authenticated request are refused
+    // while it is not null, and the row outlives any running server, so a ban holds across a
+    // restart without anything in memory.
+    public DateTime? DisabledAt { get; set; }
 }

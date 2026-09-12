@@ -133,6 +133,19 @@ pub struct SettingsState {
     /// The image uploads the profile page has out, by request id. An answer for
     /// an id that is not here belongs to another page.
     pub pending: BTreeMap<u64, ImagePurpose>,
+    /// How far the problem report the account page offers has got.
+    pub report: ReportState,
+}
+
+/// What the diagnostics section says about the report it last sent. `Sent` counts
+/// the files that reached the server, which is what the reader can quote back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReportState {
+    #[default]
+    Idle,
+    Sending,
+    Sent(usize),
+    Failed(String),
 }
 
 /// The profile page's draft, which is what Save sends.

@@ -1,6 +1,7 @@
 using System.Net.WebSockets;
 using Google.Protobuf;
 using Microsoft.EntityFrameworkCore;
+using Vorcall.Server.Admin;
 using Vorcall.Server.Attachments;
 using Vorcall.Server.Data;
 using Vorcall.Server.Permissions;
@@ -22,8 +23,10 @@ public sealed class ChatSocketHandler(
     ChannelDirectory channels,
     AttachmentStore attachments,
     ImageStore images,
+    DisabledAccounts accounts,
     IDbContextFactory<AppDbContext> contextFactory,
     IHostApplicationLifetime lifetime,
+    IConfiguration configuration,
     ILogger<ChatSocketHandler> logger)
 {
     private const int MaxInboundBytes = 16 * 1024;
@@ -46,10 +49,16 @@ public sealed class ChatSocketHandler(
     private const string UnknownMessageDetail = "unknown or deleted message";
     private const string InvalidNameDetail = "name must be 1..32 characters without control characters";
     private const string NotInVoiceDetail = "join the voice channel first";
+    private const string RateLimitedDetail = "too many messages, slow down";
 
     // The eight of PROTOCOL.md, compared as exact strings: the heart carries its variation
     // selector, so a client that drops it is not sending one of these.
     private static readonly string[] AcceptedReactions = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "👀"];
+
+    // One instance per connection, so this reads the configuration once per session; the values
+    // are fixed for the process either way, and an unusable one throws here rather than silently
+    // leaving the writes unlimited.
+    private readonly ChatLimits _limits = ChatLimits.FromConfiguration(configuration);
 
     private static readonly TimeSpan HelloDeadline = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan IdleDeadline = TimeSpan.FromSeconds(120);
@@ -66,6 +75,17 @@ public sealed class ChatSocketHandler(
     {
         var connection = new ClientConnection(socket, logger, requestAborted, lifetime.ApplicationStopping);
         var reader = new SocketReader(connection, logger);
+
+        // Everything this session logs from here down — the registry, the services it awaits —
+        // carries who and which socket, so one friend's session can be read out of a log file
+        // that has every other connection interleaved into it.
+        using var scope = logger.BeginScope(new Dictionary<string, object>
+        {
+            ["SessionId"] = SessionId(connection),
+            ["UserId"] = userId,
+            ["Username"] = username,
+        });
+
         registry.Add(connection);
         logger.LogDebug("Connection {ConnectionId} accepted for user {UserId}", connection.Id, userId);
 
@@ -171,8 +191,9 @@ public sealed class ChatSocketHandler(
         await RecordClientAsync(userId, clientVersion, clientPlatform);
 
         logger.LogInformation(
-            "Connection {ConnectionId} (user {UserId} {Username}, client {ClientVersion} {ClientPlatform}) connected; {ConnectionCount} live, latest message {LatestMessageId}",
+            "Connection {ConnectionId} (session {SessionId}, user {UserId} {Username}, client {ClientVersion} {ClientPlatform}) connected; {ConnectionCount} live, latest message {LatestMessageId}",
             connection.Id,
+            SessionId(connection),
             userId,
             username,
             clientVersion ?? "-",
@@ -217,6 +238,11 @@ public sealed class ChatSocketHandler(
 
     private async Task PumpAsync(ClientConnection connection, SocketReader reader)
     {
+        // Per live connection, and an account only has one: a replaced session starts over with
+        // a full bucket, which costs nothing a reconnect did not already cost.
+        var limiter = new WriteLimiter(_limits);
+        var rejectionLogged = false;
+
         while (true)
         {
             var received = await reader.ReadAsync(IdleDeadline);
@@ -247,6 +273,47 @@ public sealed class ChatSocketHandler(
             {
                 await FailAsync(connection, ErrorCode.Protocol, "unparsable frame", ProtocolClose, "unparsable frame");
                 return;
+            }
+
+            // An account disabled while this socket was open is otherwise invisible to it: the
+            // bearer was checked at the upgrade and never again. One cached lookup per write frame
+            // closes that gap without the admin endpoint; reads stay free, like the limiter. A ban
+            // is the registry's own business: it closes the socket as it writes the bans row.
+            if (IsWrite(frame.PayloadCase)
+                && connection.UserId is { } writer
+                && await accounts.IsDisabledAsync(writer, connection.Lifetime))
+            {
+                logger.LogInformation(
+                    "Connection {ConnectionId} of disabled account {UserId} closed at its next write frame",
+                    connection.Id,
+                    writer);
+                await CloseAsync(connection, VorcallCloseStatus.Disabled, "account disabled");
+                return;
+            }
+
+            // Only the five frames any member may send without a permission are charged; reads,
+            // presence, voice, share signalling, pings and every permission-gated management or
+            // moderation frame stay free so a throttled account can still navigate and a settings
+            // page can save a burst of changes.
+            if (IsRateLimited(frame.PayloadCase) && !limiter.TryTake())
+            {
+                Interlocked.Increment(ref WriteLimiter.RejectedTotal);
+                if (!rejectionLogged)
+                {
+                    rejectionLogged = true;
+                    logger.LogDebug(
+                        "Connection {ConnectionId} hit the write rate limit on a {PayloadCase} frame",
+                        connection.Id,
+                        frame.PayloadCase);
+                }
+
+                if (!NonFatal(connection, ErrorCode.RateLimited, RateLimitedDetail))
+                {
+                    await CloseAsync(connection, VorcallCloseStatus.SlowConsumer, "slow consumer");
+                    return;
+                }
+
+                continue;
             }
 
             switch (await DispatchAsync(connection, frame))
@@ -1038,6 +1105,52 @@ public sealed class ChatSocketHandler(
     private static bool Denied(ClientConnection connection, Perm bit)
         => NonFatal(connection, ErrorCode.PermissionDenied, PermNames.Name(bit));
 
+    // Every frame that persists a row, which is every frame the registry or MessageService writes
+    // for. MarkRead is left out although it moves a cursor: the client debounces it to one call a
+    // second per channel, and charging navigation is what the limiter is meant to avoid. Hello,
+    // Ping, the voice and share signalling frames write nothing at all.
+    private static bool IsWrite(ClientFrame.PayloadOneofCase payloadCase) => payloadCase is
+        ClientFrame.PayloadOneofCase.Send
+        or ClientFrame.PayloadOneofCase.EditMessage
+        or ClientFrame.PayloadOneofCase.DeleteMessage
+        or ClientFrame.PayloadOneofCase.React
+        or ClientFrame.PayloadOneofCase.OpenDm
+        or ClientFrame.PayloadOneofCase.CreateChannel
+        or ClientFrame.PayloadOneofCase.UpdateChannel
+        or ClientFrame.PayloadOneofCase.DeleteChannel
+        or ClientFrame.PayloadOneofCase.CreateCategory
+        or ClientFrame.PayloadOneofCase.UpdateCategory
+        or ClientFrame.PayloadOneofCase.DeleteCategory
+        or ClientFrame.PayloadOneofCase.ReorderChannels
+        or ClientFrame.PayloadOneofCase.ReorderCategories
+        or ClientFrame.PayloadOneofCase.SetOverride
+        or ClientFrame.PayloadOneofCase.CreateRole
+        or ClientFrame.PayloadOneofCase.UpdateRole
+        or ClientFrame.PayloadOneofCase.DeleteRole
+        or ClientFrame.PayloadOneofCase.ReorderRoles
+        or ClientFrame.PayloadOneofCase.SetMemberRoles
+        or ClientFrame.PayloadOneofCase.SetNickname
+        or ClientFrame.PayloadOneofCase.KickMember
+        or ClientFrame.PayloadOneofCase.BanMember
+        or ClientFrame.PayloadOneofCase.UnbanMember
+        or ClientFrame.PayloadOneofCase.UpdateServer
+        or ClientFrame.PayloadOneofCase.TransferOwnership
+        or ClientFrame.PayloadOneofCase.VoiceModerate
+        or ClientFrame.PayloadOneofCase.UpdateProfile;
+
+    // These five are every frame an unprivileged account can send at will, so they are what a
+    // flood would actually come from; the write limiter charges only them. Every management and
+    // moderation frame in IsWrite above sits behind a permission bit (MANAGE_CHANNELS,
+    // MANAGE_ROLES, BAN_MEMBERS, ...) that only a trusted member holds, and a settings page
+    // legitimately fires many of them in one burst — e.g. one SetOverride per switch while
+    // editing a role's permissions.
+    private static bool IsRateLimited(ClientFrame.PayloadOneofCase payloadCase) => payloadCase is
+        ClientFrame.PayloadOneofCase.Send
+        or ClientFrame.PayloadOneofCase.EditMessage
+        or ClientFrame.PayloadOneofCase.DeleteMessage
+        or ClientFrame.PayloadOneofCase.React
+        or ClientFrame.PayloadOneofCase.OpenDm;
+
     // Non-fatal errors ride the same outbox as everything else, so a refusal means the sender
     // itself has fallen behind and the caller closes it as a slow consumer.
     private static bool NonFatal(ClientConnection connection, ErrorCode code, string detail)
@@ -1211,11 +1324,16 @@ public sealed class ChatSocketHandler(
     // requested pair is only a fallback, and a close this handler awaited always latched one.
     private void LogDisconnect(ClientConnection connection, WebSocketCloseStatus? requestedStatus = null, string? requestedReason = null)
         => logger.LogInformation(
-            "Connection {ConnectionId} ({Username}) disconnected with {CloseCode} {CloseReason}",
+            "Connection {ConnectionId} (session {SessionId}, {Username}) disconnected with {CloseCode} {CloseReason}",
             connection.Id,
+            SessionId(connection),
             connection.Username,
             (int)(connection.CloseStatus ?? requestedStatus ?? WebSocketCloseStatus.Empty),
             connection.CloseReason ?? requestedReason ?? string.Empty);
+
+    // The first eight hex digits of the connection id: short enough to head every console line,
+    // still unique among the handful of sessions a friend group ever has open at once.
+    private static string SessionId(ClientConnection connection) => connection.Id.ToString("N")[..8];
 
     // What the pump does after one frame: carry on, or end the connection the way the frame asked
     // for.

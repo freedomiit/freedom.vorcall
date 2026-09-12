@@ -302,6 +302,10 @@ namespace Vorcall.Server.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("expires_at");
 
+                    b.Property<DateTime?>("RevokedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("revoked_at");
+
                     b.Property<DateTime?>("UsedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("used_at");
@@ -619,6 +623,10 @@ namespace Vorcall.Server.Migrations
                         .HasColumnType("character varying(256)")
                         .HasDefaultValue("")
                         .HasColumnName("description");
+
+                    b.Property<DateTime?>("DisabledAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("disabled_at");
 
                     b.Property<string>("LastClientPlatform")
                         .HasMaxLength(64)

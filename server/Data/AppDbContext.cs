@@ -86,6 +86,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         user.Property(u => u.LastClientVersion).HasColumnName("last_client_version").HasMaxLength(64);
         user.Property(u => u.LastClientPlatform).HasColumnName("last_client_platform").HasMaxLength(64);
         user.Property(u => u.LastSeenAt).HasColumnName("last_seen_at").HasColumnType("timestamp with time zone");
+        user.Property(u => u.DisabledAt).HasColumnName("disabled_at").HasColumnType("timestamp with time zone");
         user.HasIndex(u => u.UsernameNormalized).IsUnique();
 
         var refreshToken = modelBuilder.Entity<RefreshToken>();
@@ -118,6 +119,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // outlives the account that minted or consumed it.
         invite.Property(i => i.CreatedBy).HasColumnName("created_by");
         invite.Property(i => i.UsedByUserId).HasColumnName("used_by_user_id");
+        invite.Property(i => i.RevokedAt).HasColumnName("revoked_at").HasColumnType("timestamp with time zone");
         invite.HasIndex(i => i.CodeHash).IsUnique();
 
         var server = modelBuilder.Entity<Server>();

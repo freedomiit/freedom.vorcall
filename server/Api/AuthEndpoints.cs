@@ -14,6 +14,9 @@ public static class AuthEndpoints
     // to stop trying rather than sign in again.
     private const string BannedDetail = "banned";
 
+    // An admin lock on the account rather than moderation: the same 403, its own detail.
+    private const string DisabledDetail = "account disabled";
+
     public static void Map(WebApplication app)
     {
         app.MapPost("/api/auth/register", RegisterAsync).RequireRateLimiting(RateLimitPolicy);
@@ -87,6 +90,11 @@ public static class AuthEndpoints
             case LoginStatus.Banned:
                 return ProtobufBody.Fail(StatusCodes.Status403Forbidden, BannedDetail);
 
+            // Only ever reached with the right password, so naming the reason tells the holder
+            // of the account something they are entitled to know.
+            case LoginStatus.Disabled:
+                return ProtobufBody.Fail(StatusCodes.Status403Forbidden, DisabledDetail);
+
             default:
                 return ProtobufBody.Proto(outcome.Tokens!);
         }
@@ -104,6 +112,7 @@ public static class AuthEndpoints
         return outcome.Status switch
         {
             AccountRefreshStatus.Banned => ProtobufBody.Fail(StatusCodes.Status403Forbidden, BannedDetail),
+            AccountRefreshStatus.Disabled => ProtobufBody.Fail(StatusCodes.Status403Forbidden, DisabledDetail),
             AccountRefreshStatus.Rotated => ProtobufBody.Proto(outcome.Tokens!),
             _ => ProtobufBody.Fail(StatusCodes.Status401Unauthorized, "refresh token is invalid"),
         };

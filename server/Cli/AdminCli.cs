@@ -1,7 +1,11 @@
 using System.Globalization;
+using System.Net;
 using System.Text;
+using System.Text.Json;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Vorcall.Server.Admin;
+using Vorcall.Server.Api;
 using Vorcall.Server.Auth;
 using Vorcall.Server.Chat;
 using Vorcall.Server.Data;
@@ -16,6 +20,14 @@ public static class AdminCli
     private const int DefaultInviteDays = 7;
     private const int MaxVersionEcho = 32;
     private const int UsageExitCode = 2;
+
+    // PROTOCOL.md's two admin close codes, mirroring VorcallCloseStatus on the other side.
+    private const int KickedCloseCode = 4001;
+    private const int DisabledCloseCode = 4003;
+
+    private const string AdminOffMessage = "admin endpoints are off (Vorcall__AdminKey is not set)";
+    private const string DisableNote = "the lock holds in the database; a live session is closed at its next message, and signing in is refused";
+    private const string EnableNote = "the unlock holds in the database; sign-in works again within 30 seconds";
 
     public static bool IsCliInvocation(string[] args) => args.Length > 0 && args[0] is "invites" or "users" or "server";
 
@@ -71,18 +83,61 @@ public static class AdminCli
                         i.CreatedAt,
                         i.ExpiresAt,
                         i.UsedAt,
+                        i.RevokedAt,
                         Username = db.Users.Where(u => u.Id == i.UsedByUserId).Select(u => u.Username).FirstOrDefault(),
                     })
                     .ToListAsync();
 
                 foreach (var invite in invites)
                 {
+                    // Used first: an invite that was claimed can no longer be revoked, so that is
+                    // the state worth seeing even if someone tried afterwards.
                     var state = invite.UsedAt is not null
                         ? $"used by {invite.Username ?? "(deleted account)"}"
+                        : invite.RevokedAt is not null ? "revoked"
                         : invite.ExpiresAt <= now ? "expired" : "unused";
                     Console.WriteLine($"{invite.Id}  created {Format(invite.CreatedAt)}  expires {Format(invite.ExpiresAt)}  {state}");
                 }
 
+                return 0;
+            }
+
+            case "revoke":
+            {
+                if (Argument(args, 2) is not { } requested
+                    || !long.TryParse(requested, NumberStyles.Integer, CultureInfo.InvariantCulture, out var id))
+                {
+                    return Usage();
+                }
+
+                var invite = await db.Invites.FirstOrDefaultAsync(i => i.Id == id);
+                if (invite is null)
+                {
+                    Console.Error.WriteLine("No such invite.");
+                    return 1;
+                }
+
+                if (invite.UsedAt is not null)
+                {
+                    Console.Error.WriteLine($"Invite {id} was already used on {Format(invite.UsedAt.Value)}.");
+                    return 1;
+                }
+
+                if (invite.RevokedAt is not null)
+                {
+                    Console.WriteLine($"Invite {id} was already revoked on {Format(invite.RevokedAt.Value)}.");
+                    return 0;
+                }
+
+                if (invite.ExpiresAt <= now)
+                {
+                    Console.Error.WriteLine($"Invite {id} expired on {Format(invite.ExpiresAt)} and cannot be used anyway.");
+                    return 1;
+                }
+
+                invite.RevokedAt = now;
+                await db.SaveChangesAsync();
+                Console.WriteLine($"Revoked invite {id}");
                 return 0;
             }
 
@@ -109,6 +164,7 @@ public static class AdminCli
                         u.LastClientVersion,
                         u.LastClientPlatform,
                         u.LastSeenAt,
+                        u.DisabledAt,
                         Sessions = db.RefreshTokens.Count(t => t.UserId == u.Id && t.RevokedAt == null && t.ExpiresAt > now),
                     })
                     .ToListAsync();
@@ -117,7 +173,8 @@ public static class AdminCli
                 {
                     Console.WriteLine(
                         $"{user.Id}  {user.Username}  created {Format(user.CreatedAt)}  {user.Sessions} active session(s)"
-                        + FormatClient(user.LastClientVersion, user.LastClientPlatform, user.LastSeenAt));
+                        + FormatClient(user.LastClientVersion, user.LastClientPlatform, user.LastSeenAt)
+                        + (user.DisabledAt is null ? string.Empty : $"  disabled {Format(user.DisabledAt.Value)}"));
                 }
 
                 return 0;
@@ -182,6 +239,133 @@ public static class AdminCli
                     Console.WriteLine(
                         $"{account.Id}  {account.Username}"
                         + FormatClient(account.LastClientVersion, account.LastClientPlatform, account.LastSeenAt));
+                }
+
+                return 0;
+            }
+
+            case "kick":
+            {
+                if (Argument(args, 2) is not { } requested || string.IsNullOrWhiteSpace(requested))
+                {
+                    return Usage();
+                }
+
+                var user = await FindUserAsync(db, requested);
+                if (user is null)
+                {
+                    return NoSuchUser();
+                }
+
+                using var admin = new AdminReach(services);
+                if (!admin.Configured)
+                {
+                    Console.Error.WriteLine(AdminOffMessage);
+                    return 1;
+                }
+
+                // The account keeps its password and its sessions: a kick is a closed socket and
+                // nothing else, so the client is free to come straight back.
+                var kicked = await admin.KickAsync(user.Id, KickedCloseCode, "kicked by admin");
+                if (kicked == KickResult.Failed)
+                {
+                    return 1;
+                }
+
+                Console.WriteLine(kicked == KickResult.Closed
+                    ? $"Closed the live connection of {user.Username}"
+                    : $"{user.Username} has no live connection");
+                return 0;
+            }
+
+            case "disable":
+            {
+                if (Argument(args, 2) is not { } requested || string.IsNullOrWhiteSpace(requested))
+                {
+                    return Usage();
+                }
+
+                var user = await FindUserAsync(db, requested);
+                if (user is null)
+                {
+                    return NoSuchUser();
+                }
+
+                // A lock on the account, not the moderation ban: it only refuses a sign-in and
+                // closes the open socket, and leaves the member's messages, overrides and
+                // membership of the server exactly as they are. The database first and the live
+                // server second, because the lock has to hold even if nothing is listening, which
+                // is also why neither call below can fail this command once the row is written.
+                user.DisabledAt ??= now;
+                await db.SaveChangesAsync();
+                await tokens.RevokeAllAsync(db, user.Id, keepTokenId: null, now);
+                Console.WriteLine($"Disabled {user.Username} and revoked every refresh token");
+
+                using var admin = new AdminReach(services);
+                if (!admin.Configured)
+                {
+                    Console.Error.WriteLine(AdminOffMessage);
+                    Console.Error.WriteLine(DisableNote);
+                    return 0;
+                }
+
+                // Cache first, socket second: a client that reconnects between the two is
+                // refused the upgrade rather than let back in.
+                if (!await admin.RefreshAsync(user.Id))
+                {
+                    Console.Error.WriteLine(DisableNote);
+                    return 0;
+                }
+
+                var kicked = await admin.KickAsync(user.Id, DisabledCloseCode, "account disabled");
+                if (kicked == KickResult.Failed)
+                {
+                    Console.Error.WriteLine(DisableNote);
+                    return 0;
+                }
+
+                Console.WriteLine(kicked == KickResult.Closed
+                    ? $"Closed the live connection of {user.Username}"
+                    : $"{user.Username} had no live connection");
+                return 0;
+            }
+
+            case "enable":
+            {
+                if (Argument(args, 2) is not { } requested || string.IsNullOrWhiteSpace(requested))
+                {
+                    return Usage();
+                }
+
+                var user = await FindUserAsync(db, requested);
+                if (user is null)
+                {
+                    return NoSuchUser();
+                }
+
+                if (user.DisabledAt is null)
+                {
+                    Console.WriteLine($"{user.Username} is not disabled");
+                    return 0;
+                }
+
+                user.DisabledAt = null;
+                await db.SaveChangesAsync();
+
+                // The sessions the lock revoked are not restored: signing in again is the point.
+                Console.WriteLine($"Enabled {user.Username}; they can sign in again");
+
+                using var admin = new AdminReach(services);
+                if (!admin.Configured)
+                {
+                    Console.Error.WriteLine(AdminOffMessage);
+                    Console.Error.WriteLine(EnableNote);
+                    return 0;
+                }
+
+                if (!await admin.RefreshAsync(user.Id))
+                {
+                    Console.Error.WriteLine(EnableNote);
                 }
 
                 return 0;
@@ -387,13 +571,120 @@ public static class AdminCli
             Usage:
               invites new [--days N]           create an invite code (default 7 days, 1..365)
               invites list                     list every invite
+              invites revoke <id>              make an unused invite code unusable
               users list                       list every account
               users outdated [--min X.Y.Z]     list accounts below the published release
+              users kick <name>                close an account's live connection
+              users disable <name>             lock an account out of signing in, revoke its sessions and close its socket
+              users enable <name>              let a disabled account sign in again
               users revoke-sessions <name>     revoke every refresh token of an account
               users set-password <name>        set an account's password and revoke its sessions
               server set-owner <username>      set who owns the server
               server show                      show the server's name, owner and general channel
             """);
         return UsageExitCode;
+    }
+
+    private enum KickResult
+    {
+        Closed,
+        NotConnected,
+        Failed,
+    }
+
+    // The CLI's half of the admin endpoint: closing a live socket is the one thing a second
+    // process against the same database cannot do on its own. One client for the whole
+    // invocation, because "users disable" makes two calls. Neither key is ever printed.
+    private sealed class AdminReach : IDisposable
+    {
+        private static readonly TimeSpan CallTimeout = TimeSpan.FromSeconds(5);
+
+        private readonly HttpClient _http = new() { Timeout = CallTimeout };
+        private readonly AdminOptions _options;
+        private readonly string? _serverKey;
+
+        public AdminReach(IServiceProvider services)
+        {
+            _options = services.GetRequiredService<AdminOptions>();
+
+            // ServerKeyValidator keeps only a digest of the door key, so it is read from the
+            // configuration the server itself was given.
+            _serverKey = services.GetRequiredService<IConfiguration>()["Vorcall:ServerKey"];
+        }
+
+        public bool Configured => _options.Key is not null;
+
+        public async Task<KickResult> KickAsync(long userId, int code, string reason)
+        {
+            using var response = await SendAsync("api/admin/kick", new KickRequest(userId, code, reason));
+            if (response is null)
+            {
+                return KickResult.Failed;
+            }
+
+            try
+            {
+                var answer = await response.Content.ReadFromJsonAsync<KickResponse>(JsonSerializerOptions.Web);
+                return answer is { Closed: true } ? KickResult.Closed : KickResult.NotConnected;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or JsonException or TaskCanceledException)
+            {
+                Console.Error.WriteLine($"server answered something this build cannot read: {ex.Message}");
+                return KickResult.Failed;
+            }
+        }
+
+        public async Task<bool> RefreshAsync(long userId)
+        {
+            using var response = await SendAsync("api/admin/refresh-account", new RefreshRequest(userId));
+            return response is not null;
+        }
+
+        public void Dispose() => _http.Dispose();
+
+        // Null means the call did not land; whatever went wrong is already on stderr.
+        private async Task<HttpResponseMessage?> SendAsync(string path, object body)
+        {
+            if (_options.Key is not { } key)
+            {
+                Console.Error.WriteLine(AdminOffMessage);
+                return null;
+            }
+
+            var url = $"{_options.Url.TrimEnd('/')}/{path}";
+            using var request = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = JsonContent.Create(body, options: JsonSerializerOptions.Web),
+            };
+            request.Headers.TryAddWithoutValidation(AdminEndpoints.AdminKeyHeader, key);
+            request.Headers.TryAddWithoutValidation(ServerKeyMiddleware.HeaderName, _serverKey ?? string.Empty);
+
+            try
+            {
+                var response = await _http.SendAsync(request);
+                if (response.IsSuccessStatusCode)
+                {
+                    return response;
+                }
+
+                // Both gates answer 404, so it is the one status that needs saying out loud.
+                Console.Error.WriteLine(response.StatusCode == HttpStatusCode.NotFound
+                    ? $"server refused the request (404): wrong admin key, or {url} is not a private address to it"
+                    : $"server refused the request ({(int)response.StatusCode})");
+                response.Dispose();
+                return null;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                Console.Error.WriteLine($"server not reachable: {ex.Message}");
+                return null;
+            }
+        }
+
+        private sealed record KickRequest(long UserId, int Code, string Reason);
+
+        private sealed record RefreshRequest(long UserId);
+
+        private sealed record KickResponse(bool Closed);
     }
 }

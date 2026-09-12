@@ -26,7 +26,6 @@ serde_json.workspace = true
 tiny-skia.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 vorcall-core.workspace = true
 vorcall-hotkey.workspace = true
 vorcall-screen.workspace = true

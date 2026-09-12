@@ -6,10 +6,16 @@ using Vorcall.Server.Protocol;
 
 namespace Vorcall.Server.Chat;
 
-// RFC 6455 leaves 1013 to the application, so WebSocketCloseStatus has no member for it.
+// RFC 6455 leaves 1013 to the application, so WebSocketCloseStatus has no member for it, and
+// 4000..4999 is the private range PROTOCOL.md spends on the two admin closes.
 internal static class VorcallCloseStatus
 {
     public const WebSocketCloseStatus SlowConsumer = (WebSocketCloseStatus)1013;
+
+    public const WebSocketCloseStatus Kicked = (WebSocketCloseStatus)4001;
+
+    // The owner's account lock (`users disable`), not the in-app moderation ban.
+    public const WebSocketCloseStatus Disabled = (WebSocketCloseStatus)4003;
 }
 
 // One of these per accepted socket. Everything the server sends goes through the outbox so

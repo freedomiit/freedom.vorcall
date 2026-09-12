@@ -18,7 +18,10 @@ name: release
 #   3. job "build"             — builds vorcall on macos-latest with the
 #      production server key baked in, checks the binary reports the expected
 #      version, wraps it as Vorcall.app inside a DMG and uploads binary +
-#      .sha256 + DMG.
+#      .sha256 + DMG. It also builds vorcall-probe and uploads it as a
+#      separate, dry-run-included workflow artifact (vorcall-probe-macos-aarch64)
+#      for the owner to run the capture oracle on a Mac — never attached to the
+#      GitHub Release, listed in the manifest, or pushed to the host.
 #   4. job "windows-installer" — publish only: fetches the pushed
 #      vorcall-windows-x86_64.exe from the host, verifies its checksum and
 #      compiles the per-user Inno Setup installer around it.
@@ -223,6 +226,13 @@ jobs:
           VORCALL_SERVER_KEY: ${{ secrets.VORCALL_SERVER_KEY }}
         run: cargo build --release -p vorcall-app
 
+      - name: Build the probe
+        # gives the owner a macOS vorcall-probe to run the capture oracle on a
+        # Mac, since none of the developers have one; not part of the release.
+        env:
+          VORCALL_SERVER_KEY: ${{ secrets.VORCALL_SERVER_KEY }}
+        run: cargo build --release -p vorcall-probe
+
       - name: No aws-lc-rs in the graph
         # the Windows cross build (cargo-xwin, run by scripts/push-client.sh)
         # and this release gate both depend on aws-lc-rs staying out of the
@@ -233,12 +243,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ../dist && cp "target/release/vorcall${EXT}" "../dist/vorcall-${PLATFORM}${EXT}"
+          cp "target/release/vorcall-probe${EXT}" "../dist/vorcall-probe-${PLATFORM}${EXT}"
 
       - name: Ad-hoc signature
         # Apple Silicon refuses to run unsigned arm64 binaries; an ad-hoc
         # signature is enough to launch. Gatekeeper's first-run prompt is
         # documented in the README.
         run: codesign -s - --force "../dist/vorcall-macos-aarch64" && codesign -dv "../dist/vorcall-macos-aarch64"
+
+      - name: Ad-hoc signature (probe)
+        run: codesign -s - --force "../dist/vorcall-probe-macos-aarch64" && codesign -dv "../dist/vorcall-probe-macos-aarch64"
 
       - name: Check the reported version
         run: |
@@ -271,6 +285,13 @@ jobs:
         with:
           name: vorcall-${{ matrix.platform }}
           path: dist/vorcall-${{ matrix.platform }}*
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vorcall-probe-macos-aarch64
+          path: dist/vorcall-probe-macos-aarch64
           retention-days: 7
           if-no-files-found: error
 

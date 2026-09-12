@@ -90,6 +90,9 @@ pub struct App {
     /// Whether this process has checked at all: the first connection is what
     /// starts it, and every reconnect after that must not.
     pub checked_on_connect: bool,
+    /// The last run left a crash report behind and nobody has been asked about it
+    /// yet. Cleared by the offer, whichever way it is answered.
+    pub crash_offer: bool,
     /// What an earlier answer said about the update in flight. The download
     /// progress never says whether it is required, and `Restarting` carries no
     /// manifest of its own, so both read this instead.
@@ -268,7 +271,7 @@ impl App {
         };
         let ui = UiState::new(&config);
 
-        Self {
+        let mut app = Self {
             endpoints,
             session,
             session_generation: 0,
@@ -284,6 +287,9 @@ impl App {
             update_keys,
             update_notes: None,
             checked_on_connect: false,
+            // Listing the directory is all this reads; the files themselves are
+            // only ever read off the UI thread.
+            crash_offer: !vorcall_core::diagnostics::crash_reports().is_empty(),
             force_required: false,
             pending_restart: None,
             splash: None,
@@ -296,7 +302,11 @@ impl App {
             audio_unavailable: false,
             last_toast: None,
             workers: Workers::default(),
-        }
+        };
+        // A stored session lands straight in the shell, which is where the offer
+        // belongs.
+        update::settings::offer_crash_report(&mut app);
+        app
     }
 
     /// Builds the state and asks for the first window: the splash, or the main
@@ -665,6 +675,8 @@ impl App {
         self.session_generation = self.session_generation.wrapping_add(1);
         self.ui.route = state::ui::Route::Main;
         self.ui.dialog = None;
+        // After the dialog is cleared: the offer is one of the dialogs.
+        update::settings::offer_crash_report(self);
         operation::focus(Id::new(view::COMPOSER_ID))
     }
 

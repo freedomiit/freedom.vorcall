@@ -280,6 +280,13 @@ pub enum SettingsMsg {
     KeybindCaptured(String, String),
     KeybindReset(String),
     KeybindCancel,
+    /// The diagnostics button that hands the log and every crash report over.
+    ReportProblem,
+    /// How many files reached the server, or why none did.
+    ReportFinished(Result<usize, String>),
+    /// The two answers to the offer made after a crash.
+    SendCrashReport,
+    DismissCrashReport,
 }
 
 /// The server settings pages. Everything here needs a permission the mirror

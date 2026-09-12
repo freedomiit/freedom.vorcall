@@ -10,6 +10,22 @@ using System.Threading.Channels;
 
 namespace Vorcall.Server.Voice;
 
+// The relay's totals, summed across every channel. Drops are keyed by reason rather than carried
+// as fields so the exposition can walk them: the reason set is fixed and small, unlike the
+// channels, which never become labels.
+public readonly record struct RelaySnapshot(
+    int Sessions,
+    long PacketsIn,
+    long PacketsOut,
+    long BytesIn,
+    long BytesOut,
+    long SharePacketsIn,
+    long SharePacketsOut,
+    long ShareBytesIn,
+    long ShareBytesOut,
+    long KeyframeRequests,
+    IReadOnlyDictionary<string, long> Drops);
+
 // The media path: one UDP socket, one receive loop, one key per voice session. Every datagram
 // is authenticated before anything is forwarded, and the relay only ever sends to an address
 // that a session's own key has already been proved from, so the socket cannot be used to
@@ -35,6 +51,11 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
     // Copy-on-write under _gate so the receive loop forwards over a snapshot without locking.
     private readonly ConcurrentDictionary<long, ImmutableArray<VoiceSession>> _channels = new();
     private readonly ConcurrentDictionary<long, ChannelCounters> _counters = new();
+
+    // The same figures summed across channels, kept alongside rather than added up per scrape:
+    // _counters never drops a channel, so summing it would cost more the longer the process runs.
+    private readonly ChannelCounters _totals = new();
+
     private readonly Lock _gate = new();
 
     // These three drops happen before a datagram is attached to any session, so there is no
@@ -103,6 +124,9 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             {
                 return;
             }
+
+            // Its evictions stay in the exposed total: a counter that dropped with the session would read as a reset.
+            Interlocked.Add(ref _totals.DropQueueFull, session.QueueDrops);
 
             if (_channels.TryGetValue(session.ChannelId, out var members))
             {
@@ -237,6 +261,52 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
     }
 
+    // The relay's totals for one scrape. Lock-free: every figure is a single interlocked read,
+    // so the picture is consistent per counter rather than across them, which is all a counter
+    // exposition ever promises.
+    public RelaySnapshot Snapshot()
+    {
+        // Queue evictions are counted on the session whose queue overflowed: live sessions' are
+        // added here, and a removed session's were folded into the total by RemoveSession.
+        var queueDrops = Interlocked.Read(ref _totals.DropQueueFull);
+        foreach (var (_, session) in _sessions)
+        {
+            queueDrops += session.QueueDrops;
+        }
+
+        var drops = new Dictionary<string, long>(StringComparer.Ordinal)
+        {
+            ["size"] = Interlocked.Read(ref _dropSize),
+            ["header"] = Interlocked.Read(ref _dropHeader),
+            ["unknown_ssrc"] = Interlocked.Read(ref _dropUnknownSsrc),
+            ["rate"] = Interlocked.Read(ref _totals.DropRate),
+            ["bad_tag"] = Interlocked.Read(ref _totals.DropBadTag),
+            ["replay"] = Interlocked.Read(ref _totals.DropReplay),
+            ["no_address"] = Interlocked.Read(ref _totals.DropNoAddress),
+            ["share_rate"] = Interlocked.Read(ref _totals.DropShareRate),
+            ["not_sharing"] = Interlocked.Read(ref _totals.DropNotSharing),
+            ["muted"] = Interlocked.Read(ref _totals.DropMuted),
+            ["not_watching"] = Interlocked.Read(ref _totals.DropNotWatching),
+            ["queue_full"] = queueDrops,
+            ["send_error"] = Interlocked.Read(ref _totals.DropSendError),
+            ["channel_gone"] = Interlocked.Read(ref _totals.DropChannelGone),
+            ["seal_failed"] = Interlocked.Read(ref _totals.DropSealFailed),
+        };
+
+        return new RelaySnapshot(
+            _sessions.Count,
+            Interlocked.Read(ref _totals.PacketsIn),
+            Interlocked.Read(ref _totals.PacketsOut),
+            Interlocked.Read(ref _totals.BytesIn),
+            Interlocked.Read(ref _totals.BytesOut),
+            Interlocked.Read(ref _totals.SharePacketsIn),
+            Interlocked.Read(ref _totals.SharePacketsOut),
+            Interlocked.Read(ref _totals.ShareBytesIn),
+            Interlocked.Read(ref _totals.ShareBytesOut),
+            Interlocked.Read(ref _totals.KeyframeRequests),
+            drops);
+    }
+
     public override Task StartAsync(CancellationToken cancellationToken)
     {
         if (!options.Enabled)
@@ -295,6 +365,20 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         return socket is null
             ? Task.CompletedTask
             : Task.WhenAll(ReceiveLoopAsync(socket, stoppingToken), HousekeepingAsync(stoppingToken));
+    }
+
+    // Every per-channel figure moves the relay-wide one with it, so the two can never drift and
+    // the scrape never has to walk the channels.
+    private static void Bump(ref long channel, ref long total)
+    {
+        Interlocked.Increment(ref channel);
+        Interlocked.Increment(ref total);
+    }
+
+    private static void BumpBy(ref long channel, ref long total, long amount)
+    {
+        Interlocked.Add(ref channel, amount);
+        Interlocked.Add(ref total, amount);
     }
 
     private static uint NextSsrc()
@@ -448,7 +532,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         var share = header.Type is MediaHeader.TypeVideo or MediaHeader.TypeShareAudio;
         if (!share && !session.Bucket.TryTake(Stopwatch.GetTimestamp()))
         {
-            Interlocked.Increment(ref counters.DropRate);
+            Bump(ref counters.DropRate, ref _totals.DropRate);
             return false;
         }
 
@@ -461,7 +545,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             plaintext.AsSpan(0, plaintextLength),
             datagram[..MediaHeader.Length]))
         {
-            Interlocked.Increment(ref counters.DropBadTag);
+            Bump(ref counters.DropBadTag, ref _totals.DropBadTag);
             return false;
         }
 
@@ -469,7 +553,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         // push it forward with a forged datagram and lock the real sender out.
         if (!session.Replay.Accept(header.Seq))
         {
-            Interlocked.Increment(ref counters.DropReplay);
+            Bump(ref counters.DropReplay, ref _totals.DropReplay);
             return false;
         }
 
@@ -479,13 +563,13 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         {
             if (!session.ShareBucket.TryTake(Stopwatch.GetTimestamp(), length))
             {
-                Interlocked.Increment(ref counters.DropShareRate);
+                Bump(ref counters.DropShareRate, ref _totals.DropShareRate);
                 return false;
             }
 
             if (!session.Sharing || (header.Type == MediaHeader.TypeShareAudio && !session.ShareAudio))
             {
-                Interlocked.Increment(ref counters.DropNotSharing);
+                Bump(ref counters.DropNotSharing, ref _totals.DropNotSharing);
                 return false;
             }
         }
@@ -495,12 +579,12 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         // Only audio is silenced — its pings, keyframe requests and share media carry on.
         if (header.Type == MediaHeader.TypeAudio && session.Muted)
         {
-            Interlocked.Increment(ref counters.DropMuted);
+            Bump(ref counters.DropMuted, ref _totals.DropMuted);
             return false;
         }
 
-        Interlocked.Increment(ref counters.PacketsIn);
-        Interlocked.Add(ref counters.BytesIn, length);
+        Bump(ref counters.PacketsIn, ref _totals.PacketsIn);
+        BumpBy(ref counters.BytesIn, ref _totals.BytesIn, length);
 
         if (session.LearnAddress(address))
         {
@@ -515,14 +599,15 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
     // recipient's own key. The sender never gets its own audio back.
     private async Task ForwardAsync(Socket socket, Inbound inbound, byte[] buffer, byte[] scratch, byte[] plaintext, CancellationToken stoppingToken)
     {
+        var counters = inbound.Counters;
         if (!_channels.TryGetValue(inbound.Session.ChannelId, out var members))
         {
+            Bump(ref counters.DropChannelGone, ref _totals.DropChannelGone);
             return;
         }
 
         buffer.AsSpan(0, MediaHeader.Length).CopyTo(scratch);
         var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
-        var counters = inbound.Counters;
 
         foreach (var member in members)
         {
@@ -535,7 +620,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
             if (member.Address is not { } destination)
             {
-                Interlocked.Increment(ref counters.DropNoAddress);
+                Bump(ref counters.DropNoAddress, ref _totals.DropNoAddress);
                 continue;
             }
 
@@ -543,6 +628,10 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             if (TrySeal(member, scratch, plaintext.AsSpan(0, inbound.PlaintextLength)))
             {
                 await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
+            }
+            else
+            {
+                Bump(ref counters.DropSealFailed, ref _totals.DropSealFailed);
             }
         }
     }
@@ -562,12 +651,12 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         if (!inbound.Session.ShareWriter.TryWrite(new VoiceSession.Outbound(rented, inbound.PlaintextLength)))
         {
             ArrayPool<byte>.Shared.Return(rented);
-            Interlocked.Increment(ref counters.DropQueueFull);
+            Bump(ref counters.DropQueueFull, ref _totals.DropQueueFull);
             return;
         }
 
-        Interlocked.Increment(ref counters.SharePacketsIn);
-        Interlocked.Add(ref counters.ShareBytesIn, length + MediaHeader.TagLength);
+        Bump(ref counters.SharePacketsIn, ref _totals.SharePacketsIn);
+        BumpBy(ref counters.ShareBytesIn, ref _totals.ShareBytesIn, length + MediaHeader.TagLength);
     }
 
     // One sharer's fan-out, on its own task: the sends are synchronous because a share is a
@@ -640,23 +729,26 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
             if (watcher.Address is not { } destination)
             {
-                Interlocked.Increment(ref counters.DropNoAddress);
+                Bump(ref counters.DropNoAddress, ref _totals.DropNoAddress);
                 continue;
             }
 
+            // As in ForwardAsync: the watcher went away while this frame was in flight.
             if (!TrySeal(watcher, scratch, plaintext))
             {
+                Bump(ref counters.DropSealFailed, ref _totals.DropSealFailed);
                 continue;
             }
 
             try
             {
                 var sent = socket.SendTo(scratch, 0, length, SocketFlags.None, destination);
-                Interlocked.Increment(ref counters.SharePacketsOut);
-                Interlocked.Add(ref counters.ShareBytesOut, sent);
+                Bump(ref counters.SharePacketsOut, ref _totals.SharePacketsOut);
+                BumpBy(ref counters.ShareBytesOut, ref _totals.ShareBytesOut, sent);
             }
             catch (SocketException ex)
             {
+                Bump(ref counters.DropSendError, ref _totals.DropSendError);
                 logger.LogDebug(ex, "Voice share send failed with {SocketError}", ex.SocketErrorCode);
             }
             catch (ObjectDisposedException)
@@ -678,13 +770,13 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             || inbound.Session.Watching is not { } target
             || target.Ssrc != BinaryPrimitives.ReadUInt32BigEndian(plaintext))
         {
-            Interlocked.Increment(ref counters.DropNotWatching);
+            Bump(ref counters.DropNotWatching, ref _totals.DropNotWatching);
             return;
         }
 
         if (target.Address is not { } destination)
         {
-            Interlocked.Increment(ref counters.DropNoAddress);
+            Bump(ref counters.DropNoAddress, ref _totals.DropNoAddress);
             return;
         }
 
@@ -693,7 +785,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         {
             var length = MediaHeader.Length + inbound.PlaintextLength + MediaHeader.TagLength;
             await SendAsync(socket, scratch, length, destination, counters, stoppingToken);
-            Interlocked.Increment(ref counters.KeyframeRequests);
+            Bump(ref counters.KeyframeRequests, ref _totals.KeyframeRequests);
         }
     }
 
@@ -702,7 +794,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         var counters = inbound.Counters;
         if (inbound.Session.Address is not { } destination)
         {
-            Interlocked.Increment(ref counters.DropNoAddress);
+            Bump(ref counters.DropNoAddress, ref _totals.DropNoAddress);
             return;
         }
 
@@ -726,11 +818,12 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         try
         {
             var sent = await socket.SendToAsync(datagram.AsMemory(0, length), SocketFlags.None, destination, stoppingToken);
-            Interlocked.Increment(ref counters.PacketsOut);
-            Interlocked.Add(ref counters.BytesOut, sent);
+            Bump(ref counters.PacketsOut, ref _totals.PacketsOut);
+            BumpBy(ref counters.BytesOut, ref _totals.BytesOut, sent);
         }
         catch (SocketException ex)
         {
+            Bump(ref counters.DropSendError, ref _totals.DropSendError);
             logger.LogDebug(ex, "Voice send failed with {SocketError}", ex.SocketErrorCode);
         }
         catch (Exception ex) when (ex is ObjectDisposedException or OperationCanceledException)
@@ -798,7 +891,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
 
             logger.LogInformation(
-                "Voice channel {ChannelId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; share: {SharePacketsIn} packets in, {SharePacketsOut} out, {ShareBytesIn} bytes in, {ShareBytesOut} out, {KeyframeRequests} keyframe requests; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address, {DropShareRate} share rate, {DropNotSharing} not sharing, {DropMuted} muted, {DropNotWatching} not watching, {DropQueueFull} queue full",
+                "Voice channel {ChannelId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; share: {SharePacketsIn} packets in, {SharePacketsOut} out, {ShareBytesIn} bytes in, {ShareBytesOut} out, {KeyframeRequests} keyframe requests; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address, {DropShareRate} share rate, {DropNotSharing} not sharing, {DropMuted} muted, {DropNotWatching} not watching, {DropQueueFull} queue full, {DropSendError} send error, {DropChannelGone} channel gone, {DropSealFailed} seal failed",
                 channelId,
                 members.Length,
                 Interlocked.Read(ref counters.PacketsIn),
@@ -821,7 +914,10 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 Interlocked.Read(ref counters.DropNotSharing),
                 Interlocked.Read(ref counters.DropMuted),
                 Interlocked.Read(ref counters.DropNotWatching),
-                queueDrops);
+                queueDrops,
+                Interlocked.Read(ref counters.DropSendError),
+                Interlocked.Read(ref counters.DropChannelGone),
+                Interlocked.Read(ref counters.DropSealFailed));
         }
     }
 
@@ -866,5 +962,8 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         public long DropMuted;
         public long DropNotWatching;
         public long DropQueueFull;
+        public long DropSendError;
+        public long DropChannelGone;
+        public long DropSealFailed;
     }
 }
