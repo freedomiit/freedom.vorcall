@@ -180,5 +180,8 @@ self-hoster needs:
 - `deploy/backup-db.sh` is installed as `/usr/local/bin/vorcall-backup-db` with a cron entry
   at 03:15 UTC, keeping 14 days. The restore recipe is in its header.
 
-The deploy workflow reads its target from the `DEPLOY_SERVER` repository variable, so a fork
-can point it at its own host without editing the workflow.
+The deploy workflow reads its target from the `DEPLOY_SERVER` **secret**, so a fork can point
+it at its own host without editing the workflow. It has to be a secret rather than a
+repository variable: Actions masks secrets in run logs and masks nothing else, and a
+workflow-level `env:` block is printed in full at the head of every step — so a variable
+there would publish the host into logs that are world-readable on a public repository.

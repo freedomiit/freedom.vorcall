@@ -81,9 +81,13 @@ permissions:
   contents: write
 
 env:
-  SERVER: ${{ vars.DEPLOY_SERVER }}
-  APP_DIR: ${{ vars.DEPLOY_APP_DIR || '/opt/vorcall' }}
-  VORCALL_SERVER_URL: ${{ vars.VORCALL_SERVER_URL }}
+  # Secrets, not repository variables: Actions masks secrets in run logs and
+  # masks nothing else, and a workflow-level `env:` block is printed in full at
+  # the head of every step. As variables these would publish the host and the
+  # server address into world-readable logs on a public repository.
+  SERVER: ${{ secrets.DEPLOY_SERVER }}
+  APP_DIR: ${{ secrets.DEPLOY_APP_DIR || '/opt/vorcall' }}
+  VORCALL_SERVER_URL: ${{ secrets.VORCALL_SERVER_URL }}
 
 jobs:
   preflight:

@@ -14,10 +14,15 @@ name: deploy
 #      migrations on boot, so there is no separate migration step.
 #
 # Prerequisites (one time):
-#   - Repository variable DEPLOY_SERVER — the ssh target, e.g. `user@203.0.113.10`.
-#     A fork points this at its own host; nothing about the target is committed.
-#   - Optional repository variable DEPLOY_APP_DIR — where the stack lives on the
-#     host (default /opt/vorcall).
+#   - Secret DEPLOY_SERVER — the ssh target, e.g. `user@203.0.113.10`. A fork
+#     points this at its own host; nothing about the target is committed.
+#   - Optional secret DEPLOY_APP_DIR — where the stack lives on the host
+#     (default /opt/vorcall).
+#
+#     Both are SECRETS rather than repository variables on purpose: Actions masks
+#     secrets in run logs, and masks nothing else. A workflow-level `env:` block is
+#     printed in full at the head of every step, so a variable here would publish
+#     the host in a run log — world-readable on a public repository.
 #   - Secret SSH_PRIVATE_KEY — runner -> server; a valid OpenSSH private key
 #     whose public key is in the deploy user's ~/.ssh/authorized_keys.
 #   - On the server, a `.env` next to the compose file with the runtime
@@ -38,8 +43,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SERVER: ${{ vars.DEPLOY_SERVER }}
-  APP_DIR: ${{ vars.DEPLOY_APP_DIR || '/opt/vorcall' }}
+  SERVER: ${{ secrets.DEPLOY_SERVER }}
+  APP_DIR: ${{ secrets.DEPLOY_APP_DIR || '/opt/vorcall' }}
   REGISTRY: ghcr.io
   IMAGE_BASE: ghcr.io/freedomiit/vorcall
 
