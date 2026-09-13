@@ -51,7 +51,8 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo build
 cargo test -p vorcall-voice -p vorcall-core -p vorcall-release \
-           -p vorcall-app -p vorcall-hotkey -p vorcall-screen
+           -p vorcall-app -p vorcall-hotkey -p vorcall-screen \
+           -p vorcall-clipboard
 cd ..
 
 dotnet build server/Vorcall.Server.csproj -warnaserror

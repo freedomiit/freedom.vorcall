@@ -6,6 +6,7 @@ using Vorcall.Server.Attachments;
 using Vorcall.Server.Data;
 using Vorcall.Server.Permissions;
 using Vorcall.Server.Protocol;
+using Vorcall.Server.Streams;
 
 namespace Vorcall.Server.Chat;
 
@@ -46,6 +47,7 @@ public sealed class ChatSocketHandler(
     private const string UnknownChannelDetail = "unknown channel";
     private const string InvalidTextDetail = "text must be 1..2000 characters after trimming";
     private const string InvalidAttachmentDetail = "attachment is unknown, not yours, not in this channel or already used";
+    private const string InvalidStreamDetail = "streamed file is unknown, not yours, not in this channel or already used";
     private const string UnknownMessageDetail = "unknown or deleted message";
     private const string InvalidNameDetail = "name must be 1..32 characters without control characters";
     private const string NotInVoiceDetail = "join the voice channel first";
@@ -492,10 +494,13 @@ public sealed class ChatSocketHandler(
         }
 
         var attachmentIds = send.AttachmentIds.ToList();
+        var streamedFileIds = send.StreamedFileIds.ToList();
+        var carriesFiles = attachmentIds.Count > 0 || streamedFileIds.Count > 0;
 
-        // Text may be empty, and only then, when the message carries an attachment instead.
+        // Text may be empty, and only then, when the message carries an attachment or a streamed
+        // file instead.
         if (!Validation.TryNormalizeText(send.Text, out var text)
-            && !(attachmentIds.Count > 0 && string.IsNullOrWhiteSpace(send.Text)))
+            && !(carriesFiles && string.IsNullOrWhiteSpace(send.Text)))
         {
             return NonFatal(connection, ErrorCode.InvalidMessage, InvalidTextDetail);
         }
@@ -505,7 +510,8 @@ public sealed class ChatSocketHandler(
             return Denied(connection, Perm.SendMessages);
         }
 
-        if (attachmentIds.Count > 0 && !registry.Has(userId, channelId, Perm.AttachFiles))
+        // A streamed file is attached like any other; the same bit covers both.
+        if (carriesFiles && !registry.Has(userId, channelId, Perm.AttachFiles))
         {
             return Denied(connection, Perm.AttachFiles);
         }
@@ -518,6 +524,12 @@ public sealed class ChatSocketHandler(
             return NonFatal(connection, ErrorCode.InvalidAttachment, InvalidAttachmentDetail);
         }
 
+        if (streamedFileIds.Count > StreamOptions.MaxPerMessage
+            || streamedFileIds.Distinct().Count() != streamedFileIds.Count)
+        {
+            return NonFatal(connection, ErrorCode.InvalidStream, InvalidStreamDetail);
+        }
+
         // Persist first: an id only exists once the row is committed, and the broadcast
         // carries that id.
         var outcome = await messages.AppendAsync(
@@ -527,6 +539,7 @@ public sealed class ChatSocketHandler(
             text,
             send.ReplyToId,
             attachmentIds,
+            streamedFileIds,
             registry.Has(userId, channelId, Perm.MentionEveryone));
         switch (outcome.Status)
         {
@@ -535,6 +548,9 @@ public sealed class ChatSocketHandler(
 
             case AppendOutcome.Kind.InvalidAttachment:
                 return NonFatal(connection, ErrorCode.InvalidAttachment, InvalidAttachmentDetail);
+
+            case AppendOutcome.Kind.InvalidStream:
+                return NonFatal(connection, ErrorCode.InvalidStream, InvalidStreamDetail);
         }
 
         registry.BroadcastToChannel(channelId, new ServerFrame { Message = outcome.Message! });

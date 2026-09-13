@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use iced::{Point, Size};
@@ -190,6 +191,21 @@ pub enum Dialog {
     },
     /// One attachment at full size.
     Image(i64),
+    /// One file coming down onto the disk. Unlike every other dialog this one is
+    /// not a form: a transfer can run for hours, so the bytes are counted into
+    /// it in place through [`crate::app::App::dialog_mut`] rather than by
+    /// reopening it on every report.
+    Transfer {
+        source: TransferSource,
+        /// The handle the transfer was started under, which is what a cancel
+        /// names and what every progress report carries back.
+        request_id: u64,
+        file_name: String,
+        received: u64,
+        /// What the record says the file is; zero when nothing said.
+        total: u64,
+        state: TransferState,
+    },
     /// The crop adjuster a picked picture goes through before it is uploaded.
     CropImage {
         purpose: ImagePurpose,
@@ -286,6 +302,21 @@ impl fmt::Debug for Dialog {
                 .field("user_id", user_id)
                 .finish_non_exhaustive(),
             Self::Image(id) => f.debug_tuple("Image").field(id).finish(),
+            Self::Transfer {
+                source,
+                request_id,
+                received,
+                total,
+                state,
+                ..
+            } => f
+                .debug_struct("Transfer")
+                .field("source", source)
+                .field("request_id", request_id)
+                .field("received", received)
+                .field("total", total)
+                .field("state", state)
+                .finish_non_exhaustive(),
             // A picked picture is somebody's own: its size, never its pixels.
             Self::CropImage {
                 purpose,
@@ -315,6 +346,26 @@ impl fmt::Debug for Dialog {
             Self::Action(action) => f.debug_tuple("Action").field(action).finish(),
         }
     }
+}
+
+/// Which of the two kinds of file a transfer is moving. They are fetched over
+/// different endpoints and fail in different ways, so the id alone would not
+/// say what to ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferSource {
+    Attachment(i64),
+    Stream(i64),
+}
+
+/// How far a transfer has got. Both terminal states are held rather than closing
+/// the dialog: a download that took an hour is worth saying something about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferState {
+    Running,
+    /// On the disk, at this path.
+    Done(PathBuf),
+    /// Already a sentence a person can read.
+    Failed(String),
 }
 
 /// What a control in an overlay asks `update::ui` to do. None of these is a

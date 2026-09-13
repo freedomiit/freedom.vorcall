@@ -1,6 +1,6 @@
 namespace Vorcall.Server.Data;
 
-// An uploaded image. The row is written before the bytes land, and stays unlinked (MessageId
+// An uploaded file. The row is written before the bytes land, and stays unlinked (MessageId
 // null) until a SendMessage names its id; unlinked rows are swept with their files.
 public class Attachment
 {
@@ -20,6 +20,11 @@ public class Attachment
     public string ContentType { get; set; } = string.Empty;
 
     public long Size { get; set; }
+
+    // False until the whole body has streamed in. The row exists before its bytes do, so an
+    // incomplete row is an upload still in flight — or one that died mid-flight — and the short
+    // unlinked-upload TTL must not sweep it.
+    public bool Complete { get; set; }
 
     public DateTime CreatedAt { get; set; }
 }

@@ -4,18 +4,21 @@
 use iced::alignment::Vertical;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
-    Id, Space, button, column, container, image, keyed, row, text, text_editor, tooltip,
+    Id, Space, button, column, container, image, keyed, pick_list, progress_bar, row, text,
+    text_editor, tooltip,
 };
 use iced::{Element, Length, Padding, keyboard};
 use vorcall_core::mentions::{self, PALETTE};
 use vorcall_core::{Attachment, attachments, permissions};
 
 use crate::app::message::{ChatMsg, Message};
-use crate::app::state::chat::{COMPOSER_PALETTE, MESSAGE_MAX_CHARS};
-use crate::app::state::rules::plain_text;
+use crate::app::state::chat::{
+    COMPOSER_PALETTE, MESSAGE_MAX_CHARS, PendingStream, PendingTransfer, TransferKind,
+};
+use crate::app::state::rules::{format_bytes, plain_text, progress_fraction};
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
-use crate::theme::styles;
+use crate::theme::{ThemeTokens, styles};
 use crate::view::message::glyph_of;
 use crate::view::widgets::{self, Metrics};
 use crate::view::{COMPOSER_ID, TEXT_BADGE, TEXT_BODY, TEXT_SECONDARY};
@@ -33,6 +36,11 @@ const SUGGESTIONS: usize = 8;
 const EXCERPT_MAX: usize = 60;
 /// The thumbnail a pending attachment is drawn as.
 const THUMB: f32 = 40.0;
+/// How wide the route chevron is: no text of its own, only the handle.
+const ROUTES_WIDTH: f32 = 22.0;
+/// The bar on a chip whose file is still going up.
+const CHIP_BAR_LENGTH: f32 = 72.0;
+const CHIP_BAR_GIRTH: f32 = 4.0;
 
 /// Bound on a suggestion's display name, so the `@handle` beside it keeps its
 /// place next to the name instead of being pushed to the popover's right edge.
@@ -69,8 +77,7 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
         .mention_query
         .as_deref()
         .and_then(|query| mention_list(app, main, query, metrics));
-    let attachment_strip = (!composer.attachments.is_empty() || composer.uploading > 0)
-        .then(|| strip(app, main, metrics));
+    let attachment_strip = (composer.slots_used() > 0).then(|| strip(app, main, metrics));
     let palette =
         (main.chat.reacting == Some(COMPOSER_PALETTE)).then(|| emoji_palette(app, metrics));
 
@@ -134,18 +141,17 @@ fn input<'a>(
             .key_binding(move |press| binding(press, editing, replying, empty, last_own));
     }
 
-    let held = composer.attachments.len() + composer.uploading;
-    let (attach, attach_tip) = if !can_attach {
+    let (attach, attach_tip): (Option<Message>, &str) = if !can_attach {
         (None, "Requires Attach Files")
     } else if composer.editing.is_some() {
-        // An edit carries no attachments of its own.
-        (None, "An edit cannot carry an image")
-    } else if held >= attachments::MAX_PER_MESSAGE {
-        (None, "That is as many images as one message takes")
+        // An edit carries no files of its own.
+        (None, "An edit cannot carry a file")
+    } else if composer.slots_used() >= attachments::MAX_PER_MESSAGE {
+        (None, "That is as many files as one message takes")
     } else {
         (
             Some(Message::Chat(ChatMsg::PickAttachment)),
-            "Attach an image",
+            "Attach a file",
         )
     };
 
@@ -162,20 +168,80 @@ fn input<'a>(
         tokens,
     );
 
-    let box_row = row![
-        widgets::icon_button(Icon::Paperclip, attach_tip, attach, tokens),
-        editor,
-        counter(app, main, metrics),
-        emoji,
-    ]
+    let mut box_row = row![widgets::icon_button(
+        Icon::Paperclip,
+        attach_tip,
+        attach.clone(),
+        tokens
+    )]
     .spacing(8)
     .align_y(Vertical::Center);
+    // The chevron is the choice between the two routes, so it is offered on
+    // exactly the terms the paperclip is: whatever refuses one refuses both.
+    if attach.is_some() {
+        box_row = box_row.push(routes(tokens, metrics));
+    }
+    let box_row = box_row
+        .push(editor)
+        .push(counter(app, main, metrics))
+        .push(emoji);
 
     container(box_row)
         .width(Length::Fill)
         .padding([8.0, 10.0])
         .style(styles::container::input(tokens))
         .into()
+}
+
+/// The two ways one picked file travels: stored on the server, or served off
+/// this disk for as long as the sender is online. A file above the stored
+/// ceiling takes the second route whichever of these is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileRoute {
+    Attach,
+    Stream,
+}
+
+impl FileRoute {
+    const ALL: [FileRoute; 2] = [FileRoute::Attach, FileRoute::Stream];
+
+    /// Which dialog the entry opens. Both end in the same picker; only what the
+    /// picked paths are routed to differs.
+    fn message(self) -> Message {
+        match self {
+            FileRoute::Attach => Message::Chat(ChatMsg::PickAttachment),
+            FileRoute::Stream => Message::Chat(ChatMsg::PickStream),
+        }
+    }
+}
+
+impl std::fmt::Display for FileRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FileRoute::Attach => "Attach file…",
+            FileRoute::Stream => "Share as stream…",
+        })
+    }
+}
+
+/// The chevron beside the paperclip, which offers the route the one-click
+/// paperclip does not. It is a pick list rather than the anchored popover the
+/// rest of the window uses because that popover is keyed on a menu target held
+/// in the window's own state, which this module does not own; a pick list keeps
+/// its open state inside the widget, and its handle is the chevron.
+fn routes<'a>(tokens: &'a ThemeTokens, metrics: Metrics) -> Element<'a, Message> {
+    widgets::tooltip_of(
+        pick_list(FileRoute::ALL, None::<FileRoute>, FileRoute::message)
+            .placeholder("")
+            .width(ROUTES_WIDTH)
+            .text_size(metrics.text(TEXT_SECONDARY))
+            .padding([2.0, 4.0])
+            .style(styles::pick_list(tokens))
+            .menu_style(styles::menu(tokens)),
+        "Other ways to send a file",
+        tooltip::Position::Top,
+        tokens,
+    )
 }
 
 /// The emoji the composer offers, each one pressed into the text at the caret. It
@@ -212,8 +278,8 @@ fn emoji_palette<'a>(app: &'a App, metrics: Metrics) -> Element<'a, Message> {
 }
 
 /// Enter sends; Shift+Enter breaks the line; Escape unwinds a reply or an edit;
-/// Up in an empty composer reaches for the last message of one's own. Everything
-/// else is the editor's own.
+/// Up in an empty composer reaches for the last message of one's own; Ctrl+V is
+/// the app's own paste. Everything else is the editor's own.
 fn binding(
     press: KeyPress,
     editing: Option<i64>,
@@ -241,6 +307,15 @@ fn binding(
             if let Some(id) = last_own {
                 return Some(Binding::Custom(Message::Chat(ChatMsg::StartEdit(id))));
             }
+        }
+        // The editor's own paste would take the text and drop everything else,
+        // so the whole clipboard is read here instead. Text is not lost by that:
+        // `update::chat` hands a text-only clipboard straight back to the editor
+        // as the same `Edit::Paste` action this arm replaces.
+        keyboard::Key::Character(character)
+            if press.modifiers.command() && character.eq_ignore_ascii_case("v") =>
+        {
+            return Some(Binding::Custom(Message::Chat(ChatMsg::Paste)));
         }
         _ => {}
     }
@@ -436,28 +511,27 @@ fn suggestions<'a>(pairs: &'a [(i64, String)], query: &str) -> Vec<(i64, &'a str
     names
 }
 
-/// What is already uploaded for the next message, and what is still going up.
+/// What is already held for the next message, and what is still going up: the
+/// uploads that landed, the files offered as streams, and the transfers in
+/// flight.
 fn strip<'a>(app: &'a App, main: &'a MainState, metrics: Metrics) -> Element<'a, Message> {
-    let tokens = &app.tokens;
+    let composer = &main.chat.composer;
     let mut line = row![].spacing(6).align_y(Vertical::Center);
-    for attachment in &main.chat.composer.attachments {
+    for attachment in &composer.attachments {
         line = line.push(pending(app, main, attachment, metrics));
     }
-    for _ in 0..main.chat.composer.uploading {
-        line = line.push(
-            container(
-                text("Uploading…")
-                    .size(metrics.text(TEXT_SECONDARY))
-                    .color(tokens.text_muted),
-            )
-            .padding([4.0, 8.0])
-            .style(styles::container::chip(tokens)),
-        );
+    for offered in &composer.streams {
+        line = line.push(pending_stream(app, offered, metrics));
+    }
+    for transfer in &composer.uploading {
+        line = line.push(in_flight(app, transfer, metrics));
     }
     line.into()
 }
 
-/// One image the next message will carry, with the way to take it back out.
+/// One file the next message will carry, with the way to take it back out. A
+/// picture shows its thumbnail; anything else shows the paperclip, because
+/// nothing was decoded for it.
 fn pending<'a>(
     app: &'a App,
     main: &'a MainState,
@@ -468,21 +542,144 @@ fn pending<'a>(
     let key = ImageKey::Attachment(attachment.id);
     let thumb: Element<'_, Message> = match widgets::image_handle(&main.chat, key) {
         Some(handle) => image(handle).width(THUMB).height(THUMB).into(),
-        None => Space::new().width(THUMB).height(THUMB).into(),
+        None => container(icons::icon(
+            Icon::Paperclip,
+            widgets::ICON_SIZE,
+            tokens.text_secondary,
+        ))
+        .center(THUMB)
+        .into(),
     };
+
+    chip(
+        app,
+        thumb,
+        attachment.file_name.clone(),
+        format_bytes(u64::try_from(attachment.size).unwrap_or(0)),
+        None,
+        (
+            "Remove",
+            Message::Chat(ChatMsg::RemovePendingAttachment(attachment.id)),
+        ),
+        metrics,
+    )
+}
+
+/// One file the next message will point at without ever uploading it. The offer
+/// stands on the server either way: taking it back out sends nothing.
+fn pending_stream<'a>(
+    app: &'a App,
+    offered: &PendingStream,
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let glyph = container(icons::icon(
+        Icon::Link,
+        widgets::ICON_SIZE,
+        tokens.text_secondary,
+    ))
+    .center(THUMB)
+    .into();
+
+    chip(
+        app,
+        glyph,
+        offered.file_name.clone(),
+        format!(
+            "{} · streamed from here",
+            format_bytes(u64::try_from(offered.size).unwrap_or(0))
+        ),
+        None,
+        (
+            "Remove",
+            Message::Chat(ChatMsg::RemovePendingStream(offered.id)),
+        ),
+        metrics,
+    )
+}
+
+/// One upload or offer the composer is still waiting on, with how far it has
+/// come and the way to give up on it.
+fn in_flight<'a>(
+    app: &'a App,
+    transfer: &PendingTransfer,
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let glyph = container(icons::icon(
+        Icon::ArrowUp,
+        widgets::ICON_SIZE,
+        tokens.text_secondary,
+    ))
+    .center(THUMB)
+    .into();
+
+    // An offer moves no bytes, so there is no fraction worth drawing for it.
+    let progress = match transfer.kind {
+        TransferKind::Upload => Some(progress_fraction(transfer.done, transfer.total)),
+        TransferKind::Offer => None,
+    };
+    let caption = match transfer.kind {
+        TransferKind::Upload => format!(
+            "{} of {}",
+            format_bytes(transfer.done),
+            format_bytes(transfer.total)
+        ),
+        TransferKind::Offer => "Offering…".to_owned(),
+    };
+
+    chip(
+        app,
+        glyph,
+        transfer.file_name.clone(),
+        caption,
+        progress,
+        (
+            "Cancel",
+            Message::Chat(ChatMsg::CancelUpload(transfer.request_id)),
+        ),
+        metrics,
+    )
+}
+
+/// The chip every held file is drawn as: a mark, what it is called, a line
+/// under it, an optional bar, and the button that takes it out — the tooltip
+/// that button carries and what it sends travel together.
+fn chip<'a>(
+    app: &'a App,
+    mark: Element<'a, Message>,
+    file_name: String,
+    caption: String,
+    progress: Option<f32>,
+    remove: (&str, Message),
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let mut details = column![
+        text(file_name)
+            .size(metrics.text(TEXT_SECONDARY))
+            .color(tokens.text_secondary),
+        text(caption)
+            .size(metrics.text(TEXT_BADGE))
+            .color(tokens.text_muted),
+    ]
+    .spacing(2);
+    if let Some(fraction) = progress {
+        details = details.push(
+            progress_bar(0.0..=1.0, fraction)
+                .length(CHIP_BAR_LENGTH)
+                .girth(CHIP_BAR_GIRTH),
+        );
+    }
 
     container(
         row![
-            thumb,
-            text(attachment.file_name.clone())
-                .size(metrics.text(TEXT_SECONDARY))
-                .color(tokens.text_secondary),
+            mark,
+            details,
             widgets::icon_button_in(
                 Icon::Close,
-                "Remove",
-                Some(Message::Chat(ChatMsg::RemovePendingAttachment(
-                    attachment.id
-                ))),
+                remove.0,
+                Some(remove.1),
                 tokens.text_secondary,
                 widgets::ICON_MARK,
                 tokens,
@@ -568,6 +765,20 @@ mod tests {
         let many: Vec<(i64, String)> = (0..12).map(|id| (id, format!("a{id:02}"))).collect();
 
         assert_eq!(suggestions(&many, "a").len(), SUGGESTIONS);
+    }
+
+    #[test]
+    fn each_route_opens_its_own_dialog_and_says_which_it_is() {
+        assert!(matches!(
+            FileRoute::Attach.message(),
+            Message::Chat(ChatMsg::PickAttachment)
+        ));
+        assert!(matches!(
+            FileRoute::Stream.message(),
+            Message::Chat(ChatMsg::PickStream)
+        ));
+        assert_eq!(FileRoute::Attach.to_string(), "Attach file…");
+        assert_eq!(FileRoute::Stream.to_string(), "Share as stream…");
     }
 
     #[test]

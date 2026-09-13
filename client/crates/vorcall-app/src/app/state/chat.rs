@@ -138,6 +138,41 @@ impl ChannelUi {
     }
 }
 
+/// Which of the two ways a file can travel one transfer takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    /// The bytes are being uploaded and the server keeps them.
+    Upload,
+    /// Too large to store: only the record is being written, and this client
+    /// serves the bytes afterwards.
+    Offer,
+}
+
+/// One file the composer is still waiting on, as its chip draws it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTransfer {
+    /// The handle it was started under, which is what a cancel names and what
+    /// every progress report carries back.
+    pub request_id: u64,
+    pub file_name: String,
+    /// The file's own length. An offer moves no bytes, so it reaches `done` in
+    /// one step.
+    pub total: u64,
+    pub done: u64,
+    pub kind: TransferKind,
+}
+
+/// One streamed file the message being written carries: the server holds the
+/// record already, the bytes stay on this disk. The shape of [`Attachment`]
+/// without the bytes ever having moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingStream {
+    pub id: i64,
+    pub file_name: String,
+    pub content_type: String,
+    pub size: i64,
+}
+
 /// What the message being written carries besides its text.
 #[derive(Default)]
 pub struct Composer {
@@ -146,8 +181,11 @@ pub struct Composer {
     pub editing: Option<i64>,
     /// Uploaded already, and linked to the message once it is sent.
     pub attachments: Vec<Attachment>,
-    /// Uploads still in flight, which count against the per-message limit.
-    pub uploading: usize,
+    /// Offered already, and linked to the message once it is sent.
+    pub streams: Vec<PendingStream>,
+    /// Uploads and offers still in flight, which count against the per-message
+    /// limit like the files that have already landed.
+    pub uploading: Vec<PendingTransfer>,
     /// What is being typed after an `@`, without the `@` itself.
     pub mention_query: Option<String>,
 }
@@ -172,18 +210,19 @@ impl Composer {
         self.mention_query = None;
     }
 
-    /// Empties it and forgets the reply, the edit and the attachments.
+    /// Empties it and forgets the reply, the edit and the files.
     pub fn clear(&mut self) {
         self.content = text_editor::Content::new();
         self.reply_to = None;
         self.editing = None;
         self.attachments.clear();
+        self.streams.clear();
         self.mention_query = None;
     }
 
-    /// What the channel leaving view takes with it: the reply, the attachments
-    /// and the mention being typed. A half-written message survives the switch,
-    /// unless an edit is in progress — that text is the other channel's message.
+    /// What the channel leaving view takes with it: the reply, the files and the
+    /// mention being typed. A half-written message survives the switch, unless
+    /// an edit is in progress — that text is the other channel's message.
     pub fn leave_channel(&mut self) {
         if self.editing.is_some() {
             self.content = text_editor::Content::new();
@@ -191,12 +230,41 @@ impl Composer {
         self.reply_to = None;
         self.editing = None;
         self.attachments.clear();
+        self.streams.clear();
         self.mention_query = None;
     }
 
-    /// Whether there is anything to send.
+    /// Whether there is anything to send. A file alone is a message: text is
+    /// only one of the three things one can carry.
     pub fn is_empty(&self) -> bool {
-        self.text().trim().is_empty() && self.attachments.is_empty()
+        self.text().trim().is_empty() && self.attachments.is_empty() && self.streams.is_empty()
+    }
+
+    /// How many of the per-message file slots are taken. What is still coming
+    /// counts: a fifth file must be refused while the fourth is uploading, not
+    /// once it lands.
+    pub fn slots_used(&self) -> usize {
+        self.attachments.len() + self.streams.len() + self.uploading.len()
+    }
+
+    /// Forgets one transfer in flight, answering whether it was one this
+    /// composer was waiting on.
+    pub fn finish_transfer(&mut self, request_id: u64) -> bool {
+        let before = self.uploading.len();
+        self.uploading
+            .retain(|transfer| transfer.request_id != request_id);
+        self.uploading.len() != before
+    }
+
+    /// Records how far one transfer in flight has come.
+    pub fn advance_transfer(&mut self, request_id: u64, done: u64) {
+        if let Some(transfer) = self
+            .uploading
+            .iter_mut()
+            .find(|transfer| transfer.request_id == request_id)
+        {
+            transfer.done = done;
+        }
     }
 }
 
@@ -205,6 +273,27 @@ impl Composer {
 /// Answers whether the set changed, which is what makes it worth writing out.
 pub fn reopen_on_message(hidden: &mut BTreeSet<i64>, channel_id: i64) -> bool {
     hidden.remove(&channel_id)
+}
+
+/// Whether one attachment is drawn inline, rather than as a file card the reader
+/// has to ask for. The only place that rule lives.
+///
+/// An attachment is any type at all now, up to 2 GiB, so opening a channel must
+/// not fetch and decode whatever happens to be in it: only a picture small
+/// enough to be worth holding as pixels is. The ceiling is the one an image the
+/// client uploads itself obeys ([`vorcall_core::images::MAX_BYTES`], 8 MiB), so a
+/// 20 MiB PNG gets a card like anything else.
+///
+/// The content type is matched case-insensitively: it is the sender's client that
+/// declared it, and RFC 2045 does not make the case meaningful. A file claiming
+/// no bytes is no picture either, and decoding it would only say so slower.
+pub fn is_inline_preview(attachment: &Attachment) -> bool {
+    let is_image = attachment
+        .content_type
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"));
+    let size = u64::try_from(attachment.size).unwrap_or(u64::MAX);
+    is_image && size > 0 && size <= vorcall_core::images::MAX_BYTES
 }
 
 /// Where one image's pixels are. `Failed` is not retried on its own: the row
@@ -229,6 +318,9 @@ pub struct ChatState {
     pub hovered: Option<i64>,
     /// The message whose reaction palette is open.
     pub reacting: Option<i64>,
+    /// The message whose text the pointer is selecting. Only one row holds a
+    /// selection at a time: a press in another takes it away.
+    pub selecting: Option<i64>,
     pub confirm_delete: Option<i64>,
 }
 
@@ -249,6 +341,7 @@ impl ChatState {
             mark_read_due: None,
             hovered: None,
             reacting: None,
+            selecting: None,
             confirm_delete: None,
         }
     }
@@ -296,7 +389,9 @@ impl ChatState {
         true
     }
 
-    /// Every attachment one channel holds, which is what its rows draw.
+    /// Every attachment of one channel that is drawn inline, which is what
+    /// opening it fetches. Gated by [`is_inline_preview`]: the rest are file
+    /// cards and cost nothing until they are asked for.
     pub fn image_keys(&self, channel_id: i64) -> Vec<ImageKey> {
         let Some(channel) = self.channels.get(&channel_id) else {
             return Vec::new();
@@ -305,6 +400,7 @@ impl ChatState {
             .messages
             .values()
             .flat_map(|message| message.attachments.iter())
+            .filter(|attachment| is_inline_preview(attachment))
             .map(|attachment| ImageKey::Attachment(attachment.id))
             .collect()
     }
@@ -357,6 +453,7 @@ impl ChatState {
         self.composer.leave_channel();
         self.hovered = None;
         self.reacting = None;
+        self.selecting = None;
         self.confirm_delete = None;
     }
 
@@ -384,6 +481,34 @@ mod tests {
         }
     }
 
+    fn sized(id: i64, content_type: &str, size: i64) -> Attachment {
+        Attachment {
+            id,
+            file_name: format!("{id}.bin"),
+            content_type: content_type.to_owned(),
+            size,
+        }
+    }
+
+    fn stream(id: i64) -> PendingStream {
+        PendingStream {
+            id,
+            file_name: format!("{id}.mkv"),
+            content_type: "video/x-matroska".to_owned(),
+            size: 8 << 30,
+        }
+    }
+
+    fn transfer(request_id: u64, kind: TransferKind) -> PendingTransfer {
+        PendingTransfer {
+            request_id,
+            file_name: format!("{request_id}.bin"),
+            total: 1024,
+            done: 0,
+            kind,
+        }
+    }
+
     fn message(id: i64, channel_id: i64) -> ChatMessage {
         ChatMessage {
             id,
@@ -398,8 +523,7 @@ mod tests {
             reactions: Vec::new(),
             attachments: Vec::new(),
             channel_id,
-            mention_everyone: false,
-            mention_here: false,
+            ..ChatMessage::default()
         }
     }
 
@@ -481,17 +605,73 @@ mod tests {
     /// An edit is finished by sending it, and what was held for the next message
     /// is still held.
     #[test]
-    fn finishing_an_edit_keeps_the_attachments_that_were_held() {
+    fn finishing_an_edit_keeps_the_files_that_were_held() {
         let mut composer = Composer::default();
         composer.set_text("typo fixed");
         composer.editing = Some(7);
         composer.attachments = vec![attachment(3)];
+        composer.streams = vec![stream(9)];
 
         composer.finish_edit();
 
         assert_eq!(composer.editing, None);
         assert!(composer.text().trim().is_empty());
         assert_eq!(composer.attachments.len(), 1);
+        assert_eq!(composer.streams.len(), 1);
+    }
+
+    /// A file too large to store is still a message, so a stream on its own has
+    /// to be sendable.
+    #[test]
+    fn a_streamed_file_on_its_own_is_something_to_send() {
+        let mut composer = Composer::default();
+        assert!(composer.is_empty());
+
+        composer.streams = vec![stream(9)];
+        assert!(!composer.is_empty());
+
+        composer.clear();
+        assert!(composer.is_empty());
+        assert!(composer.streams.is_empty());
+    }
+
+    /// The per-message limit is counted against what is coming as well: a fifth
+    /// file must be refused while the fourth is still on its way.
+    #[test]
+    fn what_is_still_coming_takes_a_slot() {
+        let mut composer = Composer::default();
+        assert_eq!(composer.slots_used(), 0);
+
+        composer.attachments = vec![attachment(3)];
+        composer.streams = vec![stream(9)];
+        composer.uploading = vec![
+            transfer(1, TransferKind::Upload),
+            transfer(2, TransferKind::Offer),
+        ];
+
+        assert_eq!(composer.slots_used(), 4);
+    }
+
+    #[test]
+    fn a_transfer_is_advanced_and_then_forgotten_by_its_request_id() {
+        let mut composer = Composer {
+            uploading: vec![
+                transfer(1, TransferKind::Upload),
+                transfer(2, TransferKind::Upload),
+            ],
+            ..Default::default()
+        };
+
+        composer.advance_transfer(1, 512);
+        // A report for a transfer this composer never held changes nothing.
+        composer.advance_transfer(99, 512);
+        assert_eq!(composer.uploading[0].done, 512);
+        assert_eq!(composer.uploading[1].done, 0);
+
+        assert!(composer.finish_transfer(1));
+        assert!(!composer.finish_transfer(1));
+        assert_eq!(composer.uploading.len(), 1);
+        assert_eq!(composer.uploading[0].request_id, 2);
     }
 
     #[test]
@@ -531,6 +711,48 @@ mod tests {
             [ImageKey::Attachment(40), ImageKey::Attachment(41)]
         );
         assert!(chat.image_keys(99).is_empty());
+    }
+
+    /// Opening a channel must not reach for anything but the pictures it draws:
+    /// the video and the oversized PNG are cards, and a card fetches nothing.
+    #[test]
+    fn only_the_previewable_attachments_of_a_channel_are_fetched() {
+        let mut chat = ChatState::new();
+        let mut message = message(2, 1);
+        message.attachments = vec![
+            attachment(40),
+            sized(41, "video/x-matroska", 2 << 30),
+            sized(42, "image/png", 20 << 20),
+            sized(43, "IMAGE/PNG", 64),
+        ];
+        chat.entry(1).merge(vec![message]);
+
+        assert_eq!(
+            chat.image_keys(1),
+            [ImageKey::Attachment(40), ImageKey::Attachment(43)]
+        );
+    }
+
+    #[test]
+    fn the_preview_gate_admits_a_small_picture_and_nothing_else() {
+        assert!(is_inline_preview(&sized(1, "image/png", 8 << 20)));
+        assert!(is_inline_preview(&sized(1, "image/gif", 1)));
+        // Declared case is the sender's, not a decision.
+        assert!(is_inline_preview(&sized(1, "IMAGE/PNG", 64)));
+        assert!(is_inline_preview(&sized(
+            1,
+            "image/jpeg; charset=binary",
+            64
+        )));
+
+        // One byte over the ceiling an upload of our own would obey.
+        assert!(!is_inline_preview(&sized(1, "image/png", (8 << 20) + 1)));
+        assert!(!is_inline_preview(&sized(1, "video/mp4", 64)));
+        assert!(!is_inline_preview(&sized(1, "application/zip", 2 << 30)));
+        // Nothing to draw, and nothing a decode could make of it.
+        assert!(!is_inline_preview(&sized(1, "image/png", 0)));
+        assert!(!is_inline_preview(&sized(1, "", 64)));
+        assert!(!is_inline_preview(&sized(1, "image", 64)));
     }
 
     #[test]
@@ -577,19 +799,23 @@ mod tests {
         chat.current = Current::Channel(1);
         chat.composer.reply_to = Some(4);
         chat.composer.attachments.push(attachment(3));
+        chat.composer.streams.push(stream(9));
         chat.composer.set_text("half a sentence");
         chat.hovered = Some(5);
         chat.reacting = Some(5);
+        chat.selecting = Some(5);
         chat.confirm_delete = Some(5);
 
         chat.leave_channel();
 
         assert_eq!(chat.composer.reply_to, None);
         assert!(chat.composer.attachments.is_empty());
+        assert!(chat.composer.streams.is_empty());
         // The draft itself survives: it is the reader's, not the channel's.
         assert_eq!(chat.composer.text().trim(), "half a sentence");
         assert_eq!(chat.hovered, None);
         assert_eq!(chat.reacting, None);
+        assert_eq!(chat.selecting, None);
         assert_eq!(chat.confirm_delete, None);
     }
 

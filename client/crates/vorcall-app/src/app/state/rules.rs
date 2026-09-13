@@ -44,18 +44,35 @@ pub const UNEXPECTED: &str = "Unexpected server answer";
 pub const NO_CAPTURE: &str = "none";
 /// Whose screen the stage shows while the roster has not caught up.
 pub const UNKNOWN_SHARER: &str = "someone";
-/// Both the guard that keeps a huge file out of memory and the answer to one the
-/// server would refuse anyway.
-pub const TOO_LARGE: &str = "Images must be 8 MiB or smaller";
-pub const NOT_AN_IMAGE: &str = "Only PNG, JPEG, GIF and WebP images can be attached";
+/// The two picture rules, which attachments no longer share: an avatar, a
+/// banner, the server icon and a role icon are still one of four types at 8 MiB,
+/// magic-checked by the server.
+pub const IMAGE_TOO_LARGE: &str = "Images must be 8 MiB or smaller";
+pub const NOT_AN_IMAGE: &str = "Only PNG, JPEG, GIF and WebP images can be used";
+/// A file above [`vorcall_core::attachments::MAX_BYTES`] is offered as a
+/// streamed file rather than stored, so nothing but a size the protocol cannot
+/// name reaches this.
+pub const FILE_TOO_LARGE: &str = "That file is too large to send";
+/// A streamed file is served by the sender's own client, so it is readable only
+/// while they are online.
+pub const SENDER_OFFLINE: &str = "The sender is offline";
+/// The clipboard held something, but nothing this can send.
+pub const NOTHING_TO_PASTE: &str = "Nothing on the clipboard to paste";
+/// The platform, the session or a permission is what says no — not the content.
+pub const CLIPBOARD_UNAVAILABLE: &str = "Vorcall cannot read this system's clipboard";
 /// The pick list offers the system default as an entry; the configuration spells
 /// it `None`.
 pub const SYSTEM_DEFAULT: &str = "System default";
 /// The loudest a watched share can be played, which is the range the stage's
 /// slider offers.
 pub const SHARE_VOLUME_MAX: f32 = 2.0;
-/// What a notification says about a message that carries nothing but images.
-pub const IMAGE_ONLY: &str = "[image]";
+/// What a notification says about a message that carries nothing but files. Any
+/// file of any type is an attachment now, so a picture is not what it names.
+pub const FILE_ONLY: &str = "[file]";
+
+/// The units a byte count is said in, smallest first. Binary, like every limit
+/// the client states: an attachment stops at 2 GiB and a picture at 8 MiB.
+const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
 const USERNAME_MAX: usize = 32;
 const PASSWORD_MIN: usize = 8;
@@ -111,15 +128,18 @@ pub fn plain_text(text: &str, users: &[(i64, String)]) -> String {
             Segment::Mention { username, .. } => format!("@{username}"),
             Segment::Everyone => mentions::EVERYONE.to_owned(),
             Segment::Here => mentions::HERE.to_owned(),
+            // A link is drawn as one, but read and copied as the URL it is.
+            Segment::Link(url) => url,
         })
         .collect()
 }
 
-/// What a notification carries. A message that is nothing but images still has
-/// to say something.
-pub fn notification_body(text: &str, attachments: usize) -> String {
-    if text.trim().is_empty() && attachments > 0 {
-        return IMAGE_ONLY.to_owned();
+/// What a notification carries. A message that is nothing but files still has to
+/// say something. `files` counts the attachments and the streamed files
+/// together: to a notification they are the same thing.
+pub fn notification_body(text: &str, files: usize) -> String {
+    if text.trim().is_empty() && files > 0 {
+        return FILE_ONLY.to_owned();
     }
     text.to_owned()
 }
@@ -614,7 +634,39 @@ pub fn describe(failure: &ApiFailure) -> String {
         ApiFailure::StaleKey => "Unauthorized: rebuild the client with the current key".to_owned(),
         ApiFailure::Transport(_) => "Cannot reach the server".to_owned(),
         ApiFailure::Malformed(_) => UNEXPECTED.to_owned(),
+        // The disk, not the server, put an end to it: it carries its own words,
+        // and "cannot reach the server" would be a lie about a full volume.
+        ApiFailure::Io(detail) => non_empty(detail).unwrap_or_else(|| UNEXPECTED.to_owned()),
         ApiFailure::Status(_, detail) => non_empty(detail).unwrap_or_else(|| UNEXPECTED.to_owned()),
+    }
+}
+
+/// One byte count as a person reads it: whole bytes below a kibibyte, and at
+/// most one decimal place above it, so `2 GiB` is not written `2.0 GiB`.
+pub fn format_bytes(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < BYTE_UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{bytes} B");
+    }
+
+    let mut rounded = (value * 10.0).round() / 10.0;
+    // One byte short of a mebibyte rounds to 1024.0 KiB, which is a unit nobody
+    // writes: carry it instead.
+    if rounded >= 1024.0 && unit + 1 < BYTE_UNITS.len() {
+        rounded /= 1024.0;
+        unit += 1;
+    }
+
+    let suffix = BYTE_UNITS[unit];
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0} {suffix}")
+    } else {
+        format!("{rounded:.1} {suffix}")
     }
 }
 
@@ -858,16 +910,82 @@ mod tests {
         assert_eq!(plain_text("@everyone up", &users), "@everyone up");
         assert_eq!(plain_text("@here up", &users), "@here up");
         assert_eq!(plain_text("plain", &users), "plain");
+        // A link is a run of its own in the message view; copied, it is the URL.
+        assert_eq!(
+            plain_text("see https://vorcall.example/x now", &users),
+            "see https://vorcall.example/x now"
+        );
     }
 
     #[test]
-    fn a_notification_for_images_alone_still_says_something() {
-        assert_eq!(notification_body("", 2), IMAGE_ONLY);
-        assert_eq!(notification_body("   ", 1), IMAGE_ONLY);
+    fn a_notification_for_files_alone_still_says_something() {
+        assert_eq!(notification_body("", 2), FILE_ONLY);
+        assert_eq!(notification_body("   ", 1), FILE_ONLY);
         assert_eq!(notification_body("look", 1), "look");
         // Nothing at all is what a tombstone's notification would carry; there is
-        // no image to name instead.
+        // no file to name instead.
         assert_eq!(notification_body("", 0), "");
+    }
+
+    /// The expected strings are what a person writes by hand, not what the
+    /// function's own arithmetic produces.
+    #[test]
+    fn a_byte_count_reads_as_a_person_would_write_it() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1), "1 B");
+        assert_eq!(format_bytes(999), "999 B");
+        // Every unit's own boundary is exact, and an exact value carries no
+        // decimal point at all.
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1 MiB");
+        assert_eq!(format_bytes(8 * 1024 * 1024), "8 MiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2 GiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1 TiB");
+        // 1.4 MiB is 1_468_006 bytes; the tenth is what survives the rounding.
+        assert_eq!(format_bytes(1_468_006), "1.4 MiB");
+        // One byte short of a mebibyte is 1023.999… KiB, which is written as the
+        // next unit rather than as "1024 KiB".
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1 MiB");
+        // Nothing above the largest unit, however big it gets.
+        assert!(format_bytes(u64::MAX).ends_with(" TiB"));
+    }
+
+    /// A size is a glance, not a measurement: one decimal place at most,
+    /// whatever the count.
+    #[test]
+    fn a_byte_count_never_carries_more_than_one_decimal() {
+        for bytes in [
+            0,
+            1,
+            1023,
+            1025,
+            1_468_006,
+            3_333_333,
+            1_234_567_890,
+            u64::MAX / 3,
+            u64::MAX,
+        ] {
+            let said = format_bytes(bytes);
+            let decimals = said
+                .split_once('.')
+                .map(|(_, rest)| rest.trim_end_matches(char::is_alphabetic).trim().len());
+            assert!(
+                decimals.is_none_or(|places| places == 1),
+                "{bytes} said as {said}"
+            );
+        }
+    }
+
+    /// A disk that filled up is not a server that cannot be reached.
+    #[test]
+    fn a_local_failure_is_said_in_its_own_words() {
+        assert_eq!(
+            describe(&ApiFailure::Io("no space left on device".to_owned())),
+            "no space left on device"
+        );
+        assert_eq!(describe(&ApiFailure::Io(String::new())), UNEXPECTED);
     }
 
     #[test]

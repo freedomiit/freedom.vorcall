@@ -131,9 +131,12 @@ security group. Voice and screen sharing simply do not work without it.
 A complete site config, replacing `chat.example.org` with your domain. Get the certificate
 with `certbot certonly --webroot -w /var/www/certbot -d chat.example.org` first.
 
-The three unbuffered `location` blocks are not optional: uploads and update downloads are
-raw streamed bodies, and a plain `/api/` proxy would apply nginx's 1 MiB default and buffer
-whole files into memory.
+The unbuffered `location` blocks are not optional: uploads, streamed files and update
+downloads are raw streamed bodies, and a plain `/api/` proxy would apply nginx's 1 MiB
+default and buffer whole files into memory. Each of them sets its own
+`client_max_body_size`, because the three upload paths have three different ceilings: an
+attachment stops at 2 GiB, a picture at 8 MiB, and a streamed file's range is as large as
+the file it came from.
 
 ```nginx
 server {
@@ -172,9 +175,25 @@ server {
         proxy_buffering off;
     }
 
-    # Image uploads and downloads: streamed raw bodies, never buffered.
-    location /api/attachments { include /etc/nginx/snippets/vorcall-upload.conf; }
-    location /api/images      { include /etc/nginx/snippets/vorcall-upload.conf; }
+    # File uploads and downloads: streamed raw bodies, never buffered.
+    location /api/attachments {
+        client_max_body_size 2g;
+        include /etc/nginx/snippets/vorcall-upload.conf;
+    }
+
+    # Avatars, banners and icons are a separate, much smaller store.
+    location /api/images {
+        client_max_body_size 9m;
+        include /etc/nginx/snippets/vorcall-upload.conf;
+    }
+
+    # Streamed files: the sender's client pushes a range in through here while the
+    # reader pulls it out, so neither direction may be buffered and neither has a
+    # size this proxy can bound.
+    location /api/streams {
+        client_max_body_size 0;
+        include /etc/nginx/snippets/vorcall-upload.conf;
+    }
 
     # Problem reports uploaded from the client.
     location /api/diagnostics {
@@ -220,7 +239,6 @@ server {
 `/etc/nginx/snippets/vorcall-upload.conf`:
 
 ```nginx
-client_max_body_size 9m;
 proxy_request_buffering off;
 proxy_buffering off;
 proxy_read_timeout 300s;
@@ -233,10 +251,15 @@ proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto https;
 ```
 
+The snippet deliberately carries no `client_max_body_size`: each `location` above sets its
+own, and nginx refuses a duplicate at the same level. Keep `proxy_read_timeout` comfortably
+above `Vorcall__StreamSenderTimeoutSeconds` — a reader's `GET /api/streams/{id}` produces no
+bytes until the sending client answers.
+
 ### Caddy
 
-Caddy handles certificates on its own, but the upload and update paths still need their
-limits raised:
+Caddy handles certificates on its own, but the upload, streaming and update paths still
+need their limits raised, and they do not all need the same one:
 
 ```caddyfile
 chat.example.org {
@@ -244,7 +267,28 @@ chat.example.org {
 		max_size 64KB
 	}
 
-	@big path /api/attachments* /api/images* /api/diagnostics* /api/updates*
+	# A range of a streamed file is as large as the file the sender picked.
+	@streams path /api/streams*
+	handle @streams {
+		request_body {
+			max_size 1TB
+		}
+		reverse_proxy 127.0.0.1:5000 {
+			flush_interval -1
+		}
+	}
+
+	@attachments path /api/attachments*
+	handle @attachments {
+		request_body {
+			max_size 2GB
+		}
+		reverse_proxy 127.0.0.1:5000 {
+			flush_interval -1
+		}
+	}
+
+	@big path /api/images* /api/diagnostics* /api/updates*
 	handle @big {
 		request_body {
 			max_size 9MB
@@ -335,29 +379,38 @@ setting.
 | `Vorcall__VoiceEnabled` | `true` | `false` disables voice entirely; `JoinVoice` answers `VOICE_UNAVAILABLE`. |
 | `Vorcall__ShareMaxKbps` | `30000` | Per-session ceiling for screen-share media. Range 1000–200000. |
 | `Vorcall__MaxSharersPerRoom` | `3` | How many people may share in one channel at once. Range 1–16. |
-| `Vorcall__AttachmentsMaxBytes` | `2147483648` | Total on-disk quota for uploads. Beyond it an upload is refused with 507. |
+| `Vorcall__AttachmentsMaxBytes` | `214748364800` | Total on-disk quota for uploads, 200 GiB. Beyond it an upload is refused with 507. Set it from the real size of the disk. |
+| `Vorcall__StreamsEnabled` | `true` | `false` turns streamed files off server-wide and unmaps the four `/api/streams` routes. |
+| `Vorcall__StreamSenderTimeoutSeconds` | `30` | How long a reader waits for the sending client to answer before the download fails with 504. Range 1–600. |
+| `Vorcall__StreamMaxTransfersPerOwner` | `8` | How many streamed-file transfers one account may be asked to serve at once. Range 1–64. |
 | `Vorcall__AuthRequestsPerWindow` | `10` | Sign-in and registration requests per minute per IP. |
 | `Vorcall__UploadRequestsPerWindow` | `20` | Uploads per minute per account. |
 | `Vorcall__MessageBurst` | `20` | Write frames an account may send back to back. |
 | `Vorcall__MessagesPerSecond` | `2` | Sustained write-frame rate per account. |
 | `Vorcall__DiagnosticsReportsPerHour` | `10` | Problem-report uploads per account per hour. |
 | `Vorcall__DataDir` | `/data` | Where generated secrets live. |
-| `Vorcall__AttachmentsDir` | `/attachments` | Uploaded images. |
+| `Vorcall__AttachmentsDir` | `/attachments` | Uploaded files, and the avatars, banners and icons beside them. |
 | `Vorcall__LogsDir` | `/logs` | Daily JSON logs, 31 kept. |
 | `Vorcall__DiagnosticsDir` | `/diagnostics` | Uploaded problem reports, swept after 30 days. |
 | `Vorcall__ReleasesDir` | `/releases` | Signed client releases served under `/api/updates/*`. |
 
-Single-file uploads are capped at 8 MiB and four per message; those are not configurable.
+Not configurable: an attachment may be any file type, up to 2 GiB, four per message. A file
+larger than that is sent as a **streamed file** instead — the server records the offer and
+proxies the bytes but never stores them, so it is readable only while the sender's client is
+online; those are capped at 1 TiB, also four per message. Avatars, banners and icons are a
+separate, stricter store: PNG, JPEG, GIF or WebP only, checked against the type's magic
+number, 8 MiB each. Only attachments and images are charged against
+`Vorcall__AttachmentsMaxBytes`; a streamed file occupies no disk here at all.
 
 ### Where the data lives
 
-Five Docker volumes, all created on the first `up -d`:
+The Docker volumes, all created on the first `up -d`:
 
 | Volume | Holds | Back up? |
 | --- | --- | --- |
 | `pgdata` | Accounts, messages, channels, roles — everything | **Yes** |
 | `data` | The generated door key and signing key | **Yes** |
-| `attachments` | Uploaded images, avatars, banners, icons | **Yes** |
+| `attachments` | Uploaded files, avatars, banners, icons | **Yes** |
 | `logs` | Daily JSON logs | No |
 | `diagnostics` | Client problem reports | No |
 | `releases` | Signed client releases, if you publish any | If you use it |
@@ -536,9 +589,11 @@ UDP 5005 is not reachable. Check the host firewall *and* your cloud security gro
 The kernel clamped the relay's socket buffers. Apply the
 [sysctl settings](#kernel-buffers) and restart the backend.
 
-**Uploads fail at around 1 MB.**
-The reverse proxy is applying its default body limit. The `/api/attachments` and
-`/api/images` locations need `client_max_body_size 9m` and unbuffered proxying of their own.
+**Uploads fail at around 1 MB, or large ones fail at 9 MB.**
+The reverse proxy is applying a body limit. `/api/attachments`, `/api/images` and
+`/api/streams` each need their own `client_max_body_size` — 2 GiB, 9 MB and unlimited
+respectively — and unbuffered proxying. A config written before 0.6.0 caps all of them at
+`9m`, which stops every attachment above that and every streamed file.
 
 **Screen share starts and immediately stops on Linux.**
 The client needs PipeWire (`libpipewire-0.3.so.0`) and a desktop portal. Every share raises

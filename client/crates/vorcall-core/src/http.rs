@@ -1,5 +1,5 @@
-//! The HTTP half of the protocol: the one reqwest client every REST call shares,
-//! the TLS setup it must agree on with tokio-tungstenite, the three verbs every
+//! The HTTP half of the protocol: the reqwest clients every REST call shares,
+//! the TLS setup they must agree on with tokio-tungstenite, the three verbs every
 //! REST module goes through, and how a non-success response is turned into an
 //! [`ApiFailure`] the connection loop can act on.
 //!
@@ -49,6 +49,10 @@ pub enum ApiFailure {
     Transport(String),
     #[error("malformed response: {0}")]
     Malformed(String),
+    /// A transfer the disk, not the server, put an end to: a file that cannot
+    /// be read, a download with nowhere to land. It carries its own words.
+    #[error("{0}")]
+    Io(String),
 }
 
 /// The process-wide client. Built once: a session refreshes tokens and pages
@@ -88,6 +92,33 @@ pub fn download_client() -> Result<&'static reqwest::Client, ApiFailure> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(60))
+        .tls_backend_preconfigured(tls.clone())
+        .build()
+        .map_err(|e| ApiFailure::Transport(e.to_string()))?;
+
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// The client an upload of a file uses.
+///
+/// A body of gigabytes cannot live inside a whole-request budget — the largest
+/// one takes the better part of an hour on a home link — so this client has no
+/// total timeout. It has no read timeout either: reqwest starts that clock when
+/// the request does and stops it only when the response head arrives, so the
+/// 60 s of [`download_client`] would cut off every upload that runs longer than
+/// a minute. Keepalive probes are what is left to notice a peer that has gone
+/// away; reqwest has no write timeout to bound the sending itself.
+pub fn upload_client() -> Result<&'static reqwest::Client, ApiFailure> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+
+    let tls = tls_config().map_err(|e| ApiFailure::Transport(e.to_string()))?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(30))
         .tls_backend_preconfigured(tls.clone())
         .build()
         .map_err(|e| ApiFailure::Transport(e.to_string()))?;

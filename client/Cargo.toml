@@ -4,13 +4,13 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.5.2"
+version = "0.6.0"
 license = "MIT"
 
 # Oldest client version the current release still lets chat. Clients below it
 # show the "Update required" screen; release.yml asserts min_version <= version.
 [workspace.metadata.vorcall]
-min_version = "0.5.0"
+min_version = "0.6.0"
 
 [workspace.dependencies]
 # Pure-Rust port of WebRTC's AEC3, noise suppressor and AGC2. Young and its API
@@ -43,6 +43,7 @@ rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
     "http2",
+    "stream",
 ] }
 # The native file dialog for picking attachments; portal-backed on Linux.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
@@ -82,6 +83,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    # And the clipboard, for vorcall-clipboard: the formats themselves, the
+    # global blocks they arrive in, the CF_* ids, the DIB header a pasted
+    # bitmap carries and DragQueryFileW for a pasted file list.
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
 ] }
 core-graphics = "0.23"
 core-foundation = "0.9"
@@ -131,6 +140,31 @@ dispatch2 = "0.3"
 pipewire = "0.10.1"
 libspa = "0.10.1"
 
+# Reading files and images off the clipboard, one backend per platform, since
+# iced's own clipboard is text-only. windows-sys and the objc2 family above
+# already carry the Windows and macOS sides.
+# The Wayland side reads the seat's own selection on the application's
+# connection, because only the client holding keyboard focus may read it and
+# mutter implements no data control protocol to sidestep that. Both crates are
+# already in the lock through winit, and `client_system` — which is what makes
+# `Backend::from_foreign_display` exist — is already on, turned on there by the
+# smithay-clipboard iced pastes text with.
+wayland-backend = { version = "0.3", default-features = false, features = [
+    "client_system",
+    "dlopen",
+] }
+wayland-client = "0.31"
+# The CLIPBOARD selection including the INCR protocol a pasted image needs, on
+# top of the same x11rb vorcall-hotkey already links.
+x11-clipboard = "0.9"
+# NSPasteboard; the rest of the objc2 family is already a dependency above.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+    "NSPasteboardItem",
+] }
+
+vorcall-clipboard = { path = "crates/vorcall-clipboard" }
 vorcall-core = { path = "crates/vorcall-core" }
 vorcall-hotkey = { path = "crates/vorcall-hotkey" }
 vorcall-proto = { path = "crates/vorcall-proto" }

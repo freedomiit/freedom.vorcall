@@ -12,18 +12,23 @@
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    Id, Space, TextInput, button, column, container, image, mouse_area, opaque, row, scrollable,
-    slider, stack, text, text_input, toggler,
+    Id, Space, TextInput, button, column, container, image, mouse_area, opaque, progress_bar, row,
+    scrollable, slider, stack, text, text_input, toggler,
 };
 use iced::{ContentFit, Element, Length, mouse};
 use vorcall_core::ChannelKind;
 use vorcall_core::images::ImagePurpose;
 use vorcall_screen::{Source, SourceId, SourceKind};
 
-use crate::app::message::{AdminMsg, AuthMsg, CropMsg, Message, SettingsMsg, ShareMsg, UiMsg};
+use crate::app::message::{
+    AdminMsg, AuthMsg, ChatMsg, CropMsg, Message, SettingsMsg, ShareMsg, UiMsg,
+};
 use crate::app::state::chat::ImageState;
 use crate::app::state::crop::{self, CropState, FRAME_WIDTH, ZOOM_MAX, ZOOM_MIN};
-use crate::app::state::ui::{Dialog, DialogAction, SourcesState, validate_long, validate_name};
+use crate::app::state::rules::{format_bytes, progress_fraction};
+use crate::app::state::ui::{
+    Dialog, DialogAction, SourcesState, TransferSource, TransferState, validate_long, validate_name,
+};
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
 use crate::theme::ThemeTokens;
@@ -40,6 +45,8 @@ const DIALOG_WIDTH: f32 = 360.0;
 const PICKER_WIDTH: f32 = 440.0;
 /// How much of the picker the source list may take.
 const SOURCES_HEIGHT: f32 = 220.0;
+/// The bar a running transfer draws.
+const TRANSFER_BAR_GIRTH: f32 = 6.0;
 
 /// The stacked overlays, topmost last. Nothing is drawn when nothing is open.
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
@@ -177,6 +184,22 @@ fn modal<'a>(app: &'a App, main: &'a MainState, dialog: &'a Dialog) -> Element<'
             selected,
             audio,
         } => share_picker(app, sources, selected.as_ref(), *audio),
+        Dialog::Transfer {
+            source,
+            request_id,
+            file_name,
+            received,
+            total,
+            state,
+        } => transfer(
+            app,
+            *source,
+            *request_id,
+            file_name,
+            *received,
+            *total,
+            state,
+        ),
         Dialog::ThemeSaveAs { name } => theme_save_as(app, name),
         // The code is shown once: the server never sends it again.
         Dialog::InviteCreated { code } => invite_created(app, code),
@@ -490,6 +513,78 @@ fn confirm<'a>(
         vec![note(tokens, consequence.to_owned())],
         actions(app, label, true, true),
     )
+}
+
+/// One file coming down onto the disk. Alone among the dialogs this one is a
+/// display rather than a form: the counters are written into it in place, so
+/// nothing here rebuilds it.
+fn transfer<'a>(
+    app: &'a App,
+    source: TransferSource,
+    request_id: u64,
+    file_name: &str,
+    received: u64,
+    total: u64,
+    state: &'a TransferState,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+
+    let mut rows: Vec<Element<'_, Message>> = vec![
+        text(file_name.to_owned())
+            .size(TEXT_BODY)
+            .color(tokens.text_primary)
+            .into(),
+    ];
+    if matches!(source, TransferSource::Stream(_)) {
+        rows.push(note(
+            tokens,
+            "Streamed from the sender's own computer.".to_owned(),
+        ));
+    }
+
+    let (title, action) = match state {
+        TransferState::Running => {
+            rows.push(
+                progress_bar(0.0..=1.0, progress_fraction(received, total))
+                    .girth(TRANSFER_BAR_GIRTH)
+                    .into(),
+            );
+            // A record that never said how large the file is counts up instead of
+            // filling.
+            rows.push(note(
+                tokens,
+                if total == 0 {
+                    format_bytes(received)
+                } else {
+                    format!("{} of {}", format_bytes(received), format_bytes(total))
+                },
+            ));
+            let cancel = button(text("Cancel").size(TEXT_BODY))
+                .padding([6.0, 14.0])
+                .style(styles::button::secondary(tokens))
+                .on_press(Message::Chat(ChatMsg::CancelTransfer(request_id)));
+            ("Saving a file", cancel.into())
+        }
+        TransferState::Done(path) => {
+            rows.push(note(tokens, format!("Saved to {}", path.display())));
+            ("File saved", close(app))
+        }
+        TransferState::Failed(reason) => {
+            rows.push(complaint(tokens, reason.clone()));
+            ("The file did not arrive", close(app))
+        }
+    };
+
+    sized_frame(app, title, rows, action, DIALOG_WIDTH)
+}
+
+/// The one button a dialog that has nothing left to do carries.
+fn close(app: &App) -> Element<'_, Message> {
+    button(text("Close").size(TEXT_BODY))
+        .padding([6.0, 14.0])
+        .style(styles::button::secondary(&app.tokens))
+        .on_press(Message::Ui(UiMsg::CloseDialog))
+        .into()
 }
 
 /// The server settings own the ban flow — the bans page writes the same draft —

@@ -40,6 +40,12 @@ pub fn update(app: &mut App, message: KeyMsg) -> Task<Message> {
             {
                 main.chat.schedule_mark_read();
             }
+            // The first focus is the earliest moment the window certainly
+            // exists, and the clipboard cannot be opened before it has been
+            // asked which display it is on.
+            if focused {
+                return app.probe_display();
+            }
             Task::none()
         }
         KeyMsg::KeyDown(key, modifiers) => key_down(app, &key, modifiers),

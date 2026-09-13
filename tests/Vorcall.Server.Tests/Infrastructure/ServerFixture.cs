@@ -23,6 +23,7 @@ public sealed class ServerFixture : IAsyncLifetime
     public const int TightMessageBurst = 3;
     public const int TightDiagnosticsPerHour = 2;
     public const int TightAuthPerWindow = 3;
+    public const int TightStreamTimeoutSeconds = 1;
 
     private const string DefaultAdminConnectionString =
         "Host=localhost;Port=5433;Username=vorcall;Password=vorcall;Database=postgres";
@@ -108,6 +109,27 @@ public sealed class ServerFixture : IAsyncLifetime
     // A host whose server row has no owner, which is what a self-hosted install looks like between
     // `docker compose up -d` and the first account: the first registration takes ownership.
     public Task<VorcallFactory> UnownedAsync() => NamedAsync("unowned", _ => { }, seedOwner: false);
+
+    // The streamed-file proxy's two ceilings, turned down to what a test can reach: a sender that
+    // never answers is refused after a second rather than thirty, and one transfer per owner is a
+    // cap a second reader trips at once. Its own host, and not the shared one, for both of them:
+    // a one-second clock would race every honest push in the suite, and a cap of one would refuse
+    // the second of two concurrent readers, which is a case of its own.
+    public Task<VorcallFactory> TightStreamsAsync() => NamedAsync("tight-streams", settings =>
+    {
+        settings["Vorcall:StreamSenderTimeoutSeconds"] = TightStreamTimeoutSeconds.ToString(CultureInfo.InvariantCulture);
+        settings["Vorcall:StreamMaxTransfersPerOwner"] = "1";
+    });
+
+    // Streamed files off: the four routes are never mapped.
+    public Task<VorcallFactory> StreamsDisabledAsync() => NamedAsync(
+        "streams-off",
+        settings => settings["Vorcall:StreamsEnabled"] = "false");
+
+    // A host of its own for the one test that stops it. Nothing else may share it, and nothing
+    // else does: a stopped host answers no further request. The sender timeout stays at its
+    // default, so the bound that test measures against is the shutdown and not a short clock.
+    public Task<VorcallFactory> StoppableStreamsAsync() => NamedAsync("streams-stopping", _ => { });
 
     public async Task DisposeAsync()
     {

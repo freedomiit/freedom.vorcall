@@ -36,8 +36,10 @@ aplicativo móvel. O que há:
   por quem mais estiver no canal.
 - **Cargos e permissões**: 21 delas, com cores, ícones e hierarquia, sobrescrevíveis por
   canal e por membro.
-- **Mensagens** com resposta, edição, reações e imagens anexadas; contadores de não lidas e
-  de menções; `@everyone` e `@here`.
+- **Mensagens** com resposta, edição, reações e anexos de qualquer tipo de arquivo — até
+  2 GiB guardados no servidor, e o que passar disso vai direto da máquina de quem
+  enviou; texto selecionável, links clicáveis, colar um arquivo para anexar; contadores de
+  não lidas e de menções; `@everyone` e `@here`.
 - **Perfis**: avatar, banner, apelido, descrição, cor de destaque.
 - **Moderação**: expulsar, banir, silenciar e ensurdecer no servidor, mover, revogar
   convites.
@@ -45,8 +47,7 @@ aplicativo móvel. O que há:
   navegador embrulhado. Com temas, alternador rápido e teclas remapeáveis.
 
 Ausentes de propósito: mais de um servidor por instalação, DMs em grupo, tópicos, busca em
-mensagens, fixados, status personalizado, anexos que não sejam imagens, OAuth ou 2FA, e
-qualquer interface web.
+mensagens, fixados, status personalizado, OAuth ou 2FA, e qualquer interface web.
 
 ## Instalar o cliente
 

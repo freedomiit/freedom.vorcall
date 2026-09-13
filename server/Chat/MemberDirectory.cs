@@ -262,6 +262,7 @@ public sealed class MemberDirectory(
                     ct);
             await db.Reactions.Where(r => messageIds.Contains(r.MessageId)).ExecuteDeleteAsync(ct);
             await db.Attachments.Where(a => linked.Contains(a.MessageId)).ExecuteDeleteAsync(ct);
+            await db.StreamedFiles.Where(s => linked.Contains(s.MessageId)).ExecuteDeleteAsync(ct);
         }
 
         // PROTOCOL.md § Moderation puts the per-member overrides in this transaction too: an

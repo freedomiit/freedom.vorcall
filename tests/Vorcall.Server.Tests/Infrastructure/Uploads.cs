@@ -14,9 +14,10 @@ internal static class Uploads
         string bearer,
         string channel,
         byte[] body,
-        string contentType = "image/png",
+        string? contentType = "image/png",
         string? fileName = null,
-        long? declaredLength = null)
+        long? declaredLength = null,
+        string? rawContentType = null)
         => Proto.PostBytesAsync(
             factory,
             $"/api/attachments?channel={Uri.EscapeDataString(channel)}",
@@ -28,6 +29,14 @@ internal static class Uploads
                 if (fileName is not null)
                 {
                     request.Headers.Add(FileNameHeader, fileName);
+                }
+
+                // A Content-Type no client library would build: it goes on unparsed, because
+                // what the endpoint does with a header that is not a media type is the point.
+                if (rawContentType is not null)
+                {
+                    request.Content!.Headers.Remove("Content-Type");
+                    request.Content.Headers.TryAddWithoutValidation("Content-Type", rawContentType);
                 }
 
                 // A length the body does not have: what the endpoint refuses from the header
@@ -43,10 +52,47 @@ internal static class Uploads
         string bearer,
         long channelId,
         byte[] body,
-        string contentType = "image/png",
+        string? contentType = "image/png",
         string? fileName = null,
+        long? declaredLength = null,
+        string? rawContentType = null)
+        => UploadAsync(factory, bearer, History.Id(channelId), body, contentType, fileName, declaredLength, rawContentType);
+
+    // POST /api/images?purpose=..., the image store's own upload: four types, magic-checked,
+    // 8 MiB. Same door key, bearer and rate-limit policy as an attachment's.
+    public static Task<ProtoResponse> UploadImageAsync(
+        VorcallFactory factory,
+        string bearer,
+        string purpose,
+        byte[] body,
+        string? contentType = "image/png",
         long? declaredLength = null)
-        => UploadAsync(factory, bearer, History.Id(channelId), body, contentType, fileName, declaredLength);
+        => Proto.PostBytesAsync(
+            factory,
+            $"/api/images?purpose={Uri.EscapeDataString(purpose)}",
+            body,
+            contentType,
+            bearer,
+            configure: request =>
+            {
+                if (declaredLength is { } length)
+                {
+                    request.Content!.Headers.ContentLength = length;
+                }
+            });
+
+    public static Task<ProtoResponse> DownloadImageAsync(VorcallFactory factory, string bearer, long id, string? range = null)
+        => Proto.GetAsync(
+            factory,
+            $"/api/images/{id}",
+            bearer,
+            configure: request =>
+            {
+                if (range is not null)
+                {
+                    request.Headers.Range = RangeHeaderValue.Parse(range);
+                }
+            });
 
     public static Task<ProtoResponse> DownloadAsync(VorcallFactory factory, string bearer, long id, string? range = null)
         => Proto.GetAsync(

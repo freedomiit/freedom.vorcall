@@ -546,6 +546,12 @@ pub fn path() -> Option<PathBuf> {
 /// the crash reports go; `None` when the platform exposes no config directory
 /// at all.
 pub fn log_dir() -> Option<PathBuf> {
+    // These three strings pick the platform config/cache/log directory for
+    // every existing install; they are not placeholders to tidy up. Change any
+    // of them and an existing user's config.toml silently stops resolving —
+    // indistinguishable from a fresh install, so their settings are gone and
+    // they're signed out. "freedomit" is the real org id, not the kind of
+    // identifier that gets scrubbed from a public repo.
     directories::ProjectDirs::from("br.com", "freedomit", "vorcall")
         .map(|dirs| dirs.config_dir().to_path_buf())
 }
@@ -553,6 +559,7 @@ pub fn log_dir() -> Option<PathBuf> {
 /// Where anything the client can re-fetch belongs; `None` when the platform
 /// exposes no cache directory at all.
 pub fn cache_dir() -> Option<PathBuf> {
+    // Same load-bearing strings as `log_dir` above — see that comment.
     directories::ProjectDirs::from("br.com", "freedomit", "vorcall")
         .map(|dirs| dirs.cache_dir().to_path_buf())
 }

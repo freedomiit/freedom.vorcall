@@ -32,6 +32,11 @@ APP_DIR="${APP_DIR:-/opt/vorcall}"
 # The address $DOMAIN must resolve to, as a guard against provisioning a host the
 # DNS does not point at. Unset skips the check.
 EXPECTED_IP="${EXPECTED_IP-}"
+# The account the nightly backup cron job runs as. Defaults to whoever is running
+# this script, since that is the account that owns $APP_DIR/backups (created below
+# without sudo) and is in the docker group; hardcoding a specific account name here
+# would make cron reject the entry outright on any host without one.
+CRON_USER="${CRON_USER:-$(id -un)}"
 
 SITE=/etc/nginx/sites-available/$DOMAIN
 WEBROOT=/var/www/certbot
@@ -185,20 +190,29 @@ sudo sysctl --system >/dev/null
 step "backups, logs and diagnostics directories"
 mkdir -p "$APP_DIR/backups" "$APP_DIR/logs" "$APP_DIR/diagnostics"
 sudo install -m 0755 "$SCRIPT_DIR/backup-db.sh" /usr/local/bin/vorcall-backup-db
+# The sixth field of an /etc/cron.d line is the user the job runs as; it is
+# $CRON_USER (see above), not hardcoded, since the account that owns
+# $APP_DIR/backups varies by host.
 sudo tee /etc/cron.d/vorcall-backup >/dev/null <<EOF
 SHELL=/bin/bash
-15 3 * * * ubuntu APP_DIR=$APP_DIR /usr/local/bin/vorcall-backup-db >> $APP_DIR/backups/cron.log 2>&1
+15 3 * * * $CRON_USER APP_DIR=$APP_DIR /usr/local/bin/vorcall-backup-db >> $APP_DIR/backups/cron.log 2>&1
 EOF
 sudo chmod 0644 /etc/cron.d/vorcall-backup
-echo "nightly dump at 03:15 UTC via /etc/cron.d/vorcall-backup (restore procedure: head of deploy/backup-db.sh)"
+echo "nightly dump at 03:15 UTC as $CRON_USER via /etc/cron.d/vorcall-backup (restore procedure: head of deploy/backup-db.sh)"
 
 # --- 10. production .env -----------------------------------------------------
 step "production .env"
 mkdir -p "$APP_DIR"
 # Bind-mounted read-only into the backend; the release workflow scps manifests and binaries here.
 mkdir -p "$APP_DIR/releases"
-# Bind-mounted read-write into the backend; holds uploaded image attachments.
+# Bind-mounted read-write into the backend; holds uploaded attachments and images.
+# An attachment may be any file up to 2 GiB, bounded only by the total quota
+# Vorcall__AttachmentsMaxBytes, which defaults to 200 GiB. That is a quota, not a
+# reservation: this filesystem must actually be able to grow that far, or the disk
+# fills before the quota is reached. Streamed files are proxied, never stored here.
 mkdir -p "$APP_DIR/attachments"
+df -h "$APP_DIR/attachments" | awk 'NR==1 || NR==2 {print "  " $0}'
+echo "attachments quota defaults to 200 GiB (Vorcall__AttachmentsMaxBytes); lower it in $APP_DIR/.env if the space above is smaller"
 if [ -f "$APP_DIR/.env" ]; then
     echo "$APP_DIR/.env already exists, left untouched"
     echo "add Vorcall__AdminKey=<openssl rand -hex 32> and Vorcall__AdminUrl=http://backend:5000 to $APP_DIR/.env if missing (see .env.production.example)"

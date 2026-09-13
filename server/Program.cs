@@ -175,6 +175,7 @@ try
     UpdatesEndpoints.Map(app);
     AttachmentsEndpoints.Map(app);
     ImagesEndpoints.Map(app);
+    StreamsEndpoints.Map(app);
     InvitesEndpoints.Map(app);
     BansEndpoints.Map(app);
     DiagnosticsEndpoints.Map(app);

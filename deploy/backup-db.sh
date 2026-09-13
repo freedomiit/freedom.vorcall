@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Nightly logical backup of the Vorcall Postgres database.
 #
-# Runs ON THE HOST as the `ubuntu` user; installed by deploy/provision-host.sh
+# Runs ON THE HOST as whichever user provision-host.sh ran as ($CRON_USER,
+# default the invoking user); installed by deploy/provision-host.sh
 # as /usr/local/bin/vorcall-backup-db with this cron line
 # (/etc/cron.d/vorcall-backup):
 #

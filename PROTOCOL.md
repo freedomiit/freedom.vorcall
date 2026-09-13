@@ -12,8 +12,12 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 |---|---|---|---|
 | `GET /api/messages?channel=<id>&limit=100&before=<id>` | — | 200 `MessagePage` | 400 when `channel` is missing or is not a positive integer; 403 `ApiError` when the bearer user may not view that channel |
 | `GET /api/users` | — | 200 `MemberList` | — |
-| `POST /api/attachments?channel=<id>` | raw image bytes | 201 `Attachment` | 400 / 403 / 411 / 413 / 415 / 507 `ApiError` |
+| `POST /api/attachments?channel=<id>` | raw file bytes | 201 `Attachment` | 400 / 403 / 411 / 413 / 507 `ApiError` |
 | `GET /api/attachments/{id}` | — | 200 the bytes | 403 / 404 `ApiError` |
+| `POST /api/streams?channel=<id>` | `StreamOffer` | 201 `StreamedFile` | 400 / 403 / 413 `ApiError` |
+| `GET /api/streams/{id}` | — | 200 / 206 the bytes | 403 / 404 / 409 / 410 / 416 / 503 / 504 `ApiError` |
+| `POST /api/streams/{id}/chunks?transfer=<id>` | raw bytes of the range | 204 | 400 / 404 / 409 / 410 `ApiError` |
+| `POST /api/streams/{id}/decline?transfer=<id>` | — | 204 | 400 / 404 / 409 `ApiError` |
 | `POST /api/images?purpose=avatar\|banner\|server_icon\|role_icon` | raw image bytes | 201 `Image` | 400 / 403 / 411 / 413 / 415 / 507 `ApiError` |
 | `GET /api/images/{id}` | — | 200 the bytes | 404 `ApiError` |
 | `GET /api/invites` | — | 200 `InviteList` | 403 `ApiError` |
@@ -33,9 +37,10 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 
 - `GET /api/messages`: `channel` is required — there is no default channel — and must be a positive integer naming a text or DM channel the bearer user may view, else `400 ApiError{"channel"}` (malformed, or a voice channel) or `403 ApiError{"VIEW_CHANNEL"}` (unknown or not viewable). `limit` is clamped to 1..100 (default 100); a non-numeric `limit`, or a `before` below 1, is a bare `400` with no body. `before` is optional and exclusive: only messages with `id < before` are returned. Messages come back **ascending by id**; without `before` the page is the newest `limit` messages. `has_more` is true when older messages exist before `messages[0]`.
 - `GET /api/users`: every member of the server as a `Profile`, ordered by username case-insensitively. Any bearer; the member list is not permission-filtered, channel visibility is.
-- `POST /api/attachments?channel=<id>`: the body is the raw image, its `Content-Type` one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`. `X-Vorcall-Filename` is optional. See Attachments for the failure rules. Rate limited to 20 uploads per minute per user.
+- `POST /api/attachments?channel=<id>`: the body is the raw file, of any type. `Content-Type` and `X-Vorcall-Filename` are both optional. See Attachments for the failure rules. Rate limited to 20 uploads per minute per user.
 - `GET /api/attachments/{id}`: the bytes with `Content-Length`, a strong `ETag` (`"<id>-<size>"`), `Cache-Control: private, max-age=31536000, immutable`, and Range supported. `404` when the id is unknown; `403` when the caller may not see it (see Attachments).
 - `POST /api/images` and `GET /api/images/{id}`: see Profiles and images.
+- The four `/api/streams` endpoints: see Streamed files. Only the offer is rate limited, and it draws on the upload bucket above.
 - `GET /api/invites`, `POST /api/invites`, `DELETE /api/invites/{id}`, `GET /api/bans`: see Invites and bans.
 - `POST /api/auth/register`: `400` when the username, password or invite code fail the format rules; `403` when the invite is unknown, used, revoked or expired; `409` when the username is taken — and then the invite is **not** consumed; `429` when rate-limited.
 - `POST /api/auth/login`: `401` is always `ApiError{"invalid username or password"}`, the same body whether the user exists or not. `403` is `ApiError{"banned"}`. `429` carries `Retry-After: <seconds>` when the username is locked or the IP is rate-limited.
@@ -52,7 +57,7 @@ REST: every request and response body is `application/x-protobuf`. Request bodie
 Two gates, both checked before any WebSocket upgrade:
 
 1. **Door key** — the header `X-Vorcall-Key: <pre-shared key>` on every `/ws` and `/api/*` request. It is compared in constant time. A missing or wrong key gets an empty `401` with `WWW-Authenticate: X-Vorcall-Key`. It is a door key, not identity.
-2. **Bearer access token** — `Authorization: Bearer <jwt>` on `/ws`, `/api/messages`, `/api/users`, `/api/attachments`, `/api/attachments/*`, `/api/images`, `/api/images/*`, `/api/invites`, `/api/invites/*`, `/api/bans`, `/api/diagnostics`, `/api/updates/*` and `/api/auth/password`. Failure is `401` with `WWW-Authenticate: Bearer ...`. A bearer whose account the admin CLI has disabled (`users disable`) fails validation and is refused with `401` within 30 s of the lock, the `/ws` upgrade included; a banned account is turned away at the upgrade with a bare `403` (see Moderation).
+2. **Bearer access token** — `Authorization: Bearer <jwt>` on `/ws`, `/api/messages`, `/api/users`, `/api/attachments`, `/api/attachments/*`, `/api/streams`, `/api/streams/*`, `/api/images`, `/api/images/*`, `/api/invites`, `/api/invites/*`, `/api/bans`, `/api/diagnostics`, `/api/updates/*` and `/api/auth/password`. Failure is `401` with `WWW-Authenticate: Bearer ...`. A bearer whose account the admin CLI has disabled (`users disable`) fails validation and is refused with `401` within 30 s of the lock, the `/ws` upgrade included; a banned account is turned away at the upgrade with a bare `403` (see Moderation).
 
 `/api/auth/register`, `/api/auth/login`, `/api/auth/refresh` and `/api/auth/logout` need only the door key. `/api/admin/*` needs the door key, the admin key and a private source (see the endpoint notes above); `/metrics` sits outside `/api` and is gated by source alone.
 
@@ -207,11 +212,11 @@ When a connection ends, every other online member receives `MemberUpdated` with 
 
 ## Messages
 
-- `SendMessage{channel_id, text, reply_to_id, attachment_ids}` — `channel_id` is required; `0`, unknown, or a channel the sender may not view is non-fatal `ERROR_CODE_UNKNOWN_CHANNEL` (a hidden channel is indistinguishable from a missing one on purpose). A voice channel is `ERROR_CODE_INVALID_ARGUMENT`. Without `SEND_MESSAGES` in that channel: `ERROR_CODE_PERMISSION_DENIED{"SEND_MESSAGES"}`; with attachment ids but without `ATTACH_FILES`: `…{"ATTACH_FILES"}`. `text` is 1..2000 Unicode scalars after trimming, or empty only when `attachment_ids` is non-empty; anything else is non-fatal `ERROR_CODE_INVALID_MESSAGE`. A `reply_to_id` other than 0 must name a message of the same channel — a tombstone is allowed — else `ERROR_CODE_UNKNOWN_MESSAGE`. At most 4 attachment ids, each of which must exist, have been uploaded by the sender, belong to this channel, not be linked to a message yet, and not repeat within the frame, else `ERROR_CODE_INVALID_ATTACHMENT`. The text check runs **before** the two permission checks, so a malformed text in a channel the sender may not write in answers `ERROR_CODE_INVALID_MESSAGE`, not `ERROR_CODE_PERMISSION_DENIED`. The message and the links to its attachments are persisted in one transaction, then broadcast as `ChatMessage` to every member who may view the channel, **including the sender**. The sender renders only the echo.
+- `SendMessage{channel_id, text, reply_to_id, attachment_ids, streamed_file_ids}` — `channel_id` is required; `0`, unknown, or a channel the sender may not view is non-fatal `ERROR_CODE_UNKNOWN_CHANNEL` (a hidden channel is indistinguishable from a missing one on purpose). A voice channel is `ERROR_CODE_INVALID_ARGUMENT`. Without `SEND_MESSAGES` in that channel: `ERROR_CODE_PERMISSION_DENIED{"SEND_MESSAGES"}`; with attachment ids or streamed file ids but without `ATTACH_FILES`: `…{"ATTACH_FILES"}` — one bit covers both kinds. `text` is 1..2000 Unicode scalars after trimming, or empty only when `attachment_ids` or `streamed_file_ids` is non-empty; anything else is non-fatal `ERROR_CODE_INVALID_MESSAGE`. A `reply_to_id` other than 0 must name a message of the same channel — a tombstone is allowed — else `ERROR_CODE_UNKNOWN_MESSAGE`. At most 4 attachment ids, each of which must exist, have been uploaded by the sender, belong to this channel, not be linked to a message yet, and not repeat within the frame, else `ERROR_CODE_INVALID_ATTACHMENT`. `streamed_file_ids` follows the same rule word for word — at most 4, offered by the sender for this channel, unlinked, distinct — and fails with non-fatal `ERROR_CODE_INVALID_STREAM` (28), detail `"streamed file is unknown, not yours, not in this channel or already used"`. The two lists are counted separately, so a message may carry four of each. The text check runs **before** the two permission checks, so a malformed text in a channel the sender may not write in answers `ERROR_CODE_INVALID_MESSAGE`, not `ERROR_CODE_PERMISSION_DENIED`. The message and the links to its attachments and streamed files are persisted in one transaction, then broadcast as `ChatMessage` to every member who may view the channel, **including the sender**. The sender renders only the echo.
 - Mentions. The `<@id>` tokens of the text whose id names an existing user become `mention_ids`, distinct; an unknown id stays plain text and is not stored. The literal words `@everyone` and `@here` set `mention_everyone` / `mention_here` — but only when the sender holds `MENTION_EVERYONE` in that channel; without the bit they stay plain text and both flags are false (the message is **not** refused). `@here` asks clients to notify the members who are online; `@everyone` all of them.
-- `ChatMessage` carries `channel_id`, `edited_at_unix_ms` (0 when never edited), `deleted` (a tombstone: empty text, no attachments, no reactions — tombstones stay in history and in pages), `reply_to`, `mention_ids`, the two mention flags, `reactions` (grouped by emoji, user ids ascending) and `attachments`. `reply_to` is a `ReplyRef` the server fills at read time from the target's **current** state: its id, author, the first 120 scalars of its text and whether it is a tombstone.
+- `ChatMessage` carries `channel_id`, `edited_at_unix_ms` (0 when never edited), `deleted` (a tombstone: empty text, no attachments, no streamed files, no reactions — tombstones stay in history and in pages), `reply_to`, `mention_ids`, the two mention flags, `reactions` (grouped by emoji, user ids ascending), `attachments` and `streamed_files` (`StreamedFile{id, file_name, content_type, size, owner_id}`, each readable only while `owner_id` is online — see Streamed files). `reply_to` is a `ReplyRef` the server fills at read time from the target's **current** state: its id, author, the first 120 scalars of its text and whether it is a tombstone.
 - `EditMessage{id, text}` — invalid text: non-fatal `ERROR_CODE_INVALID_MESSAGE`. Unknown message or a tombstone: non-fatal `ERROR_CODE_UNKNOWN_MESSAGE`. A channel the caller may no longer view: `ERROR_CODE_UNKNOWN_CHANNEL`. Not the author: non-fatal `ERROR_CODE_FORBIDDEN` — `MANAGE_MESSAGES` does not grant editing someone else's text. Otherwise the text and `edited_at_unix_ms` are set, `mention_ids` and the mention flags are recomputed, and `MessageEdited{message}` is broadcast to the channel's viewers.
-- `DeleteMessage{id}` — unknown message or a tombstone: `ERROR_CODE_UNKNOWN_MESSAGE`. A channel the caller may no longer view: `ERROR_CODE_UNKNOWN_CHANNEL`. Neither the author nor a holder of `MANAGE_MESSAGES` in that channel: `ERROR_CODE_PERMISSION_DENIED{"MANAGE_MESSAGES"}`. Otherwise the message becomes a tombstone: text, mentions, reactions and attachments are cleared and the attachment files are removed. `MessageDeleted{channel_id, id}` is broadcast to the channel's viewers.
+- `DeleteMessage{id}` — unknown message or a tombstone: `ERROR_CODE_UNKNOWN_MESSAGE`. A channel the caller may no longer view: `ERROR_CODE_UNKNOWN_CHANNEL`. Neither the author nor a holder of `MANAGE_MESSAGES` in that channel: `ERROR_CODE_PERMISSION_DENIED{"MANAGE_MESSAGES"}`. Otherwise the message becomes a tombstone: text, mentions, reactions, attachments and streamed files are cleared, and the attachment files are removed — a streamed file has none here to remove. `MessageDeleted{channel_id, id}` is broadcast to the channel's viewers.
 - `React{message_id, emoji, remove}` — `emoji` must be one of the eight the server accepts (👍 ❤️ 😂 😮 😢 🔥 🎉 👀), else non-fatal `ERROR_CODE_INVALID_REACTION`. An unknown message: `ERROR_CODE_UNKNOWN_MESSAGE`. A channel the caller may not view: `ERROR_CODE_UNKNOWN_CHANNEL`. Without `ADD_REACTIONS`: `ERROR_CODE_PERMISSION_DENIED{"ADD_REACTIONS"}` — removing one needs the bit too, and this check comes before the tombstone verdict, so reacting to a tombstone without the bit answers the permission error rather than `ERROR_CODE_UNKNOWN_MESSAGE`. A tombstone with the bit held: `ERROR_CODE_UNKNOWN_MESSAGE`. Otherwise the reader's reaction is added, or removed when `remove` is true; both are idempotent. `ReactionsChanged{channel_id, message_id, reactions}` carrying the full grouped set is broadcast to the channel's viewers.
 - `MarkRead{channel_id, message_id}` — a channel the caller may not view: `ERROR_CODE_UNKNOWN_CHANNEL`; a voice channel, which holds no messages and therefore no cursor: `ERROR_CODE_INVALID_ARGUMENT{"channel"}`. Otherwise the cursor becomes `max(cursor, min(message_id, newest id in the channel))`. There is no reply frame.
 
@@ -227,21 +232,51 @@ Every error above is non-fatal. Every broadcast in this section is serialized un
 
 Both attachment endpoints need the door key and a bearer access token.
 
-**Upload** — `POST /api/attachments?channel=<id>`, the body being the raw image bytes:
+An attachment is **any file of any type**. Nothing on this path sniffs, decodes or renders one: the declared type is metadata, stored, echoed back to clients and handed to the download exactly as it arrived. Pictures used as an avatar, a banner, the server icon or a role icon are a different store under much narrower rules — see Profiles and images.
+
+**Upload** — `POST /api/attachments?channel=<id>`, the body being the raw file bytes:
 
 - `channel` missing or not a positive integer: `400 ApiError{"channel"}`; a voice channel, which holds no messages to attach to: `400 ApiError{"channel"}` as well. A channel the bearer user may not view: `403 ApiError{"VIEW_CHANNEL"}`. One it may view without holding `ATTACH_FILES`: `403 ApiError{"ATTACH_FILES"}`.
-- `Content-Type` outside `image/png`, `image/jpeg`, `image/gif`, `image/webp`: `415`.
-- No `Content-Length`: `411`. `Content-Length` above 8 MiB: `413`.
-- Total stored attachment bytes plus the declared length above the quota `Vorcall:AttachmentsMaxBytes` (2 GiB by default): `507` `ApiError{"attachment storage is full"}`.
-- Otherwise the body is streamed to `<Vorcall:AttachmentsDir>/<id>.<ext>`. The upload is aborted with `413` if the body exceeds the declared length while streaming, or `400` if its first bytes do not match the declared type's magic number, or if the body ends before reaching the declared length. Success is `201` `Attachment{id, file_name, content_type, size}`.
-- `X-Vorcall-Filename` is optional: a bare file name, at most 128 characters after sanitising (path separators and control characters removed). The default is `image.<ext>`.
-- Rate limit: 20 uploads per minute per user.
+- `Content-Type` is optional. When present it must be an RFC 9110 § 5.6.2 `type/subtype` and nothing more — both halves non-empty tokens, no parameters, at most 128 characters — else `400 ApiError{"malformed content type"}`; a parameter such as a `charset` is ignored, and the media type is stored lower-cased. Absent or blank, it is stored as `application/octet-stream`. There is no `415`: the only thing an attachment's type can be wrong about is its own shape.
+- No `Content-Length`: `411 ApiError{"length required"}`. `Content-Length` above 2 GiB: `413 ApiError{"files must be 2 GiB or smaller"}` — a larger file cannot be an attachment at all and is offered as a streamed file instead.
+- Total stored attachment bytes plus the declared length above the quota `Vorcall:AttachmentsMaxBytes` (200 GiB by default): `507` `ApiError{"attachment storage is full"}`. Images are charged to the same quota.
+- Otherwise the body is streamed to `<Vorcall:AttachmentsDir>/<id>.bin` — one extension for every attachment whatever its type, so the type is never part of a path. The upload is aborted with `413` if the body exceeds the declared length while streaming, or `400 ApiError{"body ended early"}` if it ends before reaching it. Success is `201` `Attachment{id, file_name, content_type, size}`.
+- `X-Vorcall-Filename` is optional: a bare file name, at most 255 characters after sanitising (path separators and control characters removed). The default is `file.bin`.
+- Rate limit: 20 uploads per minute per user, shared with `POST /api/images` and `POST /api/streams`.
 
-An upload is **unlinked** until a `SendMessage` names its id. Unlinked uploads older than 1 hour are swept every 10 minutes, file and row together.
+An upload is **unlinked** until a `SendMessage` names its id, and **incomplete** until its body has arrived in full. The sweeper runs every 10 minutes: an unlinked row is taken an hour after it was written, file and row together, while a row still marked incomplete is given 24 hours instead, because a 2 GiB body over a thin link can outlive the shorter cutoff several times over.
 
-**Download** — `GET /api/attachments/{id}`: unknown id `404`; unlinked and the caller is not the uploader `403`; linked and the caller may not view the message's channel `403`. Otherwise the bytes with `Content-Length`, the strong `ETag` `"<id>-<size>"`, `Cache-Control: private, max-age=31536000, immutable`, and Range supported.
+**Download** — `GET /api/attachments/{id}`: unknown id `404`; unlinked and the caller is not the uploader `403`; linked and the caller may not view the message's channel `403`. Otherwise the bytes with `Content-Length`, the strong `ETag` `"<id>-<size>"`, `Cache-Control: private, max-age=31536000, immutable`, and Range supported. A row written before 0.6.0 sits under the `<id>.<ext>` name its content type gave it; the store resolves either name, so nothing has to be moved.
 
 Deleting a message removes its attachments, rows and files alike.
+
+## Streamed files
+
+A **streamed file** is a file the sender's own client keeps and serves on demand. The server records the offer, asks the owning client for each range a reader wants, and copies the bytes from that request into the reader's response as they arrive; it never writes them to disk and never holds more than one copy buffer of them. Nothing is charged to `Vorcall:AttachmentsMaxBytes`, and the file is readable **only while its owner has a live WebSocket**.
+
+A file above the 2 GiB attachment ceiling can be sent no other way; below it either kind will do and the sending client chooses. `Vorcall:StreamsEnabled = false` leaves all four endpoints unmapped, so nothing can be offered and therefore no `SendMessage` can name one.
+
+All four endpoints need the door key and a bearer access token.
+
+**Offer** — `POST /api/streams?channel=<id>`, the body a `StreamOffer{file_name, content_type, size}` → `201` `StreamedFile{id, file_name, content_type, size, owner_id}`. No bytes move.
+
+- The `channel`, `VIEW_CHANNEL` and `ATTACH_FILES` rules, the media-type grammar (blank meaning `application/octet-stream`) and the 255-character file-name sanitising are the attachment upload's, unchanged.
+- `size` must be positive — `400 ApiError{"size"}` — and at most 1 TiB, else `413 ApiError{"files must be 1 TiB or smaller"}`.
+- Rate limit: the upload bucket, 20 per minute per user.
+
+**Read** — `GET /api/streams/{id}` → `200`, or `206` for a single satisfiable `Range` in bytes (several ranges, another unit or a malformed header are read as the whole file). The response carries `Content-Length`, `Accept-Ranges: bytes`, `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff` and `Content-Disposition: attachment`. There is no `ETag`: these bytes are somebody else's disk, not this server's.
+
+- Unknown id: `404 ApiError{"no such streamed file"}`. While no message names the offer only its owner may read it (`403 ApiError{"not yours"}`); once one does, anyone who may view that message's channel may read it, and nobody else (`403 ApiError{"VIEW_CHANNEL"}`).
+- A range starting past the end: `416` with `Content-Range: bytes */<size>`; one ending past it is clamped.
+- The owner's account deleted: `410 ApiError{"the sender no longer has this file"}`. The owner offline, or its socket unable to take the request: `409 ApiError{"the sender is offline"}`. The owner already serving `Vorcall:StreamMaxTransfersPerOwner` transfers (8 by default, 1..64): `503 ApiError{"the sender is serving too many transfers"}`.
+- Otherwise the server sends the owner `ServerFrame.stream_request` = `StreamRequest{stream_id, transfer_id, offset, length}` and waits `Vorcall:StreamSenderTimeoutSeconds` (30 s by default, 1..600) for an answer. Nothing: `504 ApiError{"the sender did not answer"}`. A decline: `410` carrying the decline's reason. The host stopping: `503 ApiError{"server shutting down"}`.
+- The status, `Content-Type` and `Content-Length` go out before the first byte exists, so the reader sees its `206` while the owner is still seeking. A push that then ends short aborts the connection rather than letting a truncated body read as a whole file.
+
+**Push** — `POST /api/streams/{id}/chunks?transfer=<transfer_id>`, the body exactly the bytes of the range asked for → `204`. `transfer` must be a positive run of ASCII digits, else `400 ApiError{"transfer"}`. A transfer unknown, not this bearer's or not this stream's: `404 ApiError{"no such transfer"}`; one already pushed or declined: `409 ApiError{"transfer already answered"}`; the reader gone first: `410 ApiError{"the reader went away"}`; a body ending before the range does: `400 ApiError{"body ended early"}`.
+
+**Decline** — `POST /api/streams/{id}/decline?transfer=<transfer_id>&reason=<phrase>` → `204`, with the same `400` / `404` / `409` rules. `reason` is optional: it is stripped of control characters and cut to 200 characters, and becomes the detail of the reader's `410`; empty or absent means `"the sender declined"`.
+
+An offer no message ever named is swept an hour later on the attachment sweeper's ten-minute schedule — rows only, since it never had bytes here. Deleting a message drops its streamed files with the rest.
 
 ## Profiles and images
 
@@ -250,9 +285,9 @@ A member is a `Profile{user_id, username, nickname, avatar_image_id, banner_imag
 - `UpdateProfile{description, accent_color, avatar_image_id, banner_image_id}` — own profile only, no permission needed. `description` is 0..256 scalars, `accent_color` is `0xRRGGBB` (`0` = none). The two image fields are sentinel-coded: `0` keeps the current image, `-1` clears it, any other value must name an image of the right purpose uploaded by the caller (else `ERROR_CODE_UNKNOWN_IMAGE`). Answers `MemberUpdated` to every online member.
 - `SetNickname{user_id, nickname}` — `user_id = 0` means self. On self the caller needs `CHANGE_NICKNAME`; on another member `MANAGE_MEMBERS` plus the hierarchy rule (`ERROR_CODE_HIERARCHY` / `ERROR_CODE_FORBIDDEN`). An empty `nickname` clears it; otherwise the name grammar applies (`ERROR_CODE_INVALID_NAME`). Answers `MemberUpdated` to every online member.
 
-**Images** are a separate store from attachments, with a purpose attached to each upload.
+**Images** are a separate store from attachments, with a purpose attached to each upload, and they are the one place the old picture rules still hold: an attachment may be any file of any type up to 2 GiB, an image may not.
 
-**Upload** — `POST /api/images?purpose=avatar|banner|server_icon|role_icon`, the raw image bytes as the body. The content types, magic-number check, `Content-Length` requirement, 8 MiB cap, storage quota and the 20-uploads-per-minute-per-user rate limit are the attachment upload's, unchanged. `purpose` missing or not one of the four: `400`. `avatar` and `banner` need a bearer and nothing more; `server_icon` needs `MANAGE_SERVER` and `role_icon` needs `MANAGE_ROLES`, a missing bit being `403 ApiError{detail = <bit name>}`. Success is `201 Image{id, content_type, size}`.
+**Upload** — `POST /api/images?purpose=avatar|banner|server_icon|role_icon`, the raw image bytes as the body. `Content-Type` must be one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`, else `415` `ApiError{"unsupported image type"}`, and the body's first bytes must match that type's magic number, else `400` `ApiError{"body is not the declared image type"}` — checked while the body streams in, so a renamed file is refused rather than stored. No `Content-Length`: `411`. Above 8 MiB: `413` `ApiError{"images must be 8 MiB or smaller"}`. The storage quota and the 20-uploads-per-minute-per-user rate limit are the attachment upload's, unchanged: images and attachments share `Vorcall:AttachmentsMaxBytes` and share the bucket. `purpose` missing or not one of the four: `400`. `avatar` and `banner` need a bearer and nothing more; `server_icon` needs `MANAGE_SERVER` and `role_icon` needs `MANAGE_ROLES`, a missing bit being `403 ApiError{detail = <bit name>}`. Success is `201 Image{id, content_type, size}`.
 
 **Download** — `GET /api/images/{id}`: any bearer may read any image; `404` when the id is unknown. The response carries `Content-Length`, the strong `ETag` `"<id>"` — the id alone, unlike an attachment's `"<id>-<size>"`, because an image's bytes never change (a new picture is a new row) — `Cache-Control: private, max-age=31536000, immutable`, and Range support. Clients may therefore cache an image id for good.
 
@@ -422,6 +457,8 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 
 The 0.5.0 release replaced rooms with channels and **removed** the room frames rather than keeping them: `ClientFrame` tags 4, 5 and 8 (`join_room`, `leave_room`, `create_room`), `ServerFrame` tags 5, 6, 7, 13 and 14 (`room_state`, `member_joined`, `member_left`, `room_list`, `room_updated`), `ChatMessage` field 5 (`room_id`) and `ErrorCode` 6 and 10 (`NOT_A_MEMBER`, `ROOM_EXISTS`) are all reserved by number and by name, and none of them will ever be reused. `ERROR_CODE_UNKNOWN_ROOM` (5) and `ERROR_CODE_INVALID_ROOM_NAME` (13) kept their numbers under the names `ERROR_CODE_UNKNOWN_CHANNEL` and `ERROR_CODE_INVALID_NAME`, and every `string room_id` became an `int64 channel_id` at its old tag.
 
+The 0.6.0 release is additive: `ChatMessage.streamed_files` (16), `SendMessage.streamed_file_ids` (5), `ServerFrame.stream_request` (35) and `ERROR_CODE_INVALID_STREAM` (28) are new, and nothing was removed or renumbered. A pre-0.6.0 client therefore still connects; it ignores the new payload, and a message carrying nothing but streamed files reads to it as an empty message.
+
 The protocol version stays 1, but a 0.4.x client cannot be served: it knows no channels and would read every id as an empty string. The release's `min_version` is therefore `0.5.0`, so such a client is asked to update by the manifest rather than refused by the protocol.
 
 ## Limits (summary)
@@ -439,17 +476,24 @@ The protocol version stays 1, but a 0.4.x client cannot be served: it knows no c
 | Channels | ≤ 200, DMs not counted |
 | Overrides per channel | ≤ 100 |
 | Role icon emoji | ≤ 2 scalars |
-| Message text | 1..2000 scalars after trim (empty only with attachments) |
+| Message text | 1..2000 scalars after trim (empty only with attachments or streamed files) |
 | Reply excerpt | first 120 scalars |
 | Reactions palette | 8 emoji |
 | Attachments per message | 4 |
-| Attachment size | 8 MiB |
-| Attachment types | png, jpeg, gif, webp |
-| Attachment file name | 128 chars after sanitising |
-| Attachment storage quota | 2 GiB by default |
+| Attachment size | 2 GiB |
+| Attachment types | any; the declared media type is an RFC 9110 token pair, ≤ 128 chars |
+| Attachment file name | 255 chars after sanitising |
+| Attachment storage quota | 200 GiB by default, shared with images |
 | Unlinked attachment sweep | older than 1 h, every 10 min |
-| Attachment upload rate limit | 20 uploads/min per user, configurable |
-| Image upload | 8 MiB (avatar / server icon 512², banner 1600×600, role icon 128², client-side) |
+| Incomplete attachment sweep | older than 24 h, every 10 min |
+| Attachment upload rate limit | 20 uploads/min per user, configurable, shared with images and stream offers |
+| Streamed files per message | 4 |
+| Streamed file size | 1 TiB |
+| Streamed file storage | none; readable only while the owner is online |
+| Streamed transfers per owner | 8 at once, configurable 1..64 |
+| Streamed sender answer deadline | 30 s, configurable 1..600 |
+| Unlinked stream offer sweep | older than 1 h, every 10 min |
+| Image upload | 8 MiB, png/jpeg/gif/webp, magic-checked (avatar / server icon 512², banner 1600×600, role icon 128², client-side) |
 | Unreferenced image sweep | older than 1 h |
 | Write frame rate limit | bucket of 20 per account, refilling 2/s, configurable |
 | Diagnostics report | 4 MiB per file, text only |

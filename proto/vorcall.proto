@@ -15,7 +15,7 @@ message ChatMessage {
   int64 sent_at_unix_ms = 4;
   int64 author_id = 6;            // user id; 0 for messages that predate accounts
   int64 edited_at_unix_ms = 7;    // 0 = never edited
-  bool deleted = 8;               // tombstone: text is empty, no attachments, no reactions
+  bool deleted = 8;               // tombstone: text is empty, no attachments, no streamed files, no reactions
   ReplyRef reply_to = 9;          // absent when not a reply; filled by the server at read time
   repeated int64 mention_ids = 10;      // users named by <@id> tokens in text, validated by the server
   repeated Reaction reactions = 11;     // grouped by emoji, user ids ascending
@@ -23,6 +23,7 @@ message ChatMessage {
   int64 channel_id = 13;          // the channel the message belongs to
   bool mention_everyone = 14;     // @everyone by a sender holding MENTION_EVERYONE
   bool mention_here = 15;         // @here, same rule; online members only
+  repeated StreamedFile streamed_files = 16; // none on a tombstone, like attachments
 }
 
 // A snapshot of the message a reply points at, resolved when the reply is read.
@@ -47,6 +48,38 @@ message Attachment {
   string file_name = 2;
   string content_type = 3;
   int64 size = 4;                 // bytes
+}
+
+// A file the sender's own client serves on demand. The server keeps this record
+// and proxies the bytes; it never stores them, so the file is readable only
+// while its owner is online.
+// REST: POST /api/streams?channel=<id> -> StreamedFile
+// REST: GET /api/streams/{id} -> the bytes
+message StreamedFile {
+  int64 id = 1;
+  string file_name = 2;
+  string content_type = 3;
+  int64 size = 4;                 // bytes, as the sender measured them
+  int64 owner_id = 5;             // must be online for the file to be readable
+}
+
+// The body of a stream offer. The server answers with the StreamedFile it wrote.
+// REST: POST /api/streams?channel=<id> -> StreamedFile
+message StreamOffer {
+  string file_name = 1;
+  string content_type = 2;
+  int64 size = 3;                 // bytes
+}
+
+// The server asking the owning sender for a range of one of its streamed files.
+// The sender answers out of band with
+// POST /api/streams/{stream_id}/chunks?transfer=<transfer_id>, or declines with
+// POST /api/streams/{stream_id}/decline?transfer=<transfer_id>.
+message StreamRequest {
+  int64 stream_id = 1;
+  int64 transfer_id = 2;
+  int64 offset = 3;               // first byte wanted
+  int64 length = 4;               // 0 = to the end of the file
 }
 
 enum Permission {                        // bit masks; server-scoped bits never appear in an override
@@ -215,10 +248,11 @@ message Hello {
 }
 
 message SendMessage {
-  string text = 1;                // trimmed, 1..2000 chars; may be empty only with attachments
+  string text = 1;                // trimmed, 1..2000 chars; may be empty only with attachments or streamed files
   int64 channel_id = 2;           // a text or DM channel; 0 is invalid
   int64 reply_to_id = 3;          // 0 = not a reply; otherwise a message of the same channel
   repeated int64 attachment_ids = 4; // at most 4, uploaded by the sender to this channel, not yet linked
+  repeated int64 streamed_file_ids = 5; // at most 4, offered by the sender for this channel, not yet linked
 }
 
 message Ping {
@@ -421,6 +455,7 @@ message ServerFrame {
     MemberUpdated member_updated = 32;
     MemberRemoved member_removed = 33;
     VoiceMoved voice_moved = 34;
+    StreamRequest stream_request = 35;
   }
 }
 
@@ -635,6 +670,7 @@ enum ErrorCode {
   ERROR_CODE_UNKNOWN_CATEGORY = 25;  // non-fatal: category id unknown
   ERROR_CODE_UNKNOWN_IMAGE = 26;     // non-fatal: image id unknown, not the caller's, or of the wrong purpose
   ERROR_CODE_RATE_LIMITED = 27;      // non-fatal: too many write frames from this account; retry after a moment
+  ERROR_CODE_INVALID_STREAM = 28;    // non-fatal: streamed file unknown, foreign, wrong channel or already linked
 }
 
 message Error {

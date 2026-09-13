@@ -2,9 +2,10 @@
 //! it should be, and the two REST calls that put one on the server and read one
 //! back.
 //!
-//! The accepted content types and the size ceiling are the attachments'
-//! ([`crate::attachments::sniff`], [`crate::attachments::MAX_BYTES`]) — the
-//! server sniffs both the same way.
+//! The accepted content types are the four [`crate::attachments::sniff_image`]
+//! knows, which the server sniffs the same way. The ceiling is this module's
+//! own [`MAX_BYTES`]: an attachment may run to gigabytes now, an avatar may
+//! not.
 
 use bytes::Bytes;
 use prost::Message as _;
@@ -14,6 +15,11 @@ use vorcall_proto::v1::Image;
 use crate::connection::Blob;
 use crate::endpoints::Endpoints;
 use crate::http::{self, ApiFailure};
+
+/// `PROTOCOL.md` § Limits: the largest body the image endpoint accepts. A
+/// picture is drawn from memory and drawn small, so this is the attachments'
+/// old ceiling rather than their new one.
+pub const MAX_BYTES: u64 = 8 << 20;
 
 /// What an image is for. The server checks the caller's permissions against the
 /// declared purpose — `server_icon` needs `MANAGE_SERVER`, `role_icon` needs
@@ -126,6 +132,13 @@ mod tests {
         assert_eq!(ImagePurpose::Banner.as_str(), "banner");
         assert_eq!(ImagePurpose::ServerIcon.as_str(), "server_icon");
         assert_eq!(ImagePurpose::RoleIcon.as_str(), "role_icon");
+    }
+
+    #[test]
+    fn a_picture_is_capped_far_below_a_file() {
+        // `PROTOCOL.md` § Limits: 8 MiB, which is no longer the attachments'.
+        assert_eq!(MAX_BYTES, 8 * 1024 * 1024);
+        const { assert!(MAX_BYTES < crate::attachments::MAX_BYTES) };
     }
 
     #[test]

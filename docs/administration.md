@@ -138,6 +138,34 @@ regardless.
 
 ---
 
+## Files members send
+
+An **attachment** is any file of any type, up to 2 GiB, four per message. Its bytes live in
+the `attachments` volume under the row id, and they count — together with the avatars,
+banners and icons stored beside them — against `Vorcall__AttachmentsMaxBytes`, 200 GiB by
+default. Past the quota an upload is refused with 507 and the sender is told the store is
+full, so set that key from the real size of the disk. Pictures used as an avatar, a banner,
+the server icon or a role icon keep the older, stricter rules of their own: PNG, JPEG, GIF
+or WebP, checked against the type's magic number, 8 MiB each.
+
+A **streamed file** is the other half. Above 2 GiB a file cannot be uploaded at all, and
+below it the sender may choose to stream anyway: the server records the offer, asks the
+sender's own client for each range a reader wants, and proxies the bytes through without
+ever writing them down. Nothing of it reaches this disk and nothing counts against the
+quota — but it can only be read while the sender is online, and readers see a plain "the
+sender is offline" the rest of the time. `Vorcall__StreamsEnabled=false` turns the feature
+off server-wide.
+
+Three sweeps run every 10 minutes and need no attention:
+
+| Swept | After |
+| --- | --- |
+| An upload no message ever named, file and row together; likewise a picture nothing references any more | 1 hour |
+| An upload that never finished streaming in — a 2 GiB body over a thin link outlives the shorter cutoff | 24 hours |
+| An offer no message ever named; rows only, since it never had bytes here | 1 hour |
+
+---
+
 ## Problem reports
 
 The client has a "Report a problem" button that uploads its rolling log and any crash

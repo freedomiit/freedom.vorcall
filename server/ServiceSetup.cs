@@ -16,6 +16,7 @@ using Vorcall.Server.Data;
 using Vorcall.Server.Diagnostics;
 using Vorcall.Server.Metrics;
 using Vorcall.Server.Protocol;
+using Vorcall.Server.Streams;
 using Vorcall.Server.Updates;
 using Vorcall.Server.Voice;
 
@@ -54,6 +55,9 @@ public static class ServiceSetup
         // back to a default that fills the disk.
         var attachments = AttachmentsOptions.FromConfiguration(builder.Configuration);
 
+        // The streamed-file proxy's switch and ceilings, on the same terms.
+        var streams = StreamOptions.FromConfiguration(builder.Configuration);
+
         // Both rate-limit windows are knobs so a test host can turn them down to something it can
         // actually trip; a typo fails the boot like every other Vorcall setting rather than
         // silently widening a limit.
@@ -68,11 +72,18 @@ public static class ServiceSetup
         builder.Services.AddSingleton(voice);
         builder.Services.AddSingleton(updates);
         builder.Services.AddSingleton(attachments);
+        builder.Services.AddSingleton(streams);
         builder.Services.AddSingleton<ServerMetrics>();
         builder.Services.AddSingleton<UpdateManifestStore>();
         builder.Services.AddSingleton<AttachmentStore>();
         builder.Services.AddSingleton<ImageStore>();
         builder.Services.AddHostedService<AttachmentSweeper>();
+
+        // The proxy's rendezvous is in memory and the registry tells it when an owner goes; the
+        // rows behind it and their sweep are the directory's.
+        builder.Services.AddSingleton<StreamRegistry>();
+        builder.Services.AddSingleton<StreamDirectory>();
+        builder.Services.AddHostedService<StreamSweeper>();
         DiagnosticsSetup.Configure(builder);
         AdminSetup.Configure(builder);
 

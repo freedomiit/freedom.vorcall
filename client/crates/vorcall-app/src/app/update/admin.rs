@@ -14,12 +14,13 @@ use std::path::Path;
 
 use iced::Task;
 use vorcall_core::connection::{AdminCommand, Blob, Command, RestKind, RestOutcome, RestRequest};
-use vorcall_core::images::ImagePurpose;
+use vorcall_core::images::{self, ImagePurpose};
 use vorcall_core::{Channel, Image, Override, Role, attachments, permissions};
 
 use crate::app::message::{
     AdminMsg, CropMsg, DragItem, Message, OverrideTargetKind, RoleIconDraft, ToastKind, TriState,
 };
+use crate::app::state::rules::{IMAGE_TOO_LARGE, NOT_AN_IMAGE};
 use crate::app::state::server::channel_kind;
 use crate::app::state::settings::{
     CategoryDraft, ChannelDraft, DEFAULT_INVITE_DAYS, OverviewDraft, RestList, RoleDraft,
@@ -697,8 +698,8 @@ fn read_picked(path: &Path) -> Result<(String, Blob), String> {
     let size = std::fs::metadata(path)
         .map_err(|e| format!("cannot read that file: {e}"))?
         .len();
-    if size > attachments::MAX_BYTES as u64 {
-        return Err("that image is over 8 MiB".to_owned());
+    if size > images::MAX_BYTES {
+        return Err(IMAGE_TOO_LARGE.to_owned());
     }
 
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read that file: {e}"))?;
@@ -706,6 +707,11 @@ fn read_picked(path: &Path) -> Result<(String, Blob), String> {
     // an empty file must not reach that reading.
     if bytes.is_empty() {
         return Err("that file is empty".to_owned());
+    }
+    // The dialog's extension filter is advisory: a renamed file passes it, and
+    // the magic number is what the server judges these bytes by.
+    if attachments::sniff_image(&bytes).is_none() {
+        return Err(NOT_AN_IMAGE.to_owned());
     }
     Ok((name, Blob::from(bytes)))
 }
@@ -752,7 +758,7 @@ fn upload_image(
     if main.send_command(Command::UploadImage {
         request_id,
         purpose,
-        content_type,
+        content_type: content_type.to_owned(),
         bytes,
     }) {
         main.admin.pending_images.insert(request_id, purpose);

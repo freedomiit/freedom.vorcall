@@ -2,26 +2,52 @@ using System.Globalization;
 
 namespace Vorcall.Server.Attachments;
 
-// Where uploaded images live and how many bytes of them the server will keep. The directory has
-// a usable default; a quota that is present but unusable fails the boot like the other Vorcall
-// options, because silently falling back to 2 GiB on a typo is how a disk fills up.
+// Where uploaded files live and how many bytes of them the server will keep. The directory has a
+// usable default; a quota that is present but unusable fails the boot like the other Vorcall
+// options, because silently falling back to a default on a typo is how a disk fills up.
+//
+// An attachment may be any file of any type: nothing here sniffs one. The four Image* members are
+// the separate, deliberately narrow rules of the image store — avatars, banners, the server icon
+// and role icons — which still accept four types only, magic-checked, at 8 MiB.
 public sealed record AttachmentsOptions
 {
     public const string DefaultDir = "/attachments";
 
-    public const long DefaultMaxBytes = 2L << 30;
+    // With 2 GiB allowed per file the quota is the only thing standing between uploads and a full
+    // volume, so an operator is expected to set Vorcall:AttachmentsMaxBytes from the real size of
+    // the disk; this default is merely a value a small deployment will not trip over.
+    public const long DefaultMaxBytes = 200L << 30;
 
-    // Per file, from PROTOCOL.md § Attachments: above this the upload is refused with 413.
-    public const int MaxFileBytes = 8 << 20;
+    // Per file, from PROTOCOL.md § Attachments: above this the upload is refused with 413. long
+    // rather than int because 2 << 30 overflows a signed 32-bit int.
+    public const long MaxFileBytes = 2L << 30;
 
     public const int MaxPerMessage = 4;
 
-    // Enough for the longest magic number the four accepted types use (RIFF....WEBP).
-    public const int MagicLength = 12;
+    // Every attachment is stored under its row id and this one extension: the type the client
+    // declared is metadata and never part of a path.
+    public const string StoredExtension = "bin";
+
+    // Per image file: avatars, banners and icons keep the old cap.
+    public const int ImageMaxFileBytes = 8 << 20;
+
+    // Enough for the longest magic number the four accepted image types use (RIFF....WEBP).
+    public const int ImageMagicLength = 12;
 
     // An upload nothing linked to a message within this is swept, file and row together; the same
     // age makes an unreferenced image sweepable.
     public static readonly TimeSpan UnlinkedTtl = TimeSpan.FromHours(1);
+
+    // An incomplete row is an upload that may still be streaming, and 2 GiB over a slow link can
+    // outlive UnlinkedTtl several times over, so the sweeper gives it a day before taking it.
+    public static readonly TimeSpan IncompleteTtl = TimeSpan.FromHours(24);
+
+    // RFC 9110 § 5.6.2 token characters other than the alphanumerics, which are tested separately.
+    private const string TokenPunctuation = "!#$%&'*+-.^_`|~";
+
+    // The attachments.content_type column is varchar(128); a longer media type could not be stored
+    // even if a client insisted on one.
+    private const int MaxMediaTypeLength = 128;
 
     private static ReadOnlySpan<byte> PngMagic => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -45,8 +71,30 @@ public sealed record AttachmentsOptions
             ParseMaxBytes(configuration["Vorcall:AttachmentsMaxBytes"]));
     }
 
-    // The four types the protocol accepts, and the extension each one is stored under.
-    public static bool TryExtension(string contentType, out string ext)
+    // An RFC 9110 type/subtype and nothing else: no parameters, both halves non-empty tokens. That
+    // is all an attachment's declared type has to be, because nothing on the upload path interprets
+    // it — it is stored, echoed back to clients and handed to the download as it arrived.
+    public static bool IsValidMediaType(string value)
+    {
+        if (value.Length is 0 or > MaxMediaTypeLength)
+        {
+            return false;
+        }
+
+        // A second slash, a parameter's semicolon and whitespace are all non-token characters, so
+        // the two halves being tokens is the whole grammar.
+        var slash = value.IndexOf('/');
+        if (slash <= 0 || slash == value.Length - 1)
+        {
+            return false;
+        }
+
+        return IsToken(value.AsSpan(0, slash)) && IsToken(value.AsSpan(slash + 1));
+    }
+
+    // The four image types the image store accepts, and the extension each one is stored under.
+    // Attachments are not on this table: they take any type and one extension.
+    public static bool TryImageExtension(string contentType, out string ext)
     {
         ext = contentType switch
         {
@@ -60,10 +108,10 @@ public sealed record AttachmentsOptions
         return ext.Length > 0;
     }
 
-    // The first bytes every accepted type must start with, checked while the body streams in so a
-    // renamed file is refused rather than stored. Shared by both stores: the attachments and the
-    // images accept exactly the same four types.
-    public static bool MatchesMagic(string contentType, ReadOnlySpan<byte> header) => contentType switch
+    // The first bytes every accepted image type must start with, checked while the body streams in
+    // so a renamed file is refused rather than stored. The image store alone: an attachment may be
+    // any file, so there is no magic number to hold it to.
+    public static bool MatchesImageMagic(string contentType, ReadOnlySpan<byte> header) => contentType switch
     {
         "image/png" => header.StartsWith(PngMagic),
         "image/jpeg" => header.StartsWith(JpegMagic),
@@ -71,6 +119,19 @@ public sealed record AttachmentsOptions
         "image/webp" => header.StartsWith("RIFF"u8) && header[8..12].SequenceEqual("WEBP"u8),
         _ => false,
     };
+
+    private static bool IsToken(ReadOnlySpan<char> value)
+    {
+        foreach (var c in value)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && !TokenPunctuation.Contains(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     private static long ParseMaxBytes(string? configured)
     {

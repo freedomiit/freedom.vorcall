@@ -35,6 +35,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
     public DbSet<Attachment> Attachments => Set<Attachment>();
 
+    public DbSet<StreamedFile> StreamedFiles => Set<StreamedFile>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         var message = modelBuilder.Entity<Message>();
@@ -262,9 +264,10 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         attachment.Property(a => a.ChannelId).HasColumnName("channel_id").IsRequired();
         attachment.Property(a => a.UploaderId).HasColumnName("uploader_id");
         attachment.Property(a => a.MessageId).HasColumnName("message_id");
-        attachment.Property(a => a.FileName).HasColumnName("file_name").HasMaxLength(128).IsRequired();
-        attachment.Property(a => a.ContentType).HasColumnName("content_type").HasMaxLength(32).IsRequired();
+        attachment.Property(a => a.FileName).HasColumnName("file_name").HasMaxLength(255).IsRequired();
+        attachment.Property(a => a.ContentType).HasColumnName("content_type").HasMaxLength(128).IsRequired();
         attachment.Property(a => a.Size).HasColumnName("size").IsRequired();
+        attachment.Property(a => a.Complete).HasColumnName("complete").IsRequired();
         attachment.Property(a => a.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
 
         // The sweeper reads by created_at, the page reader by message_id.
@@ -276,5 +279,28 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // Deleting a message clears its attachment rows explicitly; SetNull is only the backstop
         // for a row the service did not reach.
         attachment.HasOne<Message>().WithMany().HasForeignKey(a => a.MessageId).OnDelete(DeleteBehavior.SetNull);
+
+        var streamed = modelBuilder.Entity<StreamedFile>();
+        streamed.ToTable("streamed_files");
+        streamed.HasKey(s => s.Id);
+        streamed.Property(s => s.Id).HasColumnName("id").UseIdentityByDefaultColumn();
+        streamed.Property(s => s.ChannelId).HasColumnName("channel_id").IsRequired();
+        streamed.Property(s => s.OwnerId).HasColumnName("owner_id");
+        streamed.Property(s => s.MessageId).HasColumnName("message_id");
+        streamed.Property(s => s.FileName).HasColumnName("file_name").HasMaxLength(255).IsRequired();
+        streamed.Property(s => s.ContentType).HasColumnName("content_type").HasMaxLength(128).IsRequired();
+        streamed.Property(s => s.Size).HasColumnName("size").IsRequired();
+        streamed.Property(s => s.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
+
+        // Read like an attachment's: the sweeper by created_at, the page reader by message_id.
+        streamed.HasIndex(s => s.MessageId);
+        streamed.HasIndex(s => s.CreatedAt);
+        streamed.HasIndex(s => s.ChannelId);
+        streamed.HasOne<User>().WithMany().HasForeignKey(s => s.OwnerId).OnDelete(DeleteBehavior.SetNull);
+        streamed.HasOne<Channel>().WithMany().HasForeignKey(s => s.ChannelId).OnDelete(DeleteBehavior.Cascade);
+
+        // Deleting a message clears its streamed-file rows explicitly; SetNull is only the
+        // backstop for a row the service did not reach.
+        streamed.HasOne<Message>().WithMany().HasForeignKey(s => s.MessageId).OnDelete(DeleteBehavior.SetNull);
     }
 }

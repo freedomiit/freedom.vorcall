@@ -5,6 +5,7 @@ using Vorcall.Server.Attachments;
 using Vorcall.Server.Data;
 using Vorcall.Server.Metrics;
 using Vorcall.Server.Protocol;
+using Vorcall.Server.Streams;
 
 namespace Vorcall.Server.Chat;
 
@@ -16,11 +17,14 @@ public sealed record AppendOutcome(AppendOutcome.Kind Status, ChatMessage? Messa
         Appended,
         UnknownReply,
         InvalidAttachment,
+        InvalidStream,
     }
 
     public static AppendOutcome UnknownReply { get; } = new(Kind.UnknownReply, null);
 
     public static AppendOutcome InvalidAttachment { get; } = new(Kind.InvalidAttachment, null);
+
+    public static AppendOutcome InvalidStream { get; } = new(Kind.InvalidStream, null);
 
     public static AppendOutcome Appended(ChatMessage message) => new(Kind.Appended, message);
 }
@@ -89,6 +93,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         string text,
         long replyToId,
         IReadOnlyList<long> attachmentIds,
+        IReadOnlyList<long> streamedFileIds,
         bool mayMentionEveryone)
     {
         // The handler checks both before it gets here; a service that trusts its caller is a
@@ -97,6 +102,12 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             || attachmentIds.Distinct().Count() != attachmentIds.Count)
         {
             return AppendOutcome.InvalidAttachment;
+        }
+
+        if (streamedFileIds.Count > StreamOptions.MaxPerMessage
+            || streamedFileIds.Distinct().Count() != streamedFileIds.Count)
+        {
+            return AppendOutcome.InvalidStream;
         }
 
         await using var db = await contextFactory.CreateDbContextAsync();
@@ -155,9 +166,11 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             // the predicate is what makes the claim atomic, so a second SendMessage naming the
             // same upload, or the sweeper deleting it, loses instead of racing. It also keeps a
             // row that vanished under us out of the change tracker, where it would surface as a
-            // DbUpdateConcurrencyException and take the socket down with it.
+            // DbUpdateConcurrencyException and take the socket down with it. Complete keeps out
+            // a row whose bytes are still arriving, or never finished: the row exists before the
+            // body does, and this is the one place that must not take that on trust.
             var linked = await db.Attachments
-                .Where(a => ids.Contains(a.Id) && a.MessageId == null && a.UploaderId == userId && a.ChannelId == channelId)
+                .Where(a => ids.Contains(a.Id) && a.MessageId == null && a.UploaderId == userId && a.ChannelId == channelId && a.Complete)
                 .ExecuteUpdateAsync(setters => setters.SetProperty(a => a.MessageId, message.Id));
             if (linked != attachmentIds.Count)
             {
@@ -173,6 +186,28 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
                 .ToListAsync();
         }
 
+        var streamedFiles = new List<Data.StreamedFile>();
+        if (streamedFileIds.Count > 0)
+        {
+            var streamIds = streamedFileIds.ToList();
+
+            // The same guarded claim, with the owner for the uploader. Nothing about bytes: a
+            // streamed file has none here to have arrived.
+            var linked = await db.StreamedFiles
+                .Where(s => streamIds.Contains(s.Id) && s.MessageId == null && s.OwnerId == userId && s.ChannelId == channelId)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(s => s.MessageId, message.Id));
+            if (linked != streamedFileIds.Count)
+            {
+                await transaction.RollbackAsync();
+                return AppendOutcome.InvalidStream;
+            }
+
+            streamedFiles = await db.StreamedFiles
+                .AsNoTracking()
+                .Where(s => streamIds.Contains(s.Id))
+                .ToListAsync();
+        }
+
         await transaction.CommitAsync();
         metrics.CountMessage();
 
@@ -180,7 +215,10 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         var ordered = attachmentIds
             .Select(id => ToProtocol(attachments.First(a => a.Id == id)))
             .ToList();
-        return AppendOutcome.Appended(ToProtocol(message, [], ordered, replyTarget));
+        var orderedStreams = streamedFileIds
+            .Select(id => StreamDirectory.ToProtocol(streamedFiles.First(s => s.Id == id)))
+            .ToList();
+        return AppendOutcome.Appended(ToProtocol(message, [], ordered, orderedStreams, replyTarget));
     }
 
     public async Task<EditOutcome> EditAsync(long id, long userId, string text, bool mayMentionEveryone)
@@ -215,6 +253,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
 
         var reactions = await LoadReactionsAsync(db, [id]);
         var attachments = await LoadAttachmentsAsync(db, [id]);
+        var streamedFiles = await LoadStreamedFilesAsync(db, [id]);
         var replyTargets = await LoadReplyTargetsAsync(db, ReplyTargetIds([message]));
         return EditOutcome.Edited(
             message.ChannelId,
@@ -222,6 +261,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
                 message,
                 reactions.GetValueOrDefault(id, []),
                 attachments.GetValueOrDefault(id, []),
+                streamedFiles.GetValueOrDefault(id, []),
                 ReplyTargetOf(message, replyTargets)));
     }
 
@@ -260,6 +300,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         await db.SaveChangesAsync();
         await db.Reactions.Where(r => r.MessageId == id).ExecuteDeleteAsync();
         await db.Attachments.Where(a => a.MessageId == id).ExecuteDeleteAsync();
+        await db.StreamedFiles.Where(s => s.MessageId == id).ExecuteDeleteAsync();
         await transaction.CommitAsync();
 
         return DeleteOutcome.Deleted(
@@ -358,12 +399,14 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         var ids = rows.Select(m => m.Id).ToList();
         var reactions = await LoadReactionsAsync(db, ids);
         var attachments = await LoadAttachmentsAsync(db, ids);
+        var streamedFiles = await LoadStreamedFilesAsync(db, ids);
         var replyTargets = await LoadReplyTargetsAsync(db, ReplyTargetIds(rows));
 
         page.Messages.AddRange(rows.Select(m => ToProtocol(
             m,
             reactions.GetValueOrDefault(m.Id, []),
             attachments.GetValueOrDefault(m.Id, []),
+            streamedFiles.GetValueOrDefault(m.Id, []),
             ReplyTargetOf(m, replyTargets))));
         return page;
     }
@@ -445,6 +488,29 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
                 byMessage => (IReadOnlyList<Protocol.Attachment>)byMessage.Select(ToProtocol).ToList());
     }
 
+    private static async Task<Dictionary<long, IReadOnlyList<Protocol.StreamedFile>>> LoadStreamedFilesAsync(
+        AppDbContext db,
+        IReadOnlyList<long> messageIds)
+    {
+        if (messageIds.Count == 0)
+        {
+            return [];
+        }
+
+        var linked = messageIds.Select(id => (long?)id).ToList();
+        var rows = await db.StreamedFiles
+            .AsNoTracking()
+            .Where(s => linked.Contains(s.MessageId))
+            .OrderBy(s => s.Id)
+            .ToListAsync();
+
+        return rows
+            .GroupBy(s => s.MessageId!.Value)
+            .ToDictionary(
+                byMessage => byMessage.Key,
+                byMessage => (IReadOnlyList<Protocol.StreamedFile>)byMessage.Select(StreamDirectory.ToProtocol).ToList());
+    }
+
     private static Protocol.Attachment ToProtocol(Data.Attachment attachment) => new()
     {
         Id = attachment.Id,
@@ -457,6 +523,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         Data.Message message,
         IReadOnlyList<Protocol.Reaction> reactions,
         IReadOnlyList<Protocol.Attachment> attachments,
+        IReadOnlyList<Protocol.StreamedFile> streamedFiles,
         ReplyTarget? replyTarget)
     {
         var chatMessage = new ChatMessage
@@ -480,6 +547,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         chatMessage.MentionIds.AddRange(message.MentionIds);
         chatMessage.Reactions.AddRange(reactions);
         chatMessage.Attachments.AddRange(attachments);
+        chatMessage.StreamedFiles.AddRange(streamedFiles);
 
         if (message.ReplyToId is { } replyToId)
         {

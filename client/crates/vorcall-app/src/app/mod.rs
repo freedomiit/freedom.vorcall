@@ -10,14 +10,22 @@ pub mod state;
 pub mod update;
 
 use std::collections::BTreeMap;
+use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::Stream;
 use futures::channel::mpsc;
+use iced::task;
 use iced::widget::image::Handle;
 use iced::widget::{Id, operation};
+use iced::window::raw_window_handle::RawDisplayHandle;
 use iced::{Element, Size, Subscription, Task, Theme, keyboard, mouse, window};
+use vorcall_clipboard::Clipboard;
 use vorcall_core::connection::{self, Blob, Command};
 use vorcall_core::update::{PublicKey, Ready, Version};
 use vorcall_core::{Config, Endpoints, Event, Session, config, session};
@@ -67,6 +75,18 @@ pub const PROGRESS_STEP: u64 = 1024 * 1024;
 /// The pop-out stage: a 16:9 picture with its toolbar over it.
 pub const STAGE_WINDOW: (f32, f32) = (960.0, 560.0);
 
+/// The main window's `wl_display`, or null when this session is not Wayland.
+///
+/// Only the client holding keyboard focus may read a Wayland selection, so the
+/// clipboard backend reads on the application's own connection rather than one
+/// of its own — and only the window knows which connection that is.
+/// [`App::probe_display`] is what fills this in, from the interface thread.
+static WAYLAND_DISPLAY: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+/// Whether the window has been asked at all. A display nobody has looked at yet
+/// is not the same as one that is not Wayland: reading the X11 selection of a
+/// Wayland session is reading the wrong clipboard.
+static DISPLAY_PROBED: AtomicBool = AtomicBool::new(false);
+
 /// The window this account signs in through, and everything behind it.
 pub struct App {
     pub endpoints: Endpoints,
@@ -113,6 +133,13 @@ pub struct App {
     /// so it lives here for as long as the window does.
     pub audio: Option<audio::Audio>,
     pub audio_unavailable: bool,
+    /// The system clipboard, opened on the first paste and kept for as long as
+    /// the main window lives. Behind a lock because the read blocks — it waits
+    /// on another application — and therefore happens on a blocking thread.
+    pub clipboard: Option<Arc<Mutex<Clipboard>>>,
+    /// A clipboard this session cannot reach is not tried again: neither the
+    /// platform nor the permission changes mid-run.
+    pub clipboard_unavailable: bool,
     pub last_toast: Option<Instant>,
     pub workers: Workers,
 }
@@ -213,6 +240,10 @@ pub struct MainState {
     next_request: u64,
     pub pending_uploads: BTreeMap<u64, PendingUpload>,
     pub pending_fetches: BTreeMap<u64, ImageKey>,
+    /// The attachment downloads the window is running itself, so a cancel can
+    /// stop one: the connection loop has no download-to-disk command for a
+    /// stored attachment, and dropping the task is what ends the transfer.
+    pub pending_saves: BTreeMap<u64, task::Handle>,
     /// The user an `OpenDm` is out for, so its channel can be opened when it
     /// arrives.
     pub pending_dm: Option<i64>,
@@ -224,11 +255,15 @@ pub struct MainState {
     pub user_pairs: Vec<(i64, String)>,
 }
 
-/// What an upload was asked for, so its answer can be dropped when the channel it
-/// belongs to is no longer the one being written in.
+/// What an upload or an offer was asked for, so its answer can be dropped when
+/// the channel it belongs to is no longer the one being written in.
 pub struct PendingUpload {
     pub channel_id: i64,
     pub file_name: String,
+    /// The local file an offer is served from, kept until the server has
+    /// written the offer down: the registry records the path against the stream
+    /// id, and only the answer carries that id. `None` for a stored upload.
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +291,7 @@ impl MainState {
             next_request: 0,
             pending_uploads: BTreeMap::new(),
             pending_fetches: BTreeMap::new(),
+            pending_saves: BTreeMap::new(),
             pending_dm: None,
             pending_channel: None,
             user_pairs: Vec::new(),
@@ -342,6 +378,8 @@ impl App {
             loading_elapsed: Duration::ZERO,
             audio: None,
             audio_unavailable: false,
+            clipboard: None,
+            clipboard_unavailable: false,
             last_toast: None,
             workers: Workers::default(),
         };
@@ -571,6 +609,66 @@ impl App {
         }
     }
 
+    /// Asks the main window which display it is drawing on, once a run. The
+    /// answer is what tells a Wayland session from an X11 one, and the Wayland
+    /// clipboard backend needs the connection itself.
+    pub fn probe_display(&self) -> Task<Message> {
+        if DISPLAY_PROBED.load(Ordering::Acquire) {
+            return Task::none();
+        }
+        let Some(id) = self.main_window else {
+            return Task::none();
+        };
+        // A window that closes before this is processed never runs it, and the
+        // next focus asks again.
+        window::run(id, probe_display).discard()
+    }
+
+    /// The system clipboard, opened on the first paste. `None` is a session
+    /// this client cannot read: the caller falls back to iced's own text
+    /// clipboard, which is all a paste ever had before.
+    ///
+    /// Opening it talks to the display server, so it happens here rather than
+    /// per keystroke — once, on the interface thread that owns the window the
+    /// Wayland backend borrows.
+    pub fn ensure_clipboard(&mut self) -> Option<Arc<Mutex<Clipboard>>> {
+        if let Some(clipboard) = &self.clipboard {
+            return Some(clipboard.clone());
+        }
+        if self.clipboard_unavailable {
+            return None;
+        }
+        if !DISPLAY_PROBED.load(Ordering::Acquire) {
+            tracing::debug!("the display has not been read yet; pasting text only");
+            return None;
+        }
+
+        let display = WAYLAND_DISPLAY.load(Ordering::Acquire);
+        let opened = if display.is_null() {
+            Clipboard::new()
+        } else {
+            // SAFETY: `display` is the main window's own `wl_display`, which the
+            // event loop keeps open for as long as that window exists; the
+            // handle is dropped when the window closes, in `WindowMsg::Closed`,
+            // and never rebuilt afterwards.
+            unsafe { Clipboard::new_wayland(display) }
+        };
+
+        match opened {
+            Ok(clipboard) => {
+                tracing::debug!(backend = ?clipboard.backend(), "clipboard opened");
+                let clipboard = Arc::new(Mutex::new(clipboard));
+                self.clipboard = Some(clipboard.clone());
+                Some(clipboard)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no clipboard this client can read");
+                self.clipboard_unavailable = true;
+                None
+            }
+        }
+    }
+
     /// Starts loading one image: from the cache when it is there, from the
     /// server otherwise. Doing nothing is the common case — the pixels are
     /// already held, or somebody else's request is in flight.
@@ -695,6 +793,9 @@ impl App {
                     }
                 }
                 if self.main_window == Some(id) {
+                    // The Wayland backend borrows this window's display, so the
+                    // handle goes before the window it was built on.
+                    self.clipboard = None;
                     return iced::exit();
                 }
                 Task::none()
@@ -868,6 +969,21 @@ pub(crate) fn decode_task(
             ))
         },
     )
+}
+
+/// Reads the window's display handle into [`WAYLAND_DISPLAY`]. Runs on the
+/// interface thread, with the window in hand; a session that is not Wayland
+/// leaves the pointer null, which is what says "open a clipboard of your own".
+fn probe_display(window: &dyn window::Window) {
+    match window.display_handle() {
+        Ok(handle) => {
+            if let RawDisplayHandle::Wayland(wayland) = handle.as_raw() {
+                WAYLAND_DISPLAY.store(wayland.display.as_ptr(), Ordering::Release);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "the window has no display handle"),
+    }
+    DISPLAY_PROBED.store(true, Ordering::Release);
 }
 
 /// Trims the image cache once per run, off the UI thread.

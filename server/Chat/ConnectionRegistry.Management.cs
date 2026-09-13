@@ -1328,6 +1328,7 @@ public sealed partial class ConnectionRegistry
         if (kicked is not null)
         {
             FailLater(kicked, ErrorCode.Kicked, "kicked");
+            _streams.FaultOwner(userId);
         }
 
         return OpResult.Ok;
@@ -1408,6 +1409,7 @@ public sealed partial class ConnectionRegistry
         if (banned is not null)
         {
             FailLater(banned, ErrorCode.Banned, "banned");
+            _streams.FaultOwner(userId);
         }
 
         attachments.DeleteFiles(outcome.AttachmentFiles);

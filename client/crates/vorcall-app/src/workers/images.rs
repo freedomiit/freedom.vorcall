@@ -77,7 +77,15 @@ pub fn upload_box(purpose: ImagePurpose) -> (u32, u32) {
 ///
 /// Profile images are already inside their own box ([`upload_box`]) when they
 /// are uploaded, so this ceiling is a guard rather than the policy.
+///
+/// Only bytes something already decided are a picture reach this — an attachment
+/// through the preview gate, or an image row — so a file that is not one is a
+/// bug, and the message says that rather than whatever the format sniffer made
+/// of the first few bytes.
 pub fn decode(bytes: &[u8], max_side: u32) -> Result<(u32, u32, Vec<u8>), String> {
+    if image::guess_format(bytes).is_err() {
+        return Err("that file is not an image".to_string());
+    }
     let decoded = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
 
     let (width, height) = (decoded.width(), decoded.height());
@@ -485,6 +493,20 @@ mod tests {
 
         let (width, height, _) = decode(&png_fixture(64, 32), MAX_SIDE).expect("the image decodes");
         assert_eq!((width, height), (64, 32));
+    }
+
+    /// The preview gate is what keeps this from happening; when it does, the
+    /// reason has to be readable in a log.
+    #[test]
+    fn a_file_that_is_not_a_picture_says_so() {
+        assert_eq!(
+            decode(b"not a picture at all", MAX_SIDE),
+            Err("that file is not an image".to_string())
+        );
+        assert_eq!(
+            decode(&[], MAX_SIDE),
+            Err("that file is not an image".to_string())
+        );
     }
 
     #[test]

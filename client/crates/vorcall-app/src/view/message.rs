@@ -10,20 +10,22 @@ use chrono::{Local, NaiveDate, TimeZone as _};
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::text::Span;
 use iced::widget::{
-    Space, button, column, container, image, mouse_area, rich_text, row, span, stack, text, tooltip,
+    Space, button, column, container, image, mouse_area, row, span, stack, text, tooltip,
 };
-use iced::{ContentFit, Element, Font, Length, border, font, mouse};
+use iced::{Color, ContentFit, Element, Font, Length, border, font, mouse};
 use vorcall_core::mentions::{self, PALETTE, Segment};
-use vorcall_core::{Attachment, ChatMessage, Reaction, ReplyRef, permissions};
+use vorcall_core::{Attachment, ChatMessage, Reaction, ReplyRef, StreamedFile, permissions};
 
 use crate::app::message::{ChatMsg, MenuTarget, Message, UiMsg};
-use crate::app::state::chat::ImageState;
-use crate::app::state::rules::plain_text;
+use crate::app::state::chat::{ImageState, is_inline_preview};
+use crate::app::state::rules::{SENDER_OFFLINE, format_bytes, plain_text};
+use crate::app::state::ui::TransferSource;
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
 use crate::theme::ThemeTokens;
 use crate::theme::styles;
 use crate::view::chat::first_unread;
+use crate::view::selectable::selectable_rich_text;
 use crate::view::widgets::{self, Metrics};
 use crate::view::{TEXT_BADGE, TEXT_BODY, TEXT_SECONDARY, bold};
 use crate::workers::images::ImageKey;
@@ -49,6 +51,10 @@ const ACTION_ICON: f32 = 16.0;
 /// about thirty characters at Latin text's average advance, so all but the
 /// longest of the 32-scalar names still fit whole.
 const AUTHOR_MAX_WIDTH: f32 = TEXT_BODY * 16.0;
+/// The glyph on a file card, and how much of the selection colour is painted
+/// behind selected text.
+const CARD_ICON: f32 = 20.0;
+const SELECTION_ALPHA: f32 = 0.35;
 
 pub fn view<'a>(app: &'a App, main: &'a MainState, chat: &ChatMessage) -> Element<'a, Message> {
     let tokens = &app.tokens;
@@ -71,8 +77,15 @@ pub fn view<'a>(app: &'a App, main: &'a MainState, chat: &ChatMessage) -> Elemen
         body = body.push(head(app, main, chat, metrics));
     }
     body = body.push(said(app, main, chat, metrics));
-    for attachment in &chat.attachments {
-        body = body.push(attachment_view(app, main, attachment, metrics));
+    // A tombstone carries neither, and the server strips both; the guard says so
+    // here rather than trusting the frame.
+    if !chat.deleted {
+        for attachment in &chat.attachments {
+            body = body.push(attachment_view(app, main, attachment, metrics));
+        }
+        for file in &chat.streamed_files {
+            body = body.push(streamed_file_view(app, main, file, metrics));
+        }
     }
     if !chat.reactions.is_empty() {
         body = body.push(reactions(app, main, chat, metrics));
@@ -263,8 +276,16 @@ fn quote<'a>(
     .into()
 }
 
-/// The text itself: plain runs, the mentions as chips, and the tombstone a
-/// deleted message leaves behind.
+/// The text itself: plain runs, the mentions as chips, the links the pointer can
+/// follow, and the tombstone a deleted message leaves behind.
+///
+/// The body is [`selectable_rich_text`] rather than iced's `rich_text`, which is
+/// the only way one paragraph can carry chips, clickable links and a pointer
+/// selection at once. A row is armed for selection while the pointer is over it
+/// or while it is the row that holds the live selection: the widget publishes
+/// `on_select` only out of an armed row, so the hovered row is what lets a drag
+/// start at all, and `selecting` is what keeps the row armed once the drag has
+/// carried the pointer off it.
 fn said<'a>(
     app: &'a App,
     main: &'a MainState,
@@ -280,7 +301,7 @@ fn said<'a>(
             .into();
     }
 
-    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut spans: Vec<Span<'a, String>> = Vec::new();
     for segment in mentions::segments(&chat.text, &main.user_pairs) {
         match segment {
             Segment::Text(body) => spans.push(span(body).color(tokens.text_primary)),
@@ -301,18 +322,44 @@ fn said<'a>(
             } else {
                 span(mentions::HERE).color(tokens.text_primary)
             }),
+            // Only `http`/`https` ever reaches here: `mentions::segments` is what
+            // decides that, and widening it would hand the reader a `file:` or
+            // `javascript:` URL to click.
+            Segment::Link(url) => spans.push(
+                span(url.clone())
+                    .color(tokens.accent)
+                    .underline(true)
+                    .link(url),
+            ),
         }
     }
 
-    rich_text(spans)
+    let id = chat.id;
+    let armed = main.chat.selecting == Some(id) || main.chat.hovered == Some(id);
+
+    selectable_rich_text(spans)
         .size(metrics.text(TEXT_BODY))
         .width(Length::Fill)
+        .selectable(armed)
+        .selection_colour(selection_colour(tokens))
+        .on_select(move || Message::Chat(ChatMsg::StartSelection(id)))
+        .on_link_click(|url: String| Message::Chat(ChatMsg::OpenLink(url)))
         .into()
+}
+
+/// What is painted behind selected text. The 29 theme tokens hold no selection
+/// colour, so it is the accent at the alpha a highlight wants — enough to read
+/// as selected, little enough to leave a mention chip's own tint showing.
+fn selection_colour(tokens: &ThemeTokens) -> Color {
+    Color {
+        a: SELECTION_ALPHA,
+        ..tokens.accent
+    }
 }
 
 /// One mention, as a chip inside the line of text. `mine` is a mention of this
 /// account, which is painted in the accent rather than in the ink.
-fn chip_span<'a>(body: String, mine: bool, tokens: &ThemeTokens) -> Span<'a> {
+fn chip_span<'a>(body: String, mine: bool, tokens: &ThemeTokens) -> Span<'a, String> {
     span(body)
         .color(if mine {
             tokens.accent
@@ -325,7 +372,8 @@ fn chip_span<'a>(body: String, mine: bool, tokens: &ThemeTokens) -> Span<'a> {
         .font(bold())
 }
 
-/// One attachment, as large as the list draws it.
+/// One attachment: a picture as large as the list draws it, anything else as a
+/// card of what the message already says about it.
 fn attachment_view<'a>(
     app: &'a App,
     main: &'a MainState,
@@ -333,6 +381,22 @@ fn attachment_view<'a>(
     metrics: Metrics,
 ) -> Element<'a, Message> {
     let id = attachment.id;
+    // Anything that is not drawn inline is a card: no fetch, no decode, so a
+    // 2 GiB upload costs the list nothing until it is asked for.
+    if !is_inline_preview(attachment) {
+        return file_card(
+            app,
+            Icon::Paperclip,
+            &attachment.file_name,
+            attachment.size,
+            None,
+            Ok(Message::Chat(ChatMsg::SaveFile(
+                TransferSource::Attachment(id),
+            ))),
+            metrics,
+        );
+    }
+
     let key = ImageKey::Attachment(id);
     match main.chat.images.get(&key) {
         Some(ImageState::Ready(handle)) => mouse_area(
@@ -348,6 +412,97 @@ fn attachment_view<'a>(
             placeholder(app, Icon::Image, "Loading the image…", metrics)
         }
     }
+}
+
+/// One streamed file, whose bytes never reached the server: the same card under
+/// the link mark, greyed out for as long as the sender is offline. Nothing can
+/// be read out of it then, so the card says so rather than failing on a press.
+fn streamed_file_view<'a>(
+    app: &'a App,
+    main: &'a MainState,
+    file: &StreamedFile,
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let online = main.server.is_online(file.owner_id);
+    let save = if online {
+        Ok(Message::Chat(ChatMsg::SaveFile(TransferSource::Stream(
+            file.id,
+        ))))
+    } else {
+        Err(SENDER_OFFLINE)
+    };
+
+    file_card(
+        app,
+        Icon::Link,
+        &file.file_name,
+        file.size,
+        Some(if online {
+            "Streamed file"
+        } else {
+            SENDER_OFFLINE
+        }),
+        save,
+        metrics,
+    )
+}
+
+/// The card a file that is not drawn inline gets: a mark, what it is called, how
+/// large it is, and the one button that puts it on the disk. An `Err` save greys
+/// the card out and says why the file cannot be had.
+fn file_card<'a>(
+    app: &'a App,
+    glyph: Icon,
+    file_name: &str,
+    size: i64,
+    note: Option<&str>,
+    save: Result<Message, &str>,
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let enabled = save.is_ok();
+    let ink = |color: Color| {
+        if enabled { color } else { styles::faded(color) }
+    };
+
+    let mut caption = format_bytes(u64::try_from(size).unwrap_or(0));
+    if let Some(note) = note {
+        caption = format!("{caption} · {note}");
+    }
+
+    let details = column![
+        text(file_name.to_owned())
+            .size(metrics.text(TEXT_BODY))
+            .color(ink(tokens.text_primary)),
+        text(caption)
+            .size(metrics.text(TEXT_SECONDARY))
+            .color(ink(tokens.text_muted)),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+
+    let save_button = widgets::icon_button_in(
+        Icon::ArrowDown,
+        save.as_ref().err().copied().unwrap_or("Save"),
+        save.ok(),
+        tokens.text_secondary,
+        widgets::ICON_SIZE,
+        tokens,
+    );
+
+    container(
+        row![
+            icons::icon(glyph, CARD_ICON, ink(tokens.text_secondary)),
+            details,
+            save_button,
+        ]
+        .spacing(10)
+        .align_y(Vertical::Center),
+    )
+    .width(ATTACHMENT_WIDTH)
+    .padding([8.0, 10.0])
+    .style(styles::container::input(tokens))
+    .into()
 }
 
 /// The box an attachment keeps while its pixels are on the way, or once they are

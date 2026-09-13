@@ -4,6 +4,7 @@ using System.Net.WebSockets;
 using Google.Protobuf;
 using Vorcall.Server.Permissions;
 using Vorcall.Server.Protocol;
+using Vorcall.Server.Streams;
 using Vorcall.Server.Voice;
 
 namespace Vorcall.Server.Chat;
@@ -83,6 +84,16 @@ public enum VoiceSelfStateOutcome
     Set,
 }
 
+// Where a frame addressed to one account went. SlowConsumer is a live connection that could not
+// take it and is being closed for falling behind: for a caller that waits on an answer to the
+// frame, the account is as good as offline.
+public enum SendToOutcome
+{
+    Offline,
+    SlowConsumer,
+    Sent,
+}
+
 // Everything a scrape wants to know about the presence model, read in one pass so the six
 // figures describe the same moment rather than six different ones.
 public readonly record struct RegistrySnapshot(
@@ -156,6 +167,7 @@ public sealed partial class ConnectionRegistry
     private readonly MemberDirectory _members;
     private readonly ServerDirectory _server;
     private readonly VoiceRelay _relay;
+    private readonly StreamRegistry _streams;
     private readonly ILogger<ConnectionRegistry> _logger;
 
     private long _everyoneRoleId;
@@ -170,6 +182,7 @@ public sealed partial class ConnectionRegistry
         MemberDirectory members,
         ServerDirectory server,
         VoiceRelay relay,
+        StreamRegistry streams,
         ILogger<ConnectionRegistry> logger)
     {
         _channels = channels;
@@ -177,6 +190,7 @@ public sealed partial class ConnectionRegistry
         _members = members;
         _server = server;
         _relay = relay;
+        _streams = streams;
         _logger = logger;
         _relay.SpeakingChanged += OnSpeakingChanged;
     }
@@ -581,6 +595,7 @@ public sealed partial class ConnectionRegistry
 
         List<ClientConnection>? slow = null;
         List<uint> removed = [];
+        var wentOffline = false;
         lock (_gate)
         {
             if (!IsLive(connection, userId))
@@ -595,6 +610,7 @@ public sealed partial class ConnectionRegistry
                 // viewer of the channels it was in.
                 RemoveVoiceEverywhereLocked(userId, ref slow, removed);
                 _online.Remove(userId);
+                wentOffline = true;
 
                 if (_memberById.TryGetValue(userId, out var member))
                 {
@@ -608,6 +624,13 @@ public sealed partial class ConnectionRegistry
 
         CloseSlow(slow);
         ReleaseVoice(removed);
+
+        // Only when the account itself went offline: a replaced connection's successor may still
+        // answer a StreamRequest that reached the old one, so its readers keep waiting.
+        if (wentOffline)
+        {
+            _streams.FaultOwner(userId);
+        }
     }
 
     // Called by the registration endpoint once the account exists: every online member learns about
@@ -659,15 +682,39 @@ public sealed partial class ConnectionRegistry
         CloseSlow(slow);
     }
 
-    public void SendTo(long userId, ServerFrame frame)
+    // Resolved by id under the gate at the moment of sending, never from a connection the caller
+    // held: an attach replaces the account's live connection with a new object, so one captured
+    // earlier can be the replaced one while the account is fully online elsewhere.
+    public SendToOutcome SendTo(long userId, ServerFrame frame)
     {
         List<ClientConnection>? slow = null;
+        SendToOutcome outcome;
         lock (_gate)
         {
-            SendToLocked(userId, frame, ref slow);
+            // Enqueue's rule, spelled out because the caller needs the verdict: a refusal with
+            // IsReady set is a full outbox, one without is a close already latched, whose frames
+            // are dropped and whose account is on its way offline.
+            if (!_online.TryGetValue(userId, out var connection))
+            {
+                outcome = SendToOutcome.Offline;
+            }
+            else if (connection.TryEnqueue(frame))
+            {
+                outcome = SendToOutcome.Sent;
+            }
+            else if (connection.IsReady)
+            {
+                (slow ??= []).Add(connection);
+                outcome = SendToOutcome.SlowConsumer;
+            }
+            else
+            {
+                outcome = SendToOutcome.Offline;
+            }
         }
 
         CloseSlow(slow);
+        return outcome;
     }
 
     public JoinVoiceOutcome JoinVoice(ClientConnection connection, long channelId, bool selfMuted, bool selfDeafened)

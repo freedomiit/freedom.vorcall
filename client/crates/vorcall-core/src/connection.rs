@@ -11,11 +11,13 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::channel::mpsc;
+use futures::stream::FuturesUnordered;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use prost::Message as _;
 use tokio::time::{Instant, interval_at, sleep, sleep_until, timeout_at};
@@ -33,9 +35,9 @@ use vorcall_proto::v1::{
     JoinVoice, KickMember, LeaveVoice, MarkRead, MessagePage, OpenDm, Override, Ping, Profile,
     React, Reaction, ReorderCategories, ReorderChannels, ReorderRoles, Role, SendMessage, Server,
     ServerFrame, ServerSnapshot, SetMemberRoles, SetNickname, SetOverride, StartShare, StopShare,
-    TransferOwnership, UnbanMember, UnwatchShare, UpdateCategory, UpdateChannel, UpdateProfile,
-    UpdateRole, UpdateServer, VoiceMember, VoiceModerate, VoiceSelfState, WatchShare, client_frame,
-    server_frame,
+    StreamRequest, StreamedFile, TransferOwnership, UnbanMember, UnwatchShare, UpdateCategory,
+    UpdateChannel, UpdateProfile, UpdateRole, UpdateServer, VoiceMember, VoiceModerate,
+    VoiceSelfState, WatchShare, client_frame, server_frame,
 };
 
 use crate::admin;
@@ -46,6 +48,7 @@ use crate::history;
 use crate::http::{self, ApiFailure};
 use crate::images::{self, ImagePurpose};
 use crate::session::{self, Session};
+use crate::streams::{self, StreamError};
 use crate::update;
 
 type WsMessage = tungstenite::Message;
@@ -68,6 +71,11 @@ const BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 const BACKOFF_JITTER: f64 = 0.20;
 /// Attachment and image transfers this loop runs at once; the rest wait.
 const TRANSFER_SLOTS: usize = 2;
+/// The most of an attachment a preview holds in memory. Only a picture is ever
+/// drawn inline and `PROTOCOL.md` § Limits caps a picture at
+/// [`images::MAX_BYTES`]; the file itself may be gigabytes now, and goes
+/// through `attachments::download_to_path` onto the disk instead.
+const PREVIEW_MAX_BYTES: u64 = images::MAX_BYTES;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -77,6 +85,10 @@ pub enum Command {
         /// The message this one answers; `None` when it answers nothing.
         reply_to_id: Option<i64>,
         attachment_ids: Vec<i64>,
+        /// Files this sender has offered for the channel and not yet linked to
+        /// a message. Nothing was uploaded: the bytes stay on this disk and are
+        /// read back out of this client.
+        streamed_file_ids: Vec<i64>,
     },
     /// The newest page of a channel, asked for when the UI first opens it.
     LoadHistory {
@@ -111,8 +123,16 @@ pub enum Command {
         request_id: u64,
         channel_id: i64,
         file_name: String,
-        content_type: &'static str,
+        content_type: String,
         bytes: Blob,
+    },
+    /// A file on disk rather than bytes in hand: it streams straight off the
+    /// disk, so sending a gigabyte never costs a gigabyte of memory.
+    UploadAttachmentFile {
+        request_id: u64,
+        channel_id: i64,
+        path: PathBuf,
+        content_type: String,
     },
     FetchAttachment {
         request_id: u64,
@@ -121,12 +141,41 @@ pub enum Command {
     UploadImage {
         request_id: u64,
         purpose: ImagePurpose,
-        content_type: &'static str,
+        content_type: String,
         bytes: Blob,
     },
     FetchImage {
         request_id: u64,
         id: i64,
+    },
+    /// Offers a local file for the others to read out of this client. Nothing
+    /// is uploaded: the file stays at `path` and is served on demand.
+    OfferStream {
+        request_id: u64,
+        channel_id: i64,
+        path: PathBuf,
+        content_type: String,
+        size: u64,
+    },
+    /// Reads one streamed file onto the disk at `save_to`.
+    FetchStream {
+        request_id: u64,
+        id: i64,
+        save_to: PathBuf,
+    },
+    /// The answer to an [`Event::StreamRequested`]: `path` is the local file the
+    /// app resolved the stream id to against its own registry. A file it found
+    /// gone it declines itself, and that never reaches this loop.
+    ServeStream {
+        stream_id: i64,
+        transfer_id: i64,
+        offset: i64,
+        length: i64,
+        path: PathBuf,
+    },
+    /// Stops the transfer `request_id` names, in flight or still queued.
+    CancelTransfer {
+        request_id: u64,
     },
     JoinVoice {
         channel_id: i64,
@@ -182,9 +231,14 @@ impl Command {
             Self::Delete { .. } => "Delete",
             Self::React { .. } => "React",
             Self::UploadAttachment { .. } => "UploadAttachment",
+            Self::UploadAttachmentFile { .. } => "UploadAttachmentFile",
             Self::FetchAttachment { .. } => "FetchAttachment",
             Self::UploadImage { .. } => "UploadImage",
             Self::FetchImage { .. } => "FetchImage",
+            Self::OfferStream { .. } => "OfferStream",
+            Self::FetchStream { .. } => "FetchStream",
+            Self::ServeStream { .. } => "ServeStream",
+            Self::CancelTransfer { .. } => "CancelTransfer",
             Self::JoinVoice { .. } => "JoinVoice",
             Self::LeaveVoice { .. } => "LeaveVoice",
             Self::VoiceSelfState { .. } => "VoiceSelfState",
@@ -582,6 +636,41 @@ pub enum Event {
         id: i64,
         error: String,
     },
+    /// The server wrote the offer down; the file itself never moved.
+    StreamOffered {
+        request_id: u64,
+        file: StreamedFile,
+    },
+    StreamOfferFailed {
+        request_id: u64,
+        error: String,
+    },
+    StreamFetched {
+        request_id: u64,
+        id: i64,
+        path: PathBuf,
+    },
+    StreamFetchFailed {
+        request_id: u64,
+        id: i64,
+        error: String,
+    },
+    /// The server wants a range of a file this client offered. The app resolves
+    /// the id against its own registry and answers with
+    /// [`Command::ServeStream`], or declines the transfer itself.
+    StreamRequested {
+        stream_id: i64,
+        transfer_id: i64,
+        offset: i64,
+        length: i64,
+    },
+    /// How far one transfer has got. Coarse by design: a report every megabyte
+    /// or every percent, whichever is larger, and a last one at the end.
+    TransferProgress {
+        request_id: u64,
+        sent: u64,
+        total: u64,
+    },
     RestResult {
         request_id: u64,
         outcome: Result<RestOutcome, String>,
@@ -641,6 +730,56 @@ fn watch_target(user_id: i64) -> Option<i64> {
     (user_id != 0).then_some(user_id)
 }
 
+/// One of the four picture types [`images::upload`] takes, which names them as
+/// `&'static str` while the UI resolves a content type as a `String`. Anything
+/// else travels as [`attachments::DEFAULT_TYPE`], which the image endpoint
+/// refuses in its own words rather than this loop inventing them.
+fn image_type(content_type: &str) -> &'static str {
+    ["image/png", "image/jpeg", "image/gif", "image/webp"]
+        .into_iter()
+        .find(|known| known.eq_ignore_ascii_case(content_type))
+        .unwrap_or(attachments::DEFAULT_TYPE)
+}
+
+/// The name a file travels under. It is metadata: a path with nothing usable in
+/// it is not worth failing an offer over.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// A streamed-file failure as the transfer pipeline's own error. An
+/// [`ApiFailure`] travels on untouched, so a bearer challenge still buys the one
+/// refresh-and-retry every fetch gets; the answers only a stream can give — the
+/// sender is offline, declined, or never answered — become an
+/// [`ApiFailure::Io`], the variant that prints the words it was handed.
+fn stream_failure(error: StreamError) -> ApiFailure {
+    match error {
+        StreamError::Api(failure) => failure,
+        other => ApiFailure::Io(other.to_string()),
+    }
+}
+
+/// The progress callback one transfer reports through. [`attachments`] and
+/// [`streams`] already hold a report back to a megabyte or a percent, so every
+/// call here is worth a frame; one the UI is too far behind to take is dropped
+/// rather than stalling the transfer, and the finishing event is what says the
+/// transfer is over.
+fn progress_reporter(
+    mut events: mpsc::Sender<Event>,
+    request_id: u64,
+) -> impl FnMut(u64, u64) + Send + 'static {
+    move |sent, total| {
+        let _ = events.try_send(Event::TransferProgress {
+            request_id,
+            sent,
+            total,
+        });
+    }
+}
+
 /// A log-safe rendering of a received frame: `VoiceReady` carries the media key
 /// and a message carries what somebody typed, neither of which may ever reach a
 /// log line.
@@ -662,6 +801,17 @@ fn describe(frame: &ServerFrame) -> String {
             Some(message) => format!("MessageEdited {{ {} }}", describe_message(message)),
             None => "MessageEdited { message: None }".to_owned(),
         },
+        // Nothing here needs redacting today; naming every field keeps a later
+        // addition to the frame out of the `{frame:?}` catch-all by accident.
+        Some(server_frame::Payload::StreamRequest(request)) => {
+            let stream_id = request.stream_id;
+            let transfer_id = request.transfer_id;
+            let offset = request.offset;
+            let length = request.length;
+            format!(
+                "StreamRequest {{ stream_id: {stream_id}, transfer_id: {transfer_id}, offset: {offset}, length: {length} }}"
+            )
+        }
         _ => format!("{frame:?}"),
     }
 }
@@ -727,6 +877,7 @@ fn classify_first_frame(payload: Option<server_frame::Payload>) -> FirstFrame {
         Some(server_frame::Payload::MemberUpdated(_)) => FirstFrame::Ignore("MemberUpdated"),
         Some(server_frame::Payload::MemberRemoved(_)) => FirstFrame::Ignore("MemberRemoved"),
         Some(server_frame::Payload::VoiceMoved(_)) => FirstFrame::Ignore("VoiceMoved"),
+        Some(server_frame::Payload::StreamRequest(_)) => FirstFrame::Ignore("StreamRequest"),
         None => FirstFrame::Unknown,
     }
 }
@@ -1151,6 +1302,11 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
             request_id,
             channel_id,
             ..
+        }
+        | Command::UploadAttachmentFile {
+            request_id,
+            channel_id,
+            ..
         } => {
             tracing::debug!(
                 request_id,
@@ -1200,6 +1356,59 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
                 })
                 .await
                 .is_ok()
+        }
+        Command::OfferStream {
+            request_id,
+            channel_id,
+            ..
+        } => {
+            tracing::debug!(
+                request_id,
+                channel_id,
+                "cannot offer a file while disconnected"
+            );
+            events
+                .send(Event::StreamOfferFailed {
+                    request_id,
+                    error: "not connected".to_owned(),
+                })
+                .await
+                .is_ok()
+        }
+        Command::FetchStream { request_id, id, .. } => {
+            tracing::debug!(
+                request_id,
+                id,
+                "cannot read a streamed file while disconnected"
+            );
+            events
+                .send(Event::StreamFetchFailed {
+                    request_id,
+                    id,
+                    error: "not connected".to_owned(),
+                })
+                .await
+                .is_ok()
+        }
+        // No event: the transfer the server was asking for is gone with the
+        // socket that asked, and the reader waits the server out.
+        Command::ServeStream {
+            stream_id,
+            transfer_id,
+            ..
+        } => {
+            tracing::debug!(
+                stream_id,
+                transfer_id,
+                "cannot serve a streamed range while disconnected"
+            );
+            true
+        }
+        // No event either: whatever this was cancelling has already been
+        // answered with a failure of its own.
+        Command::CancelTransfer { request_id } => {
+            tracing::debug!(request_id, "nothing to cancel while disconnected");
+            true
         }
         Command::Rest(request) => {
             tracing::debug!(
@@ -1784,15 +1993,21 @@ impl HistoryQueue {
     }
 }
 
-/// One attachment or image transfer the UI asked for.
+/// One attachment, image or streamed-file transfer the UI asked for.
 #[derive(Clone)]
 enum Transfer {
     Upload {
         request_id: u64,
         channel_id: i64,
         file_name: String,
-        content_type: &'static str,
+        content_type: String,
         bytes: Blob,
+    },
+    UploadFile {
+        request_id: u64,
+        channel_id: i64,
+        path: PathBuf,
+        content_type: String,
     },
     Fetch {
         request_id: u64,
@@ -1801,12 +2016,24 @@ enum Transfer {
     UploadImage {
         request_id: u64,
         purpose: ImagePurpose,
-        content_type: &'static str,
+        content_type: String,
         bytes: Blob,
     },
     FetchImage {
         request_id: u64,
         id: i64,
+    },
+    Offer {
+        request_id: u64,
+        channel_id: i64,
+        path: PathBuf,
+        content_type: String,
+        size: u64,
+    },
+    FetchStream {
+        request_id: u64,
+        id: i64,
+        save_to: PathBuf,
     },
 }
 
@@ -1814,9 +2041,12 @@ impl Transfer {
     fn request_id(&self) -> u64 {
         match self {
             Self::Upload { request_id, .. }
+            | Self::UploadFile { request_id, .. }
             | Self::Fetch { request_id, .. }
             | Self::UploadImage { request_id, .. }
-            | Self::FetchImage { request_id, .. } => *request_id,
+            | Self::FetchImage { request_id, .. }
+            | Self::Offer { request_id, .. }
+            | Self::FetchStream { request_id, .. } => *request_id,
         }
     }
 }
@@ -1849,11 +2079,25 @@ impl TransferQueue {
         self.running = self.running.saturating_sub(1);
     }
 
+    /// Takes one that has not started out of the queue, so a cancel does not
+    /// have to wait for its turn to come round first.
+    fn cancel(&mut self, request_id: u64) -> Option<Transfer> {
+        let index = self
+            .waiting
+            .iter()
+            .position(|request| request.request_id() == request_id)?;
+        self.waiting.remove(index)
+    }
+
     /// What never started, so a disconnect can answer it.
     fn abandon(&mut self) -> Vec<Transfer> {
         self.waiting.drain(..).collect()
     }
 }
+
+/// One range this client is serving, resolving to the request it answered so
+/// its arm can name that in a log line.
+type Serve<'a> = Pin<Box<dyn Future<Output = (i64, i64, Result<(), StreamError>)> + Send + 'a>>;
 
 /// One in-flight transfer, kept whole so a refresh can re-issue the same
 /// request.
@@ -1878,12 +2122,14 @@ enum Transferred {
     Stop(AfterAttempt),
 }
 
-/// Runs one transfer to the event that answers it. The bytes never reach a log
-/// line; their size does.
+/// Runs one transfer to the event that answers it, reporting its progress into
+/// `events` as it goes. Neither the bytes nor the path reach a log line; the
+/// size does.
 async fn run_transfer(
     endpoints: &Endpoints,
     access_token: String,
     request: Transfer,
+    events: mpsc::Sender<Event>,
 ) -> Result<Event, ApiFailure> {
     match request {
         Transfer::Upload {
@@ -1893,12 +2139,12 @@ async fn run_transfer(
             content_type,
             bytes,
         } => {
-            let attachment = attachments::upload(
+            let attachment = attachments::upload_bytes(
                 endpoints,
                 &access_token,
                 channel_id,
                 &file_name,
-                content_type,
+                &content_type,
                 bytes,
             )
             .await?;
@@ -1914,8 +2160,36 @@ async fn run_transfer(
                 attachment,
             })
         }
+        Transfer::UploadFile {
+            request_id,
+            channel_id,
+            path,
+            content_type,
+        } => {
+            let attachment = attachments::upload_from_path(
+                endpoints,
+                &access_token,
+                channel_id,
+                &path,
+                &content_type,
+                progress_reporter(events, request_id),
+            )
+            .await?;
+            tracing::info!(
+                request_id,
+                channel_id,
+                id = attachment.id,
+                size = attachment.size,
+                "attachment streamed up from disk"
+            );
+            Ok(Event::AttachmentUploaded {
+                request_id,
+                attachment,
+            })
+        }
         Transfer::Fetch { request_id, id } => {
-            let bytes = attachments::download(endpoints, &access_token, id).await?;
+            let bytes =
+                attachments::download(endpoints, &access_token, id, PREVIEW_MAX_BYTES).await?;
             tracing::debug!(request_id, id, size = bytes.len(), "attachment fetched");
             Ok(Event::AttachmentFetched {
                 request_id,
@@ -1929,8 +2203,14 @@ async fn run_transfer(
             content_type,
             bytes,
         } => {
-            let image =
-                images::upload(endpoints, &access_token, purpose, content_type, bytes).await?;
+            let image = images::upload(
+                endpoints,
+                &access_token,
+                purpose,
+                image_type(&content_type),
+                bytes,
+            )
+            .await?;
             tracing::info!(
                 request_id,
                 ?purpose,
@@ -1949,16 +2229,64 @@ async fn run_transfer(
                 bytes: Blob::from(bytes),
             })
         }
+        Transfer::Offer {
+            request_id,
+            channel_id,
+            path,
+            content_type,
+            size,
+        } => {
+            let file = streams::offer(
+                endpoints,
+                &access_token,
+                channel_id,
+                &file_name_of(&path),
+                &content_type,
+                i64::try_from(size).unwrap_or(i64::MAX),
+            )
+            .await?;
+            tracing::info!(
+                request_id,
+                channel_id,
+                id = file.id,
+                size = file.size,
+                "streamed file offered"
+            );
+            Ok(Event::StreamOffered { request_id, file })
+        }
+        Transfer::FetchStream {
+            request_id,
+            id,
+            save_to,
+        } => {
+            streams::fetch_to_path(
+                endpoints,
+                &access_token,
+                id,
+                &save_to,
+                progress_reporter(events, request_id),
+            )
+            .await
+            .map_err(stream_failure)?;
+            tracing::info!(request_id, id, "streamed file read onto disk");
+            Ok(Event::StreamFetched {
+                request_id,
+                id,
+                path: save_to,
+            })
+        }
     }
 }
 
 /// The event telling the UI one transfer is not coming.
 fn transfer_failed(request: &Transfer, error: String) -> Event {
     match request {
-        Transfer::Upload { request_id, .. } => Event::UploadFailed {
-            request_id: *request_id,
-            error,
-        },
+        Transfer::Upload { request_id, .. } | Transfer::UploadFile { request_id, .. } => {
+            Event::UploadFailed {
+                request_id: *request_id,
+                error,
+            }
+        }
         Transfer::Fetch { request_id, id } => Event::FetchFailed {
             request_id: *request_id,
             id: *id,
@@ -1969,6 +2297,15 @@ fn transfer_failed(request: &Transfer, error: String) -> Event {
             error,
         },
         Transfer::FetchImage { request_id, id } => Event::ImageFetchFailed {
+            request_id: *request_id,
+            id: *id,
+            error,
+        },
+        Transfer::Offer { request_id, .. } => Event::StreamOfferFailed {
+            request_id: *request_id,
+            error,
+        },
+        Transfer::FetchStream { request_id, id, .. } => Event::StreamFetchFailed {
             request_id: *request_id,
             id: *id,
             error,
@@ -1988,7 +2325,10 @@ async fn settle_transfer<'a>(
 ) -> Transferred {
     let reissue = {
         let request = request.clone();
-        move |token| -> Boxed<'a, Event> { Box::pin(run_transfer(endpoints, token, request)) }
+        let events = events.clone();
+        move |token| -> Boxed<'a, Event> {
+            Box::pin(run_transfer(endpoints, token, request, events))
+        }
     };
 
     match settle(slot, result, reissue, endpoints, session, events).await {
@@ -2117,6 +2457,7 @@ fn start_transfers<'a>(
     slots: [&mut Option<TransferFetch<'a>>; TRANSFER_SLOTS],
     endpoints: &'a Endpoints,
     access_token: &str,
+    events: &mpsc::Sender<Event>,
 ) {
     for slot in slots {
         if slot.is_some() {
@@ -2130,10 +2471,32 @@ fn start_transfers<'a>(
                 endpoints,
                 access_token.to_owned(),
                 request.clone(),
+                events.clone(),
             )),
             request,
         });
     }
+}
+
+/// Stops the transfer `request_id` names and hands it back, so its arm can
+/// answer the UI. Dropping the future in its slot is what actually cancels one
+/// in flight: the request ends there, and the reader or writer thread behind it
+/// ends with the channel it was feeding. One still queued has only to leave the
+/// queue.
+fn cancel_transfer(
+    request_id: u64,
+    slots: [&mut Option<TransferFetch<'_>>; TRANSFER_SLOTS],
+    queue: &mut TransferQueue,
+) -> Option<Transfer> {
+    for slot in slots {
+        if let Some(transfer) = slot.take_if(|transfer| transfer.request.request_id() == request_id)
+        {
+            queue.finish();
+            return Some(transfer.request);
+        }
+    }
+
+    queue.cancel(request_id)
 }
 
 /// Starts the next queued REST request when the one slot is free.
@@ -2281,6 +2644,13 @@ where
     let mut second_transfer: Option<TransferFetch<'_>> = None;
     let mut rest = RestQueue::default();
     let mut rest_job: Option<RestJob<'_>> = None;
+    // The ranges of its own files this client is serving. Deliberately not the
+    // transfer queue: a served range is this loop answering the server for a
+    // reader who is already blocked on it, so it must never sit behind the
+    // user's own uploads in one of the two `TRANSFER_SLOTS`. How many run at
+    // once is the server's to bound — it caps the transfers one account may
+    // have open at all.
+    let mut serves: FuturesUnordered<Serve<'_>> = FuturesUnordered::new();
 
     // Skip the immediate first tick: we have just finished a handshake.
     let mut ping = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
@@ -2511,6 +2881,17 @@ where
                                     count: watchers.count,
                                 });
                             }
+                            // The app owns the registry: it resolves the id to a
+                            // local file and answers with `ServeStream`, or
+                            // declines the transfer itself.
+                            Some(server_frame::Payload::StreamRequest(request)) => {
+                                emit_or_break!('live, events, Event::StreamRequested {
+                                    stream_id: request.stream_id,
+                                    transfer_id: request.transfer_id,
+                                    offset: request.offset,
+                                    length: request.length,
+                                });
+                            }
                             // A Pong only had to reach the watchdog above.
                             Some(server_frame::Payload::Pong(_)) => {}
                             // The handshake is over: a second Welcome means the
@@ -2617,6 +2998,7 @@ where
                     [&mut first_transfer, &mut second_transfer],
                     endpoints,
                     &session.access_token,
+                    events,
                 );
             }
 
@@ -2637,6 +3019,7 @@ where
                     [&mut first_transfer, &mut second_transfer],
                     endpoints,
                     &session.access_token,
+                    events,
                 );
             }
 
@@ -2673,6 +3056,20 @@ where
                 start_rest(&mut rest, &mut rest_job, endpoints, &session.access_token);
             }
 
+            Some((stream_id, transfer_id, result)) = serves.next(), if !serves.is_empty() => {
+                match result {
+                    Ok(()) => tracing::debug!(stream_id, transfer_id, "streamed range served"),
+                    // Nothing to tell the UI: it never asked for this range, and
+                    // the reader's own client is what reports the transfer.
+                    Err(error) => tracing::warn!(
+                        stream_id,
+                        transfer_id,
+                        %error,
+                        "cannot serve a streamed range"
+                    ),
+                }
+            }
+
             command = commands.next() => {
                 let Some(command) = command else {
                     tracing::info!("UI dropped the command channel; closing");
@@ -2681,12 +3078,13 @@ where
                 tracing::debug!(kind = command.kind_name(), "command");
 
                 match command {
-                    Command::Send { channel_id, text, reply_to_id, attachment_ids } => {
+                    Command::Send { channel_id, text, reply_to_id, attachment_ids, streamed_file_ids } => {
                         let payload = client_frame::Payload::Send(SendMessage {
                             text,
                             channel_id,
                             reply_to_id: reply_to_id.unwrap_or_default(),
                             attachment_ids,
+                            streamed_file_ids,
                         });
                         if let Err(e) = send_frame(sink, payload).await {
                             tracing::warn!(error = %e, "cannot send the message");
@@ -2803,6 +3201,23 @@ where
                             [&mut first_transfer, &mut second_transfer],
                             endpoints,
                             &session.access_token,
+                            events,
+                        );
+                    }
+                    Command::UploadAttachmentFile { request_id, channel_id, path, content_type } => {
+                        tracing::info!(request_id, channel_id, "attachment upload from disk queued");
+                        transfers.push(Transfer::UploadFile {
+                            request_id,
+                            channel_id,
+                            path,
+                            content_type,
+                        });
+                        start_transfers(
+                            &mut transfers,
+                            [&mut first_transfer, &mut second_transfer],
+                            endpoints,
+                            &session.access_token,
+                            events,
                         );
                     }
                     Command::FetchAttachment { request_id, id } => {
@@ -2813,6 +3228,7 @@ where
                             [&mut first_transfer, &mut second_transfer],
                             endpoints,
                             &session.access_token,
+                            events,
                         );
                     }
                     Command::UploadImage { request_id, purpose, content_type, bytes } => {
@@ -2828,6 +3244,7 @@ where
                             [&mut first_transfer, &mut second_transfer],
                             endpoints,
                             &session.access_token,
+                            events,
                         );
                     }
                     Command::FetchImage { request_id, id } => {
@@ -2838,7 +3255,79 @@ where
                             [&mut first_transfer, &mut second_transfer],
                             endpoints,
                             &session.access_token,
+                            events,
                         );
+                    }
+                    Command::OfferStream { request_id, channel_id, path, content_type, size } => {
+                        tracing::info!(request_id, channel_id, size, "streamed file offer queued");
+                        transfers.push(Transfer::Offer {
+                            request_id,
+                            channel_id,
+                            path,
+                            content_type,
+                            size,
+                        });
+                        start_transfers(
+                            &mut transfers,
+                            [&mut first_transfer, &mut second_transfer],
+                            endpoints,
+                            &session.access_token,
+                            events,
+                        );
+                    }
+                    Command::FetchStream { request_id, id, save_to } => {
+                        tracing::info!(request_id, id, "streamed file read queued");
+                        transfers.push(Transfer::FetchStream { request_id, id, save_to });
+                        start_transfers(
+                            &mut transfers,
+                            [&mut first_transfer, &mut second_transfer],
+                            endpoints,
+                            &session.access_token,
+                            events,
+                        );
+                    }
+                    // Not a queued transfer: the server is asking on behalf of a
+                    // reader who is already waiting, so this never queues behind
+                    // the user's own uploads. The app has already resolved the
+                    // id against its registry; a file it found gone it declined
+                    // itself.
+                    Command::ServeStream { stream_id, transfer_id, offset, length, path } => {
+                        tracing::debug!(stream_id, transfer_id, offset, length, "serving a streamed range");
+                        let request = StreamRequest { stream_id, transfer_id, offset, length };
+                        let access_token = session.access_token.clone();
+                        serves.push(Box::pin(async move {
+                            let result = streams::serve_chunk(
+                                endpoints,
+                                &access_token,
+                                &request,
+                                &path,
+                                // A served range has no `request_id`: the UI
+                                // never asked for it and has nothing to show.
+                                |_sent, _wanted| {},
+                            )
+                            .await;
+                            (stream_id, transfer_id, result)
+                        }));
+                    }
+                    Command::CancelTransfer { request_id } => {
+                        match cancel_transfer(
+                            request_id,
+                            [&mut first_transfer, &mut second_transfer],
+                            &mut transfers,
+                        ) {
+                            Some(request) => {
+                                tracing::info!(request_id, "transfer cancelled");
+                                emit_or_break!('live, events, transfer_failed(&request, "cancelled".to_owned()));
+                                start_transfers(
+                                    &mut transfers,
+                                    [&mut first_transfer, &mut second_transfer],
+                                    endpoints,
+                                    &session.access_token,
+                                    events,
+                                );
+                            }
+                            None => tracing::debug!(request_id, "nothing to cancel: that transfer is already over"),
+                        }
                     }
                     Command::Rest(request) => {
                         tracing::debug!(request_id = request.request_id, kind = ?request.kind, "REST request queued");
@@ -2895,6 +3384,14 @@ where
         let _ = events
             .send(transfer_failed(&request, "disconnected".to_owned()))
             .await;
+    }
+    if !serves.is_empty() {
+        // Nothing to answer: a range this client never finished is one the
+        // server times its reader out of, and the reader asks again.
+        tracing::debug!(
+            count = serves.len(),
+            "abandoning the ranges this client was serving"
+        );
     }
     let abandoned = rest_job
         .into_iter()
@@ -3204,7 +3701,7 @@ mod tests {
             request_id: 4,
             channel_id: GENERAL,
             file_name: "shot.png".to_owned(),
-            content_type: "image/png",
+            content_type: "image/png".to_owned(),
             bytes: Blob::from(vec![0; 8]),
         };
 
@@ -3364,9 +3861,10 @@ mod tests {
             server_frame::Payload::MemberUpdated(Default::default()),
             server_frame::Payload::MemberRemoved(Default::default()),
             server_frame::Payload::VoiceMoved(Default::default()),
+            server_frame::Payload::StreamRequest(Default::default()),
         ];
-        // `ServerFrame` carries 29 payloads: these are all but Welcome and Error.
-        assert_eq!(ignored.len(), 27);
+        // `ServerFrame` carries 30 payloads: these are all but Welcome and Error.
+        assert_eq!(ignored.len(), 28);
 
         for payload in ignored {
             let printed = format!("{payload:?}");

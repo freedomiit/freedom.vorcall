@@ -12,15 +12,16 @@
 use iced::alignment::Vertical;
 use iced::widget::{Space, button, column, container, mouse_area, row, stack, text, tooltip};
 use iced::{Element, Length, Padding, Point, Size};
+use vorcall_core::mentions::{self, Segment};
 use vorcall_core::permissions;
-use vorcall_core::{ChannelKind, VoiceMember};
+use vorcall_core::{ChannelKind, ChatMessage, VoiceMember};
 
 use crate::app::message::{
     ChannelsMsg, ChatMsg, MenuTarget, Message, SettingsMsg, ShareMsg, UiMsg, VoiceMsg,
 };
 use crate::app::state::server::{ServerModel, channel_kind};
 use crate::app::state::settings::ServerTab;
-use crate::app::state::ui::Dialog;
+use crate::app::state::ui::{Dialog, TransferSource};
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
 use crate::theme::ThemeTokens;
@@ -58,6 +59,9 @@ const IS_SELF: &str = "That is you";
 const IS_OWNER: &str = "They own the server";
 const OUTRANKED: &str = "They outrank you";
 const DELETED: &str = "The message is deleted";
+const NO_TEXT: &str = "It has no text";
+const NO_SOLE_LINK: &str = "No single link to copy";
+const NO_FILE: &str = "It carries no file";
 
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let Some(menu) = app.ui.context_menu else {
@@ -264,6 +268,10 @@ fn message_items(main: &MainState, id: i64) -> Vec<Entry> {
     let channel = Some(message.channel_id);
     let mine = message.author_id == main.member_id;
     let alive = !message.deleted;
+    let link = sole_link(&message.text, &main.user_pairs);
+    // The first file the message carries, which is the one the menu saves; a
+    // message with several is saved from the cards themselves.
+    let file = first_file(message);
 
     vec![
         Entry::item(
@@ -300,6 +308,39 @@ fn message_items(main: &MainState, id: i64) -> Vec<Entry> {
         ),
         Entry::item(
             Item::new(
+                "Select text",
+                Icon::Edit,
+                perform(Message::Chat(ChatMsg::StartSelection(id))),
+            )
+            .needs(alive, DELETED)
+            .needs(!message.text.is_empty(), NO_TEXT),
+        ),
+        Entry::item(
+            Item::new(
+                "Copy link",
+                Icon::Link,
+                match &link {
+                    Some(url) => copies("Link", url.clone()),
+                    None => Message::Noop,
+                },
+            )
+            .needs(alive, DELETED)
+            .needs(link.is_some(), NO_SOLE_LINK),
+        ),
+        Entry::item(
+            Item::new(
+                "Save file as…",
+                Icon::ArrowDown,
+                match file {
+                    Some(source) => perform(Message::Chat(ChatMsg::SaveFile(source))),
+                    None => Message::Noop,
+                },
+            )
+            .needs(alive, DELETED)
+            .needs(file.is_some(), NO_FILE),
+        ),
+        Entry::item(
+            Item::new(
                 "Edit",
                 Icon::Edit,
                 perform(Message::Chat(ChatMsg::StartEdit(id))),
@@ -327,6 +368,33 @@ fn message_items(main: &MainState, id: i64) -> Vec<Entry> {
             copies("Message id", id.to_string()),
         )),
     ]
+}
+
+/// The one `http`/`https` URL a message carries, if it carries exactly one.
+/// With several there is no single link the menu could mean.
+fn sole_link(body: &str, users: &[(i64, String)]) -> Option<String> {
+    let mut links =
+        mentions::segments(body, users)
+            .into_iter()
+            .filter_map(|segment| match segment {
+                Segment::Link(url) => Some(url),
+                _ => None,
+            });
+    let first = links.next()?;
+
+    links.next().is_none().then_some(first)
+}
+
+/// The file the menu saves: the first stored upload, or the first streamed file
+/// where the message carries no upload.
+fn first_file(message: &ChatMessage) -> Option<TransferSource> {
+    if let Some(attachment) = message.attachments.first() {
+        return Some(TransferSource::Attachment(attachment.id));
+    }
+    message
+        .streamed_files
+        .first()
+        .map(|file| TransferSource::Stream(file.id))
 }
 
 fn member_items(main: &MainState, user_id: i64) -> Vec<Entry> {
@@ -731,4 +799,51 @@ fn moderation_state(main: &MainState, channel_id: i64, user_id: i64) -> (bool, b
         .map_or((false, false), |profile| {
             (profile.server_muted, profile.server_deafened)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use vorcall_core::{Attachment, StreamedFile};
+
+    /// The menu offers a link only when there is one link to mean.
+    #[test]
+    fn one_link_is_copied_and_two_are_not() {
+        assert_eq!(
+            sole_link("look at https://vorcall.example/a today", &[]),
+            Some("https://vorcall.example/a".to_owned())
+        );
+        assert_eq!(
+            sole_link("https://a.example and https://b.example", &[]),
+            None
+        );
+        assert_eq!(sole_link("nothing to click here", &[]), None);
+    }
+
+    #[test]
+    fn the_stored_upload_is_saved_before_the_streamed_file() {
+        let attachment = Attachment {
+            id: 7,
+            ..Attachment::default()
+        };
+        let streamed = StreamedFile {
+            id: 9,
+            ..StreamedFile::default()
+        };
+
+        let both = ChatMessage {
+            attachments: vec![attachment],
+            streamed_files: vec![streamed.clone()],
+            ..ChatMessage::default()
+        };
+        let stream_only = ChatMessage {
+            streamed_files: vec![streamed],
+            ..ChatMessage::default()
+        };
+
+        assert_eq!(first_file(&both), Some(TransferSource::Attachment(7)));
+        assert_eq!(first_file(&stream_only), Some(TransferSource::Stream(9)));
+        assert_eq!(first_file(&ChatMessage::default()), None);
+    }
 }

@@ -15,6 +15,7 @@ pub mod overlays;
 pub mod profile_card;
 pub mod quick_switcher;
 pub mod rail;
+pub mod selectable;
 pub mod server_settings;
 pub mod settings;
 pub mod stage;

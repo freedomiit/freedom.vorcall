@@ -35,15 +35,17 @@ app. What there is:
   else in the channel.
 - **Roles and permissions**: 21 of them, with colours, icons and a hierarchy, overridable
   per channel and per member.
-- **Messages** with replies, edits, reactions and image attachments; unread and mention
-  counts; `@everyone` and `@here`.
+- **Messages** with replies, edits, reactions and attachments of any file type — up to
+  2 GiB kept on the server, anything larger streamed straight off the sender's machine;
+  selectable text, clickable links, paste a file to attach it; unread and mention counts;
+  `@everyone` and `@here`.
 - **Profiles**: avatar, banner, nickname, description, accent colour.
 - **Moderation**: kick, ban, server mute and deafen, move, invite revocation.
 - **A native desktop client** for Linux, Windows and macOS — Rust and `iced`, not a browser
   in a box. Themable, with a quick switcher and rebindable keys.
 
 Deliberately absent: more than one server per deployment, group DMs, threads, message
-search, pins, custom status, non-image attachments, OAuth or 2FA, and any web UI.
+search, pins, custom status, OAuth or 2FA, and any web UI.
 
 ## Install the client
 

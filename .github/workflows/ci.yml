@@ -45,7 +45,7 @@ jobs:
         run: cargo build
 
       - name: Test
-        run: cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app -p vorcall-hotkey -p vorcall-screen
+        run: cargo test -p vorcall-voice -p vorcall-core -p vorcall-release -p vorcall-app -p vorcall-hotkey -p vorcall-screen -p vorcall-clipboard
 
   server:
     runs-on: ubuntu-latest

@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use iced::widget::{scrollable, text_editor};
 use iced::{Point, Size, keyboard, mouse, window};
+use vorcall_clipboard::Pasted;
 use vorcall_core::config::{Density, Entrance, TransmitMode};
 use vorcall_core::connection::Blob;
 use vorcall_core::images::ImagePurpose;
@@ -25,7 +26,7 @@ use vorcall_hotkey::Edge;
 use vorcall_screen::{Source, SourceId};
 
 use crate::app::state::settings::{ServerTab, SettingsTab};
-use crate::app::state::ui::Dialog;
+use crate::app::state::ui::{Dialog, TransferSource};
 use crate::app::state::voice::{EngineHandoff, HotkeyHandoff};
 use crate::workers::share::{ShareEvent, StageEvent};
 use crate::workers::voice::{AudioEvent, DeviceLists};
@@ -148,13 +149,79 @@ pub enum ChatMsg {
     PickAttachment,
     /// Whatever the file dialog answered, or the files dropped on the window.
     FilesPicked(Vec<PathBuf>),
-    /// One file read off the disk: its name and its bytes.
+    /// One picked, dropped or pasted file, measured off the interface thread:
+    /// its size is what decides whether it is stored on the server or offered
+    /// from this disk, and `offer` is that choice already made by hand.
+    FileMeasured {
+        path: PathBuf,
+        size: u64,
+        content_type: String,
+        offer: bool,
+    },
+    /// Bytes to send as a file, with the name they travel under: a pasted
+    /// picture has no file of its own to stream from.
     FileRead(Result<(String, Blob), String>),
     RemovePendingAttachment(i64),
+    /// One streamed file out of the message being written. The offer stands on
+    /// the server either way: nothing was uploaded to take back.
+    RemovePendingStream(i64),
+    /// Give up on one upload or offer the composer is still waiting on, named by
+    /// the request id it was started under.
+    CancelUpload(u64),
     OpenImage(i64),
     /// The pixels of one cached image, ready to draw.
     ImageDecoded(ImageKey, Result<iced::widget::image::Handle, String>),
+    /// The download button on one attachment or one streamed file: asks where
+    /// to put it before a byte moves.
+    SaveFile(TransferSource),
+    /// Where that dialog said to put it, which is what starts the transfer;
+    /// `None` is a dialog the user dismissed.
+    SaveDestination(TransferSource, Option<PathBuf>),
+    /// Give up on the download the transfer dialog is following, named by the
+    /// request id it was started under.
+    CancelTransfer(u64),
+    /// How far the attachment being saved has come. A stored attachment has no
+    /// download-to-disk command in the connection loop, so that one transfer
+    /// runs in the window and reports here rather than as an `Event`.
+    SaveProgress {
+        request_id: u64,
+        received: u64,
+        total: u64,
+    },
+    /// Where it landed, or why it did not.
+    SaveFinished {
+        request_id: u64,
+        result: Result<PathBuf, String>,
+    },
+    /// One range of a file this client offered, resolved against the registry:
+    /// the local file is still the one that was offered, so it may be read.
+    ServeStream {
+        stream_id: i64,
+        transfer_id: i64,
+        offset: i64,
+        length: i64,
+        path: PathBuf,
+    },
     CopyText(i64),
+    /// Paste into the composer: files copied in a file manager, a screenshot, or
+    /// text — whichever the clipboard is offering.
+    Paste,
+    /// What the clipboard held, or the sentence saying why it could not be read.
+    /// [`Pasted`] prints itself summarised, so the derived `Debug` puts neither
+    /// a pasted picture nor the pasted text in the log.
+    PasteRead(Result<Pasted, String>),
+    /// Ask for the files to offer as streamed ones, which is the chevron beside
+    /// the paperclip rather than the paperclip itself.
+    PickStream,
+    /// Offer one local file as a streamed file: above the stored-attachment
+    /// ceiling the server keeps only the record, and this client serves the
+    /// bytes for as long as it is online.
+    OfferFile(PathBuf),
+    /// The press that starts selecting text inside one message, which takes the
+    /// selection away from whatever row held it.
+    StartSelection(i64),
+    /// One `http`/`https` URL out of a message, handed to the system browser.
+    OpenLink(String),
     MarkChannelRead(i64),
 }
 

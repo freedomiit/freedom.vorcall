@@ -17,6 +17,14 @@ internal static class Frames
         return new ClientFrame { Send = send };
     }
 
+    // The same, carrying streamed files rather than uploads; text may be empty for either.
+    public static ClientFrame SendStreamed(string text, long channelId, params long[] streamedFileIds)
+    {
+        var send = new SendMessage { Text = text, ChannelId = channelId };
+        send.StreamedFileIds.AddRange(streamedFileIds);
+        return new ClientFrame { Send = send };
+    }
+
     public static ClientFrame Ping(long sentAtUnixMs) => new() { Ping = new Ping { SentAtUnixMs = sentAtUnixMs } };
 
     public static ClientFrame OpenDm(long userId) => new() { OpenDm = new OpenDm { UserId = userId } };

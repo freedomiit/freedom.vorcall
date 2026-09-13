@@ -35,10 +35,14 @@ namespace Vorcall.Server.Migrations
                         .HasColumnType("bigint")
                         .HasColumnName("channel_id");
 
+                    b.Property<bool>("Complete")
+                        .HasColumnType("boolean")
+                        .HasColumnName("complete");
+
                     b.Property<string>("ContentType")
                         .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("character varying(32)")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
                         .HasColumnName("content_type");
 
                     b.Property<DateTime>("CreatedAt")
@@ -47,8 +51,8 @@ namespace Vorcall.Server.Migrations
 
                     b.Property<string>("FileName")
                         .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)")
+                        .HasMaxLength(255)
+                        .HasColumnType("character varying(255)")
                         .HasColumnName("file_name");
 
                     b.Property<long?>("MessageId")
@@ -588,6 +592,60 @@ namespace Vorcall.Server.Migrations
                     b.ToTable("server", (string)null);
                 });
 
+            modelBuilder.Entity("Vorcall.Server.Data.StreamedFile", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<long>("ChannelId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("channel_id");
+
+                    b.Property<string>("ContentType")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("content_type");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("FileName")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("character varying(255)")
+                        .HasColumnName("file_name");
+
+                    b.Property<long?>("MessageId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("message_id");
+
+                    b.Property<long?>("OwnerId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("owner_id");
+
+                    b.Property<long>("Size")
+                        .HasColumnType("bigint")
+                        .HasColumnName("size");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ChannelId");
+
+                    b.HasIndex("CreatedAt");
+
+                    b.HasIndex("MessageId");
+
+                    b.HasIndex("OwnerId");
+
+                    b.ToTable("streamed_files", (string)null);
+                });
+
             modelBuilder.Entity("Vorcall.Server.Data.User", b =>
                 {
                     b.Property<long>("Id")
@@ -809,6 +867,25 @@ namespace Vorcall.Server.Migrations
                     b.HasOne("Vorcall.Server.Data.Channel", null)
                         .WithMany()
                         .HasForeignKey("GeneralChannelId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("Vorcall.Server.Data.User", null)
+                        .WithMany()
+                        .HasForeignKey("OwnerId")
+                        .OnDelete(DeleteBehavior.SetNull);
+                });
+
+            modelBuilder.Entity("Vorcall.Server.Data.StreamedFile", b =>
+                {
+                    b.HasOne("Vorcall.Server.Data.Channel", null)
+                        .WithMany()
+                        .HasForeignKey("ChannelId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Vorcall.Server.Data.Message", null)
+                        .WithMany()
+                        .HasForeignKey("MessageId")
                         .OnDelete(DeleteBehavior.SetNull);
 
                     b.HasOne("Vorcall.Server.Data.User", null)

@@ -26,10 +26,10 @@ public sealed record ImageSaveOutcome(ImageSaveOutcome.Kind Status, ImageRecord?
     public static ImageSaveOutcome Saved(ImageRecord image) => new(Kind.Saved, image);
 }
 
-// Avatars, banners, the server icon and role icons: the same streaming upload, magic check, per
-// file cap and storage quota as attachments, in a store of their own under images/. An image is
-// kept while a profile, the server row or a role points at it and swept with its file once
-// nothing does.
+// Avatars, banners, the server icon and role icons: the same streaming upload and the same
+// storage quota as attachments, in a store of their own under images/, but held to rules an
+// attachment is not — four types, each magic-checked, at 8 MiB. An image is kept while a profile,
+// the server row or a role points at it and swept with its file once nothing does.
 public sealed class ImageStore(
     AttachmentsOptions options,
     IDbContextFactory<AppDbContext> contexts,
@@ -45,7 +45,7 @@ public sealed class ImageStore(
 
     public string PathFor(long id, string contentType)
     {
-        if (!AttachmentsOptions.TryExtension(contentType, out var ext))
+        if (!AttachmentsOptions.TryImageExtension(contentType, out var ext))
         {
             throw new ArgumentException($"Unsupported image content type '{contentType}'.", nameof(contentType));
         }
@@ -81,12 +81,12 @@ public sealed class ImageStore(
         Stream body,
         CancellationToken ct)
     {
-        if (!AttachmentsOptions.TryExtension(contentType, out _))
+        if (!AttachmentsOptions.TryImageExtension(contentType, out _))
         {
             return ImageSaveOutcome.Rejected(ImageSaveOutcome.Kind.BadMagic);
         }
 
-        if (declaredLength > AttachmentsOptions.MaxFileBytes)
+        if (declaredLength > AttachmentsOptions.ImageMaxFileBytes)
         {
             return ImageSaveOutcome.Rejected(ImageSaveOutcome.Kind.TooLarge);
         }
@@ -125,7 +125,7 @@ public sealed class ImageStore(
         {
             Directory.CreateDirectory(Root);
 
-            var header = new byte[AttachmentsOptions.MagicLength];
+            var header = new byte[AttachmentsOptions.ImageMagicLength];
             var headerLength = 0;
             var written = 0L;
 
@@ -167,7 +167,7 @@ public sealed class ImageStore(
                         var copied = Math.Min(header.Length - headerLength, read);
                         buffer.AsSpan(0, copied).CopyTo(header.AsSpan(headerLength));
                         headerLength += copied;
-                        if (headerLength == header.Length && !AttachmentsOptions.MatchesMagic(contentType, header))
+                        if (headerLength == header.Length && !AttachmentsOptions.MatchesImageMagic(contentType, header))
                         {
                             failure = ImageSaveOutcome.Kind.BadMagic;
                             break;
@@ -233,7 +233,7 @@ public sealed class ImageStore(
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var row = await db.Images.AsNoTracking().FirstOrDefaultAsync(i => i.Id == id, ct);
-        if (row is null || !AttachmentsOptions.TryExtension(row.ContentType, out _))
+        if (row is null || !AttachmentsOptions.TryImageExtension(row.ContentType, out _))
         {
             return null;
         }

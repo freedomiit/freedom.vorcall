@@ -66,6 +66,12 @@ services:
       Vorcall__VoiceHost: ${VORCALL_VOICE_HOST:-}
       Vorcall__VoicePort: ${VORCALL_VOICE_PORT:-5005}
       Vorcall__ShareEnabled: ${VORCALL_SHARE_ENABLED:-true}
+      Vorcall__StreamsEnabled: ${VORCALL_STREAMS_ENABLED:-true}
+      # Left empty on purpose: the server's own defaults apply, so the numbers
+      # are not duplicated here. See .env.example for what they are.
+      Vorcall__StreamSenderTimeoutSeconds: ${VORCALL_STREAM_SENDER_TIMEOUT_SECONDS:-}
+      Vorcall__StreamMaxTransfersPerOwner: ${VORCALL_STREAM_MAX_TRANSFERS_PER_OWNER:-}
+      Vorcall__AttachmentsMaxBytes: ${VORCALL_ATTACHMENTS_MAX_BYTES:-}
       Vorcall__DataDir: /data
       Vorcall__AttachmentsDir: /attachments
       Vorcall__LogsDir: /logs
@@ -82,7 +88,10 @@ services:
       # Generated secrets. Losing this volume rotates the door key and signs
       # everyone out; it is the one thing here worth backing up besides the database.
       - data:/data
-      # Uploaded images: message attachments, avatars, banners, icons.
+      # Uploaded files: message attachments (any type, up to 2 GiB each),
+      # avatars, banners, icons. Bounded by VORCALL_ATTACHMENTS_MAX_BYTES,
+      # which defaults to 200 GiB — make sure the volume can grow that far,
+      # or lower it. Streamed files never land here: they are proxied, not stored.
       - attachments:/attachments
       # Daily JSON logs, 31 kept by the server itself.
       - logs:/logs

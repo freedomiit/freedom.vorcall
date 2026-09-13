@@ -133,12 +133,21 @@ A configuração completa do site está no
 domínio. Emita o certificado antes com
 `certbot certonly --webroot -w /var/www/certbot -d chat.exemplo.org`.
 
-Os três blocos `location` sem buffer não são opcionais: uploads e downloads de atualização
-são corpos transmitidos em fluxo, e um proxy `/api/` genérico aplicaria o limite padrão de
-1 MiB do nginx e carregaria arquivos inteiros na memória. São eles:
+Os blocos `location` sem buffer não são opcionais: uploads, arquivos por streaming e
+downloads de atualização são corpos grandes entregues aos poucos, e um proxy `/api/`
+genérico aplicaria o limite padrão de 1 MiB do nginx e carregaria arquivos inteiros na
+memória. Cada um deles define o próprio `client_max_body_size`, porque os três caminhos de
+upload têm tetos diferentes. São eles:
 
-- `location /api/attachments` e `location /api/images` — `client_max_body_size 9m`,
+- `location /api/attachments` — `client_max_body_size 2g`,
   `proxy_request_buffering off`, `proxy_buffering off`.
+- `location /api/images` — o mesmo, com `client_max_body_size 9m`: avatares, banners e
+  ícones são um acervo à parte, bem menor.
+- `location /api/streams` — o mesmo, com `client_max_body_size 0`: o trecho que o cliente
+  remetente envia é do tamanho do arquivo que ele escolheu, e nenhum dos dois sentidos
+  pode ser bufferizado. Mantenha o `proxy_read_timeout` bem acima de
+  `Vorcall__StreamSenderTimeoutSeconds`: o `GET` de quem lê não produz byte nenhum até o
+  cliente remetente responder.
 - `location /api/diagnostics` — `client_max_body_size 5m`, também sem buffer.
 - `location /api/updates/` — sem buffer, `proxy_read_timeout 300s`.
 - `location = /ws` — upgrade de WebSocket, com timeouts de 3600s.
@@ -214,29 +223,39 @@ configuração `Vorcall:ShareMaxKbps`.
 | `Vorcall__VoiceEnabled` | `true` | `false` desliga a voz por completo; `JoinVoice` responde `VOICE_UNAVAILABLE`. |
 | `Vorcall__ShareMaxKbps` | `30000` | Teto por sessão para a mídia de compartilhamento. Faixa 1000–200000. |
 | `Vorcall__MaxSharersPerRoom` | `3` | Quantas pessoas podem compartilhar num canal ao mesmo tempo. Faixa 1–16. |
-| `Vorcall__AttachmentsMaxBytes` | `2147483648` | Cota total em disco para uploads. Acima dela, um upload é recusado com 507. |
+| `Vorcall__AttachmentsMaxBytes` | `214748364800` | Cota total em disco para uploads, 200 GiB. Acima dela, um upload é recusado com 507. Ajuste ao tamanho real do seu disco. |
+| `Vorcall__StreamsEnabled` | `true` | `false` desliga os arquivos por streaming no servidor inteiro e desmapeia as quatro rotas `/api/streams`. |
+| `Vorcall__StreamSenderTimeoutSeconds` | `30` | Quanto tempo quem lê espera a resposta do cliente remetente antes de o download falhar com 504. Faixa 1–600. |
+| `Vorcall__StreamMaxTransfersPerOwner` | `8` | Quantas transferências uma conta pode servir ao mesmo tempo. Faixa 1–64. |
 | `Vorcall__AuthRequestsPerWindow` | `10` | Requisições de login e cadastro por minuto por IP. |
 | `Vorcall__UploadRequestsPerWindow` | `20` | Uploads por minuto por conta. |
 | `Vorcall__MessageBurst` | `20` | Quadros de escrita que uma conta pode mandar em sequência. |
 | `Vorcall__MessagesPerSecond` | `2` | Taxa sustentada de quadros de escrita por conta. |
 | `Vorcall__DiagnosticsReportsPerHour` | `10` | Relatórios de problema por conta por hora. |
 | `Vorcall__DataDir` | `/data` | Onde ficam os segredos gerados. |
-| `Vorcall__AttachmentsDir` | `/attachments` | Imagens enviadas. |
+| `Vorcall__AttachmentsDir` | `/attachments` | Arquivos enviados, e os avatares, banners e ícones ao lado deles. |
 | `Vorcall__LogsDir` | `/logs` | Logs JSON diários, 31 mantidos. |
 | `Vorcall__DiagnosticsDir` | `/diagnostics` | Relatórios de problema, varridos após 30 dias. |
 | `Vorcall__ReleasesDir` | `/releases` | Versões assinadas do cliente, servidas em `/api/updates/*`. |
 
-Cada arquivo enviado é limitado a 8 MiB, e a quatro por mensagem; isso não é configurável.
+Não é configurável: um anexo pode ser um arquivo de qualquer tipo, de até 2 GiB, quatro por
+mensagem. Um arquivo maior que isso é enviado como **arquivo por streaming** — o servidor
+guarda a oferta e repassa os bytes, mas nunca os armazena, de modo que ele só pode ser lido
+enquanto o cliente de quem enviou estiver online; esses param em 1 TiB, também quatro por
+mensagem. Avatares, banners e ícones são um acervo à parte, mais rígido: só PNG, JPEG, GIF
+ou WebP, conferidos contra o número mágico do tipo, 8 MiB cada. Só os anexos e as imagens
+contam para `Vorcall__AttachmentsMaxBytes`; um arquivo por streaming não ocupa disco nenhum
+aqui.
 
 ### Onde ficam os dados
 
-Cinco volumes Docker, todos criados no primeiro `up -d`:
+Os volumes Docker, todos criados no primeiro `up -d`:
 
 | Volume | Contém | Fazer backup? |
 | --- | --- | --- |
 | `pgdata` | Contas, mensagens, canais, cargos — tudo | **Sim** |
 | `data` | A chave de porta e a chave de assinatura geradas | **Sim** |
-| `attachments` | Imagens enviadas, avatares, banners, ícones | **Sim** |
+| `attachments` | Arquivos enviados, avatares, banners, ícones | **Sim** |
 | `logs` | Logs JSON diários | Não |
 | `diagnostics` | Relatórios de problema dos clientes | Não |
 | `releases` | Versões assinadas do cliente, se você publicar alguma | Se usar |
@@ -410,10 +429,12 @@ nuvem. Teste com `nc -u -z -v <seu-servidor> 5005` de outra máquina.
 O kernel cortou os buffers de socket do relay. Aplique os
 [ajustes de sysctl](#buffers-do-kernel) e reinicie o backend.
 
-**Os uploads falham por volta de 1 MB.**
-O proxy reverso está aplicando o limite padrão de corpo. Os locations
-`/api/attachments` e `/api/images` precisam do próprio `client_max_body_size 9m` e de
-proxy sem buffer.
+**Os uploads falham por volta de 1 MB, ou os maiores falham em 9 MB.**
+O proxy reverso está aplicando um limite de corpo. Os locations `/api/attachments`,
+`/api/images` e `/api/streams` precisam cada um do seu próprio `client_max_body_size` —
+2 GiB, 9 MB e sem limite, respectivamente — e de proxy sem buffer. Uma configuração escrita
+antes da 0.6.0 limita todos eles a `9m`, o que barra todo anexo acima disso e todo arquivo
+por streaming.
 
 **O compartilhamento de tela começa e para na hora, no Linux.**
 O cliente precisa do PipeWire (`libpipewire-0.3.so.0`) e de um portal de desktop. Todo

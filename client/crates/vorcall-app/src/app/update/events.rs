@@ -5,29 +5,38 @@
 //! events are routed to the module that owns that area.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use iced::Task;
 use iced::widget::{Id, operation, scrollable};
 use vorcall_core::connection::Blob;
-use vorcall_core::permissions;
 use vorcall_core::{
-    ChannelKind, ChatMessage, Command, DisconnectReason, ErrorCode, Event, ReadState,
+    ChannelKind, ChatMessage, Command, DisconnectReason, ErrorCode, Event, ReadState, StreamedFile,
+    Verdict,
 };
+use vorcall_core::{permissions, registry, streams};
 
-use crate::app::message::{AdminMsg, Message, ToastKind};
-use crate::app::state::chat::{self, Current, ImageState, MESSAGE_LIMIT, MainView};
+use crate::app::message::{AdminMsg, ChatMsg, Message, ToastKind};
+use crate::app::state::chat::{self, Current, ImageState, MESSAGE_LIMIT, MainView, PendingStream};
 use crate::app::state::rules::{
     addressed_to_me, mention_counts, notification_body, notification_rule, pending_channel_name,
     plain_text, unread_rule,
 };
 use crate::app::state::server::{ServerModel, channel_kind};
 use crate::app::state::settings::ServerTab;
-use crate::app::state::ui::{Dialog, Route};
+use crate::app::state::ui::{Dialog, Route, TransferState};
+// The two named rather than the module: `chat` is already the state module here.
+use crate::app::update::chat::{advance_dialog, finish_dialog};
 use crate::app::update::{admin, channels, check, settings, share, voice};
 use crate::app::{App, MainState, Status, decode_task};
 use crate::view;
 use crate::workers::images::{self, ImageKey};
 use crate::workers::notify;
+
+/// What the server records when this client will not serve a range after all.
+/// A short phrase and nothing else: never a path out of the sender's own file
+/// system.
+const DECLINE_GONE: &str = "file gone";
 
 pub fn update(app: &mut App, event: Event) -> Task<Message> {
     // The reasons that end the session for good replace the whole screen, so they
@@ -447,7 +456,7 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
                 tracing::debug!(request_id, "ignoring an upload nothing is waiting for");
                 return Task::none();
             };
-            main.chat.composer.uploading = main.chat.composer.uploading.saturating_sub(1);
+            main.chat.composer.finish_transfer(request_id);
             if main.chat.current.is(pending.channel_id) {
                 main.chat.composer.attachments.push(attachment);
             } else {
@@ -464,7 +473,7 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
             if let Some(main) = app.main_mut()
                 && let Some(pending) = main.pending_uploads.remove(&request_id)
             {
-                main.chat.composer.uploading = main.chat.composer.uploading.saturating_sub(1);
+                main.chat.composer.finish_transfer(request_id);
                 tracing::warn!(
                     file_name = %pending.file_name,
                     channel_id = pending.channel_id,
@@ -508,6 +517,57 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
                 Some(task) => task,
                 None => admin::on_image_upload_failed(app, request_id, error),
             }
+        }
+        Event::StreamOffered { request_id, file } => on_offered(app, request_id, file),
+        Event::StreamOfferFailed { request_id, error } => {
+            if let Some(main) = app.main_mut()
+                && let Some(pending) = main.pending_uploads.remove(&request_id)
+            {
+                main.chat.composer.finish_transfer(request_id);
+                tracing::warn!(
+                    file_name = %pending.file_name,
+                    channel_id = pending.channel_id,
+                    %error,
+                    "a file was not offered"
+                );
+            }
+            app.toast(ToastKind::Error, error);
+            Task::none()
+        }
+        Event::StreamFetched {
+            request_id,
+            id,
+            path,
+        } => {
+            tracing::info!(request_id, id, path = %path.display(), "a streamed file was saved");
+            finish_dialog(app, request_id, TransferState::Done(path));
+            Task::none()
+        }
+        Event::StreamFetchFailed {
+            request_id,
+            id,
+            error,
+        } => {
+            tracing::warn!(request_id, id, %error, "a streamed file was not saved");
+            finish_dialog(app, request_id, TransferState::Failed(error));
+            Task::none()
+        }
+        Event::StreamRequested {
+            stream_id,
+            transfer_id,
+            offset,
+            length,
+        } => on_stream_requested(app, stream_id, transfer_id, offset, length),
+        Event::TransferProgress {
+            request_id,
+            sent,
+            total,
+        } => {
+            if let Some(main) = app.main_mut() {
+                main.chat.composer.advance_transfer(request_id, sent);
+            }
+            advance_dialog(app, request_id, sent, total);
+            Task::none()
         }
         Event::SendDropped => {
             app.toast(ToastKind::Error, "Not connected".to_owned());
@@ -755,6 +815,159 @@ fn refused_join(code: i32) -> bool {
     ]
     .iter()
     .any(|known| *known as i32 == code)
+}
+
+/// One offer the server wrote down: the composer carries it, and the registry
+/// records which local file it is served from.
+fn on_offered(app: &mut App, request_id: u64, file: StreamedFile) -> Task<Message> {
+    let Some(main) = app.main_mut() else {
+        return Task::none();
+    };
+    let Some(pending) = main.pending_uploads.remove(&request_id) else {
+        tracing::debug!(request_id, "ignoring an offer nothing is waiting for");
+        return Task::none();
+    };
+    main.chat.composer.finish_transfer(request_id);
+
+    if !main.chat.current.is(pending.channel_id) {
+        // Never linked to a message, so the server sweeps it; nothing is on the
+        // server's disk to take back.
+        tracing::debug!(
+            id = file.id,
+            channel_id = pending.channel_id,
+            "dropping an offer for a channel no longer being written in"
+        );
+        return Task::none();
+    }
+
+    let (id, offered) = (file.id, file.size);
+    main.chat.composer.streams.push(PendingStream {
+        id,
+        file_name: file.file_name,
+        content_type: file.content_type,
+        size: file.size,
+    });
+    let Some(path) = pending.path else {
+        tracing::warn!(
+            id,
+            "an offer with no local file behind it; it cannot be served"
+        );
+        return Task::none();
+    };
+    record_offer(id, path, offered)
+}
+
+/// Writes down which local file one stream id is served from, and what it looked
+/// like at the time. Without the record a restart cannot answer a reader at all:
+/// the offer stands on the server, and only this client knows where the bytes
+/// are.
+///
+/// `offered` is the length the record on the server states. A file that changed
+/// while the offer was in flight is not written down at all: the two records
+/// would already disagree, and a range read out of it is bytes nobody offered.
+fn record_offer(id: i64, path: PathBuf, offered: i64) -> Task<Message> {
+    Task::perform(
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let metadata = std::fs::metadata(&path)?;
+            let size = metadata.len();
+            anyhow::ensure!(
+                i64::try_from(size).is_ok_and(|size| size == offered),
+                "the file changed while it was being offered"
+            );
+            let modified = metadata.modified()?;
+            let mut registry = registry::load();
+            registry.insert(id, path, size, modified);
+            registry::save(&registry)
+        }),
+        move |joined| {
+            match joined.unwrap_or_else(|e| Err(anyhow::Error::msg(e.to_string()))) {
+                Ok(()) => tracing::debug!(id, "an offered file was written down"),
+                // The offer stands and this run can still serve it; a restart
+                // cannot.
+                Err(e) => tracing::warn!(id, error = %e, "cannot record an offered file"),
+            }
+            Message::Noop
+        },
+    )
+}
+
+/// One range of a file this client offered.
+///
+/// The registry is what says which local file the id stands for, and whether it
+/// is still the one that was offered: a file that moved, changed or grew must
+/// never be served, because the same range of a different file is somebody
+/// else's data. Anything short of a match is declined and dropped from the
+/// registry, so no later request retries it.
+fn on_stream_requested(
+    app: &mut App,
+    stream_id: i64,
+    transfer_id: i64,
+    offset: i64,
+    length: i64,
+) -> Task<Message> {
+    let endpoints = app.endpoints.clone();
+    let token = app
+        .session
+        .as_ref()
+        .map(|session| session.access_token.clone());
+
+    Task::perform(
+        async move {
+            let resolved = tokio::task::spawn_blocking(move || {
+                let mut registry = registry::load();
+                match registry.verify(stream_id) {
+                    Verdict::Unchanged(path) => Some(path),
+                    Verdict::Gone => {
+                        if registry.remove(stream_id).is_some()
+                            && let Err(e) = registry::save(&registry)
+                        {
+                            tracing::warn!(stream_id, error = %e, "cannot forget an offered file");
+                        }
+                        None
+                    }
+                }
+            })
+            .await;
+
+            let path = match resolved {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::warn!(stream_id, error = %e, "cannot resolve an offered file");
+                    None
+                }
+            };
+            if let Some(path) = path {
+                return Message::Chat(ChatMsg::ServeStream {
+                    stream_id,
+                    transfer_id,
+                    offset,
+                    length,
+                    path,
+                });
+            }
+
+            tracing::info!(
+                stream_id,
+                transfer_id,
+                "declining a range of a file that is gone"
+            );
+            match token {
+                Some(token) => {
+                    if let Err(e) =
+                        streams::decline(&endpoints, &token, stream_id, transfer_id, DECLINE_GONE)
+                            .await
+                    {
+                        tracing::warn!(stream_id, transfer_id, error = %e, "cannot decline a range");
+                    }
+                }
+                // Without a token the reader waits out the server's own deadline
+                // instead, which is the same answer a moment later.
+                None => tracing::warn!(stream_id, "no session to decline a range with"),
+            }
+            Message::Noop
+        },
+        std::convert::identity,
+    )
 }
 
 /// Caches one transferred image and turns it into pixels off the UI thread.

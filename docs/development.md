@@ -30,7 +30,9 @@ Plus [rustup](https://rustup.rs) (stable, 1.89+ — the floor comes from notify-
 Why each native dependency: ALSA headers for cpal/rodio (capture and playback), PipeWire
 headers and libclang for the screen-capture bindings, a C++ compiler for OpenH264, which
 the `cc` crate builds from vendored sources — no cmake, no nasm. Opus is a pure-Rust port,
-so it adds nothing.
+so it adds nothing. `vorcall-clipboard` adds nothing either: its Wayland backend `dlopen`s
+`libwayland-client` and its X11 backend goes through x11rb, so neither wants a header at
+build time.
 
 **macOS** — Xcode command-line tools and rustup. macOS 13 or newer to run the result;
 screen capture uses ScreenCaptureKit.
@@ -131,13 +133,14 @@ drag-to-Applications DMG the same way CI does; it needs `brew install librsvg` f
 Everything below must pass before a change is done. This is exactly what CI runs.
 
 ```bash
-# Client: format, lint, build, unit tests across all six crates
+# Client: format, lint, build, unit tests across all seven library crates
 cd client
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo build
 cargo test -p vorcall-voice -p vorcall-core -p vorcall-release \
-           -p vorcall-app -p vorcall-hotkey -p vorcall-screen
+           -p vorcall-app -p vorcall-hotkey -p vorcall-screen \
+           -p vorcall-clipboard
 cd ..
 
 # Server: build with warnings as errors, then the full suite
@@ -233,6 +236,7 @@ client/                 Cargo workspace
   vorcall-voice           media engine: framing, AEAD, Opus, jitter buffer, echo cancellation
   vorcall-screen          screen capture backends and the OpenH264 codec
   vorcall-hotkey          system-wide input listener for push-to-talk and friends
+  vorcall-clipboard       reading files and images off the clipboard, one backend per platform
   vorcall-app             the iced GUI, binary `vorcall`
   vorcall-probe           headless oracle for voice, share and updates
   vorcall-release         release signing tool

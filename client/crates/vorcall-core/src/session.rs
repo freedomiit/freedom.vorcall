@@ -64,6 +64,7 @@ impl Session {
 
 /// `None` when the platform exposes no config directory at all.
 pub fn path() -> Option<PathBuf> {
+    // Same load-bearing strings as `config::log_dir` — see that comment.
     directories::ProjectDirs::from("br.com", "freedomit", "vorcall")
         .map(|dirs| dirs.config_dir().join(FILE))
 }

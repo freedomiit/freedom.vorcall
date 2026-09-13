@@ -110,6 +110,7 @@ fn create_fresh(path: &Path) -> io::Result<File> {
 }
 
 fn fallback_dir() -> Result<PathBuf, UpdateError> {
+    // Same load-bearing strings as `config::log_dir` — see that comment.
     directories::ProjectDirs::from("br.com", "freedomit", "vorcall")
         .map(|dirs| dirs.data_local_dir().join("updates"))
         .ok_or_else(|| {

@@ -1,10 +1,11 @@
 namespace Vorcall.Server.Attachments;
 
 // Uploads nothing ever linked are the one kind of attachment no other path deletes: a client
-// that picks an image and then abandons the composer leaves a row and a file behind. Deleting a
+// that picks a file and then abandons the composer leaves a row and a file behind. Deleting a
 // message takes its own attachments with it, so this only ever sees the unlinked ones. Images are
 // the same story with a different reference — a profile, the server row or a role — and are swept
-// on the same schedule.
+// on the same schedule. An attachment row whose bytes never finished arriving waits for the far
+// longer incomplete cutoff instead, since a large upload can still be in flight.
 public sealed class AttachmentSweeper(
     AttachmentStore store,
     ImageStore images,
@@ -26,7 +27,9 @@ public sealed class AttachmentSweeper(
                 try
                 {
                     var now = DateTime.UtcNow;
-                    var removed = await store.SweepUnlinkedAsync(now - AttachmentsOptions.UnlinkedTtl);
+                    var removed = await store.SweepUnlinkedAsync(
+                        now - AttachmentsOptions.UnlinkedTtl,
+                        now - AttachmentsOptions.IncompleteTtl);
                     var removedImages = await images.SweepUnreferencedAsync(
                         AttachmentsOptions.UnlinkedTtl,
                         now,

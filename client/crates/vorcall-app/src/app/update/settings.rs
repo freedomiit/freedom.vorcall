@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 
 use iced::Task;
 use vorcall_core::connection::{AdminCommand, Blob, Command};
-use vorcall_core::images::ImagePurpose;
-use vorcall_core::{Endpoints, Image, Profile, config, diagnostics, report};
+use vorcall_core::images::{self, ImagePurpose};
+use vorcall_core::{Endpoints, Image, Profile, attachments, config, diagnostics, report};
 
 use crate::app::message::{
     AdminMsg, ChannelsMsg, CropMsg, Message, SettingsMsg, ToastKind, UiMsg, VoiceMsg,
 };
-use crate::app::state::rules::describe;
+use crate::app::state::rules::{IMAGE_TOO_LARGE, NOT_AN_IMAGE, describe};
 use crate::app::state::settings::{
     OverviewDraft, ProfileDraft, ReportState, ServerTab, SettingsTab, ThemeDraft, ThemeEntry,
     image_sentinel,
@@ -500,7 +500,21 @@ fn read_file(path: &Path) -> Result<(String, Vec<u8>), String> {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("image")
         .to_owned();
+    // Asked before the read: nothing the server would refuse belongs in memory,
+    // and a picked file is only bounded by the disk it came off.
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read that file: {e}"))?
+        .len();
+    if size > images::MAX_BYTES {
+        return Err(IMAGE_TOO_LARGE.to_owned());
+    }
+
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read that file: {e}"))?;
+    // The dialog's extension filter is advisory: a renamed file passes it, and
+    // the magic number is what the server judges these bytes by.
+    if attachments::sniff_image(&bytes).is_none() {
+        return Err(NOT_AN_IMAGE.to_owned());
+    }
     Ok((name, bytes))
 }
 
@@ -526,7 +540,7 @@ pub fn upload_cropped(
     if main.send_command(Command::UploadImage {
         request_id,
         purpose,
-        content_type,
+        content_type: content_type.to_owned(),
         bytes,
     }) {
         main.settings.pending.insert(request_id, purpose);

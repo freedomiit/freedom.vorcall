@@ -325,8 +325,13 @@ fn submit(app: &mut App) -> Task<Message> {
                 Command::Admin(AdminCommand::SetNickname { user_id, nickname }),
             )
         }
-        // Nothing to submit: these are read, not filled in.
-        Dialog::Image(_) | Dialog::InviteCreated { .. } | Dialog::Action(_) => Task::none(),
+        // Nothing to submit: these are read, not filled in. A transfer is not
+        // even a form — its own controls cancel it or open what landed, and the
+        // bytes are counted into it in place.
+        Dialog::Image(_)
+        | Dialog::InviteCreated { .. }
+        | Dialog::Transfer { .. }
+        | Dialog::Action(_) => Task::none(),
     }
 }
 

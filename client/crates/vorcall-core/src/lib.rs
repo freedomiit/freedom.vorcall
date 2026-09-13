@@ -17,8 +17,11 @@ pub mod http;
 pub mod images;
 pub mod mentions;
 pub mod permissions;
+pub mod registry;
 pub mod report;
 pub mod session;
+pub mod streams;
+mod transfer;
 pub mod update;
 
 pub use config::{Config, Density, Entrance};
@@ -26,9 +29,11 @@ pub use connection::{Command, DisconnectReason, Event, MediaKey};
 pub use endpoints::Endpoints;
 pub use http::ApiFailure;
 pub use images::ImagePurpose;
+pub use registry::{Registry, Verdict};
 pub use session::Session;
+pub use streams::StreamError;
 pub use vorcall_proto::v1::{
     Attachment, Ban, Category, Channel, ChannelKind, ChannelPosition, ChatMessage, ErrorCode,
     Image, Invite, InviteCreated, MessagePage, Override, Permission, Profile, Reaction, ReadState,
-    ReplyRef, Role, Server, ServerSnapshot, TokenResponse, VoiceMember,
+    ReplyRef, Role, Server, ServerSnapshot, StreamedFile, TokenResponse, VoiceMember,
 };

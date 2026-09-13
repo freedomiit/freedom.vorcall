@@ -7,10 +7,11 @@ using Vorcall.Server.Permissions;
 
 namespace Vorcall.Server.Api;
 
-// Avatars, banners, the server icon and role icons. Same door key, bearer, content types, size cap,
-// magic check, storage quota and upload rate limit as an attachment; what differs is the purpose
-// the upload declares, which is what decides the permission it needs, and that any bearer may read
-// any image back.
+// Avatars, banners, the server icon and role icons. Same door key, bearer, storage quota and
+// upload rate limit as an attachment, but where an attachment takes any file up to 2 GiB this
+// takes four image types, magic-checked, up to 8 MiB. What else differs is the purpose the upload
+// declares, which is what decides the permission it needs, and that any bearer may read any image
+// back.
 public static class ImagesEndpoints
 {
     private const string PurposeField = "purpose";
@@ -64,7 +65,7 @@ public static class ImagesEndpoints
         // are case-insensitive while the store's table is lower case.
         if (!MediaTypeHeaderValue.TryParse(context.Request.ContentType, out var parsedContentType)
             || parsedContentType.MediaType.Value is not { } declaredType
-            || !AttachmentsOptions.TryExtension(declaredType.ToLowerInvariant(), out _))
+            || !AttachmentsOptions.TryImageExtension(declaredType.ToLowerInvariant(), out _))
         {
             return ProtobufBody.Fail(StatusCodes.Status415UnsupportedMediaType, AttachmentsEndpoints.UnsupportedTypeDetail);
         }
@@ -78,16 +79,17 @@ public static class ImagesEndpoints
             return ProtobufBody.Fail(StatusCodes.Status411LengthRequired, AttachmentsEndpoints.LengthRequiredDetail);
         }
 
-        if (declaredLength > AttachmentsOptions.MaxFileBytes)
+        if (declaredLength > AttachmentsOptions.ImageMaxFileBytes)
         {
             return ProtobufBody.Fail(StatusCodes.Status413PayloadTooLarge, AttachmentsEndpoints.TooLargeDetail);
         }
 
-        // Kestrel's own 30 MB cap would answer a lying Content-Length with its generic 413; one
-        // byte past the limit lets the store see the overrun first and answer in protobuf.
+        // Kestrel's default body limit (30 MB) sits well above the 8 MiB image cap, so a lying
+        // Content-Length would reach that generic 413 instead of ours; one byte past our own cap
+        // lets the store see the overrun first and answer in protobuf.
         if (context.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } bodySize)
         {
-            bodySize.MaxRequestBodySize = AttachmentsOptions.MaxFileBytes + 1;
+            bodySize.MaxRequestBodySize = AttachmentsOptions.ImageMaxFileBytes + 1;
         }
 
         var outcome = await store.SaveAsync(

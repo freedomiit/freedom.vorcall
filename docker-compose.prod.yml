@@ -50,8 +50,11 @@ services:
       # (releases/<version>/…, releases/manifest.json, releases/manifest.sig); served
       # by /api/updates/*. Read-only: the workflow writes, the backend only reads.
       - ./releases:/releases:ro
-      # image attachments uploaded through /api/attachments; written by the
-      # backend, so not read-only. Quota is Vorcall__AttachmentsMaxBytes.
+      # files uploaded through /api/attachments and /api/images; written by the
+      # backend, so not read-only. An attachment may be any type, up to 2 GiB;
+      # the total is bounded by Vorcall__AttachmentsMaxBytes, default 200 GiB.
+      # That is a quota, not a reservation — this host's disk must be able to
+      # grow that far, or lower it in .env. Streamed files are proxied, not stored.
       - ./attachments:/attachments
       # daily JSON logs written by the backend, kept 31 days by the server itself
       - ./logs:/logs

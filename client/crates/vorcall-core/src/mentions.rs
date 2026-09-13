@@ -1,6 +1,7 @@
-//! The mention tokens of a message text: the `<@id>` form that names one user,
-//! the literal `@everyone` / `@here` words that name a whole channel, and the
-//! fixed reaction palette the composer offers.
+//! What a message text carries beyond its characters: the `<@id>` form that
+//! names one user, the literal `@everyone` / `@here` words that name a whole
+//! channel, the links the view makes clickable, and the fixed reaction palette
+//! the composer offers.
 
 /// The two words that name everyone in a channel. They stay literal text on the
 /// wire; the server reads them the same way and only honours them for a sender
@@ -128,14 +129,22 @@ pub fn mentions_here(text: &str) -> bool {
     contains_literal(text, HERE)
 }
 
-/// One run of a message text: plain characters, a mention to render, or one of
-/// the two channel-wide words.
+/// One run of a message text: plain characters, a mention to render, one of the
+/// two channel-wide words, or a link.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Segment {
     Text(String),
-    Mention { user_id: i64, username: String },
+    Mention {
+        user_id: i64,
+        username: String,
+    },
     Everyone,
     Here,
+    /// An `http`/`https` URL exactly as it was written. Nothing else is ever a
+    /// link: message text is whatever a sender typed, and a `file:` or
+    /// `javascript:` URL the reader can click is a way to hand them something
+    /// they never asked for.
+    Link(String),
 }
 
 /// Splits a stored text into the runs the message view draws.
@@ -175,6 +184,15 @@ pub fn segments(text: &str, users: &[(i64, String)]) -> Vec<Segment> {
             continue;
         }
 
+        if let Some(url) = link_at(rest, previous) {
+            flush(&mut pending, &mut out);
+            previous = url.chars().next_back();
+            let len = url.len();
+            out.push(Segment::Link(url.to_owned()));
+            rest = &rest[len..];
+            continue;
+        }
+
         pending.push(ch);
         previous = Some(ch);
         rest = &rest[ch.len_utf8()..];
@@ -199,6 +217,78 @@ fn parse_token(text: &str) -> Option<(i64, usize)> {
     }
     let id = digits.parse().ok()?;
     Some((id, digits.len() + 3))
+}
+
+/// The two schemes a link may carry, and the only two: a reader clicks these,
+/// so nothing that reaches the file system or runs anything is ever one.
+const SCHEMES: [&str; 2] = ["https://", "http://"];
+
+/// The URL `rest` opens with, if it opens with one.
+///
+/// A link starts at the beginning of the text, after whitespace, or after an
+/// opening bracket or quote, and it always carries its scheme: a bare
+/// `www.example.com` is text, which keeps the rule small enough to be sure of.
+/// It runs to the first whitespace, angle bracket or quote — `<` ends it, so a
+/// mention written straight after one stays a mention — and then gives back the
+/// punctuation a sentence put after it.
+fn link_at(rest: &str, previous: Option<char>) -> Option<&str> {
+    if !previous.is_none_or(opens_a_link) {
+        return None;
+    }
+    let scheme = SCHEMES.iter().find(|scheme| {
+        rest.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    })?;
+
+    let end = rest
+        .char_indices()
+        .find(|(_, character)| !url_char(*character))
+        .map_or(rest.len(), |(at, _)| at);
+    let url = trim_trailing(&rest[..end]);
+
+    // A scheme and nothing after it is not a link.
+    (url.len() > scheme.len()).then_some(url)
+}
+
+/// What may sit right before a link: a sentence's space, or the bracket or
+/// quote the sentence put it inside.
+fn opens_a_link(previous: char) -> bool {
+    previous.is_whitespace() || matches!(previous, '(' | '[' | '{' | '<' | '"' | '\'')
+}
+
+/// Whether a character can still be part of a URL. The angle brackets and the
+/// quotes are what a text wraps a URL in, never part of one.
+fn url_char(character: char) -> bool {
+    !character.is_whitespace()
+        && !character.is_control()
+        && !matches!(character, '<' | '>' | '"' | '`')
+}
+
+/// Gives back the punctuation that ended the sentence rather than the URL.
+///
+/// A closing bracket only goes when the URL did not open one itself, so
+/// `(https://example.com/a)` loses its bracket while a Wikipedia
+/// `..._(disambiguation)` keeps its own.
+fn trim_trailing(url: &str) -> &str {
+    let mut url = url;
+    while let Some(last) = url.chars().next_back() {
+        let drop = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
+            ')' => count(url, ')') > count(url, '('),
+            ']' => count(url, ']') > count(url, '['),
+            '}' => count(url, '}') > count(url, '{'),
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        url = &url[..url.len() - last.len_utf8()];
+    }
+    url
+}
+
+fn count(text: &str, character: char) -> usize {
+    text.chars().filter(|found| *found == character).count()
 }
 
 /// Whether the message names `me`, which is what turns a row into a highlight.
@@ -383,6 +473,169 @@ mod tests {
                 "{text} is plain text"
             );
         }
+    }
+
+    #[test]
+    fn a_bare_url_is_one_link() {
+        assert_eq!(
+            segments("https://example.com", &users()),
+            vec![Segment::Link("https://example.com".to_owned())]
+        );
+        assert_eq!(
+            segments("http://example.com/a/b", &users()),
+            vec![Segment::Link("http://example.com/a/b".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_url_keeps_the_sentence_punctuation_out() {
+        assert_eq!(
+            segments("see https://example.com/a.", &users()),
+            vec![
+                Segment::Text("see ".to_owned()),
+                Segment::Link("https://example.com/a".to_owned()),
+                Segment::Text(".".to_owned()),
+            ]
+        );
+        assert_eq!(
+            segments("https://example.com/a, then", &users()),
+            vec![
+                Segment::Link("https://example.com/a".to_owned()),
+                Segment::Text(", then".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_url_in_parentheses_keeps_the_bracket_out() {
+        assert_eq!(
+            segments("(https://example.com/b)", &users()),
+            vec![
+                Segment::Text("(".to_owned()),
+                Segment::Link("https://example.com/b".to_owned()),
+                Segment::Text(")".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_url_keeps_the_brackets_it_opened_itself() {
+        let url = "https://en.wikipedia.org/wiki/Vorcall_(disambiguation)";
+        assert_eq!(segments(url, &users()), vec![Segment::Link(url.to_owned())]);
+        // The one the sentence added still goes.
+        assert_eq!(
+            segments(&format!("({url})"), &users()),
+            vec![
+                Segment::Text("(".to_owned()),
+                Segment::Link(url.to_owned()),
+                Segment::Text(")".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_query_string_stays_whole() {
+        let url = "https://example.com/search?q=vorcall&lang=pt-BR&page=2";
+        assert_eq!(segments(url, &users()), vec![Segment::Link(url.to_owned())]);
+    }
+
+    #[test]
+    fn only_http_and_https_are_links() {
+        for text in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "vorcall://join/7",
+            "www.example.com",
+            "ftp://example.com/pub",
+            "https://",
+        ] {
+            assert_eq!(
+                segments(text, &users()),
+                vec![Segment::Text(text.to_owned())],
+                "{text} is plain text"
+            );
+        }
+        // A scheme in the middle of a word is not a link either.
+        assert_eq!(
+            segments("xhttps://example.com", &users()),
+            vec![Segment::Text("xhttps://example.com".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_link_and_a_mention_stay_apart() {
+        assert_eq!(
+            segments("<@7> https://example.com/x", &users()),
+            vec![
+                Segment::Mention {
+                    user_id: 7,
+                    username: "ana".to_owned()
+                },
+                Segment::Text(" ".to_owned()),
+                Segment::Link("https://example.com/x".to_owned()),
+            ]
+        );
+        assert_eq!(
+            segments("https://example.com/x <@7>", &users()),
+            vec![
+                Segment::Link("https://example.com/x".to_owned()),
+                Segment::Text(" ".to_owned()),
+                Segment::Mention {
+                    user_id: 7,
+                    username: "ana".to_owned()
+                },
+            ]
+        );
+        // A mention written straight after a URL is still a mention: `<` ends
+        // the URL.
+        assert_eq!(
+            segments("https://example.com/x<@7>", &users()),
+            vec![
+                Segment::Link("https://example.com/x".to_owned()),
+                Segment::Mention {
+                    user_id: 7,
+                    username: "ana".to_owned()
+                },
+            ]
+        );
+        // And what looks like a channel word inside a URL is part of the URL.
+        assert_eq!(
+            segments("https://example.com/@everyone", &users()),
+            vec![Segment::Link("https://example.com/@everyone".to_owned())]
+        );
+    }
+
+    #[test]
+    fn text_without_a_url_is_untouched() {
+        for text in [
+            "nothing here",
+            "a http b",
+            "ratio 3:1",
+            "email@everyone.com",
+        ] {
+            assert_eq!(
+                segments(text, &users()),
+                vec![Segment::Text(text.to_owned())],
+                "{text} is plain text"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_may_carry_a_non_ascii_path() {
+        assert_eq!(
+            segments("veja https://example.com/café.", &users()),
+            vec![
+                Segment::Text("veja ".to_owned()),
+                Segment::Link("https://example.com/café".to_owned()),
+                Segment::Text(".".to_owned()),
+            ]
+        );
+        let cyrillic = "https://пример.рф/путь";
+        assert_eq!(
+            segments(cyrillic, &users()),
+            vec![Segment::Link(cyrillic.to_owned())]
+        );
     }
 
     #[test]

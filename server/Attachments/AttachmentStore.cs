@@ -13,7 +13,10 @@ public sealed record StoreOutcome(StoreOutcome.Kind Status, Protocol.Attachment?
         Stored,
         TooLarge,
         QuotaExceeded,
-        NotAnImage,
+
+        // The declared media type is not one this server can record: any type is accepted, a
+        // header that is not a type/subtype at all is not.
+        BadContentType,
         Truncated,
 
         // The upload was fine and this server could not write it down.
@@ -34,30 +37,48 @@ public sealed class AttachmentStore(
     ServerMetrics metrics,
     ILogger<AttachmentStore> logger)
 {
-    public const int MaxFileNameLength = 128;
+    // Matches attachments.file_name, varchar(255).
+    public const int MaxFileNameLength = 255;
 
     private const int CopyBufferBytes = 64 * 1024;
     private const string PartSuffix = ".part";
 
-    public string PathFor(long id, string contentType)
+    // What an upload that named no file is called; an attachment is any file, so nothing here
+    // pretends it is a picture.
+    private const string FallbackFileName = "file.bin";
+
+    // <dir>/<id>.bin, where everything written from now on goes. The stored name depends on the
+    // row id alone and not on the type the client declared, which is exactly what lets an
+    // attachment be any file at all.
+    public string PathFor(long id) => PathWithExtension(id, AttachmentsOptions.StoredExtension);
+
+    // The path a row's bytes are actually under. Until 0.6.0 an attachment was stored as
+    // <id>.<ext> with the extension derived from its content type, so a row written before then
+    // still points at that name and neither a download nor a delete may miss it. Falls back to the
+    // current name when neither file is there, so a caller's "no file on disk" branch still fires.
+    public string ExistingPathFor(long id, string contentType)
     {
-        if (!AttachmentsOptions.TryExtension(contentType, out var ext))
+        var path = PathFor(id);
+        if (File.Exists(path))
         {
-            throw new ArgumentException($"Unsupported attachment content type '{contentType}'.", nameof(contentType));
+            return path;
         }
 
-        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.Dir));
-        var path = Path.GetFullPath(Path.Combine(root, $"{id}.{ext}"));
-
-        // Ids are numbers and the extension is one of four literals, so there is no traversal to
-        // filter out; this is the assertion that keeps it that way.
-        if (Path.GetDirectoryName(path) != root)
+        if (AttachmentsOptions.TryImageExtension(contentType, out var ext))
         {
-            throw new InvalidOperationException("Attachment path escaped the attachments directory.");
+            var legacy = PathWithExtension(id, ext);
+            if (File.Exists(legacy))
+            {
+                return legacy;
+            }
         }
 
         return path;
     }
+
+    // Kept for callers that hold a whole row rather than an id; they get the resolved name, since
+    // a row is exactly what says which of the two a file could be under.
+    public string PathFor(long id, string contentType) => ExistingPathFor(id, contentType);
 
     // Images share this quota (Vorcall:AttachmentsMaxBytes), so both tables count towards it.
     public async Task<long> TotalBytesAsync()
@@ -77,9 +98,11 @@ public sealed class AttachmentStore(
         Stream body,
         CancellationToken ct)
     {
-        if (!AttachmentsOptions.TryExtension(contentType, out var ext))
+        // Any type, as long as it is a type: the bytes are never interpreted, so the only thing
+        // that could be wrong with the declaration is its shape.
+        if (!AttachmentsOptions.IsValidMediaType(contentType))
         {
-            return StoreOutcome.Rejected(StoreOutcome.Kind.NotAnImage);
+            return StoreOutcome.Rejected(StoreOutcome.Kind.BadContentType);
         }
 
         if (declaredLength > AttachmentsOptions.MaxFileBytes)
@@ -101,30 +124,30 @@ public sealed class AttachmentStore(
 
         await using var db = await contexts.CreateDbContextAsync();
 
-        // The row is written first because the id names the file.
+        // The row is written first because the id names the file, and stays incomplete until the
+        // bytes are under that name.
         var row = new Data.Attachment
         {
             ChannelId = channelId,
             UploaderId = uploaderId,
             MessageId = null,
-            FileName = SanitizeFileName(fileName, ext),
+            FileName = SanitizeFileName(fileName),
             ContentType = contentType,
             Size = declaredLength,
+            Complete = false,
             CreatedAt = DateTime.UtcNow,
         };
 
         db.Attachments.Add(row);
         await db.SaveChangesAsync(ct);
 
-        var path = PathFor(row.Id, contentType);
+        var path = PathFor(row.Id);
         var partPath = path + PartSuffix;
         StoreOutcome.Kind? failure = null;
         try
         {
             Directory.CreateDirectory(options.Dir);
 
-            var header = new byte[AttachmentsOptions.MagicLength];
-            var headerLength = 0;
             var written = 0L;
 
             // Written to a .part name and renamed at the end, so a file under the final name is
@@ -161,26 +184,8 @@ public sealed class AttachmentStore(
                         break;
                     }
 
-                    if (headerLength < header.Length)
-                    {
-                        var copied = Math.Min(header.Length - headerLength, read);
-                        buffer.AsSpan(0, copied).CopyTo(header.AsSpan(headerLength));
-                        headerLength += copied;
-                        if (headerLength == header.Length && !AttachmentsOptions.MatchesMagic(contentType, header))
-                        {
-                            failure = StoreOutcome.Kind.NotAnImage;
-                            break;
-                        }
-                    }
-
                     await file.WriteAsync(buffer.AsMemory(0, read), ct);
                 }
-            }
-
-            // A body too short to carry a magic number is not one of the four types either.
-            if (failure is null && headerLength < header.Length)
-            {
-                failure = StoreOutcome.Kind.NotAnImage;
             }
 
             if (failure is null && written != declaredLength)
@@ -200,7 +205,7 @@ public sealed class AttachmentStore(
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // The caller sent a perfectly good image and the disk refused it, so this is not a
+            // The caller sent a perfectly good file and the disk refused it, so this is not a
             // rejected upload: it is this server failing, and the only line that says so.
             logger.LogError(ex, "Attachment {AttachmentId} could not be written to storage", row.Id);
             failure = StoreOutcome.Kind.StorageFailed;
@@ -215,6 +220,11 @@ public sealed class AttachmentStore(
             await db.SaveChangesAsync(CancellationToken.None);
             return StoreOutcome.Rejected(rejected);
         }
+
+        // Only after the rename, so the flag is true exactly when the bytes are on disk under the
+        // final name. Not ct, for the same reason the removal above is not.
+        row.Complete = true;
+        await db.SaveChangesAsync(CancellationToken.None);
 
         logger.LogDebug(
             "Attachment {AttachmentId} stored for {UserId} in {ChannelId} ({SizeBytes} bytes)",
@@ -241,8 +251,17 @@ public sealed class AttachmentStore(
     }
 
     // Best effort by design: the rows are already gone, and a file left behind is disk to
-    // reclaim, not a correctness problem.
-    public void DeleteFiles(IEnumerable<(long Id, string ContentType)> rows) => DeleteFiles(PathsFor(rows));
+    // reclaim, not a correctness problem. The .part sibling goes too, because this is the overload
+    // the sweeper uses and an incomplete row's bytes are under exactly that name — once its row is
+    // gone nothing is left to find them by.
+    public void DeleteFiles(IEnumerable<(long Id, string ContentType)> rows)
+    {
+        foreach (var path in PathsFor(rows))
+        {
+            TryDeleteFile(path);
+            TryDeleteFile(path + PartSuffix);
+        }
+    }
 
     public void DeleteFiles(IEnumerable<string> paths)
     {
@@ -253,29 +272,30 @@ public sealed class AttachmentStore(
     }
 
     // The paths of rows whose database entries are about to go, or have just gone through a
-    // cascade: a caller that can no longer read a content type keeps the names instead.
+    // cascade: a caller that can no longer read a content type keeps the names instead. Resolved
+    // rather than built, because a row written before 0.6.0 is under the old name and deleting its
+    // row while leaving the file would leak disk with nothing left to find the orphan by.
     public List<string> PathsFor(IEnumerable<(long Id, string ContentType)> rows)
     {
         var paths = new List<string>();
         foreach (var (id, contentType) in rows)
         {
-            if (!AttachmentsOptions.TryExtension(contentType, out _))
-            {
-                continue;
-            }
-
-            paths.Add(PathFor(id, contentType));
+            paths.Add(ExistingPathFor(id, contentType));
         }
 
         return paths;
     }
 
-    public async Task<int> SweepUnlinkedAsync(DateTime olderThan)
+    // Two cutoffs, because the row exists before its bytes do. A complete upload nothing linked is
+    // stale on the caller's short cutoff; an incomplete one may still be streaming — 2 GiB on a
+    // slow link outlives that cutoff easily — so it is only swept once it is past the longer one.
+    public async Task<int> SweepUnlinkedAsync(DateTime olderThan, DateTime incompleteOlderThan)
     {
         await using var db = await contexts.CreateDbContextAsync();
         var stale = await db.Attachments
             .AsNoTracking()
-            .Where(a => a.MessageId == null && a.CreatedAt < olderThan)
+            .Where(a => a.MessageId == null
+                && ((a.Complete && a.CreatedAt < olderThan) || (!a.Complete && a.CreatedAt < incompleteOlderThan)))
             .Select(a => new { a.Id, a.ContentType })
             .ToListAsync();
         if (stale.Count == 0)
@@ -297,17 +317,20 @@ public sealed class AttachmentStore(
             .ToListAsync();
 
         DeleteFiles(stale.Where(a => !survivors.Contains(a.Id)).Select(a => (a.Id, a.ContentType)));
-        logger.LogDebug("Swept {Count} unlinked attachments older than {Cutoff}", deleted, olderThan);
+        logger.LogDebug(
+            "Swept {Count} unlinked attachments: complete ones older than {Cutoff}, incomplete ones older than {IncompleteCutoff}",
+            deleted,
+            olderThan,
+            incompleteOlderThan);
         return deleted;
     }
 
     // Metadata only: the name is echoed to clients and never used to build a path.
-    public static string SanitizeFileName(string? raw, string ext)
+    public static string SanitizeFileName(string? raw)
     {
-        var fallback = $"image.{ext}";
         if (string.IsNullOrWhiteSpace(raw))
         {
-            return fallback;
+            return FallbackFileName;
         }
 
         var builder = new StringBuilder(MaxFileNameLength);
@@ -329,7 +352,23 @@ public sealed class AttachmentStore(
         }
 
         var name = builder.ToString().Trim();
-        return name.Length == 0 ? fallback : name;
+        return name.Length == 0 ? FallbackFileName : name;
+    }
+
+    private string PathWithExtension(long id, string ext)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.Dir));
+        var path = Path.GetFullPath(Path.Combine(root, $"{id}.{ext}"));
+
+        // Ids are numbers and the extension is one of five literals — the stored one, or one of
+        // the four a pre-0.6.0 row could have been written under — so there is no traversal to
+        // filter out; this is the assertion that keeps it that way.
+        if (Path.GetDirectoryName(path) != root)
+        {
+            throw new InvalidOperationException("Attachment path escaped the attachments directory.");
+        }
+
+        return path;
     }
 
     private void TryDeleteFile(string path)

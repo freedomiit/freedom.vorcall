@@ -16,6 +16,15 @@ internal sealed class ProtoResponse(HttpStatusCode status, IReadOnlyDictionary<s
 
     public string? Header(string name) => headers.TryGetValue(name, out var value) ? value : null;
 
+    // A comma-separated header's parts, ordered: the client parses Cache-Control and the like
+    // into typed values and writes them back in its own order, which is none of a test's business.
+    public string[] Parts(string name) =>
+    [
+        .. (Header(name) ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Order(StringComparer.Ordinal),
+    ];
+
     // The ApiError every 4xx/429 of this API carries.
     public string Detail => ApiError.Parser.ParseFrom(Body).Detail;
 
@@ -46,17 +55,25 @@ internal static class Proto
         string? key = ServerFixture.ServerKey)
         => PostBytesAsync(factory, path, body.ToByteArray(), ContentType, bearer, key);
 
+    // A null content type sends no Content-Type header at all — ByteArrayContent supplies none of
+    // its own — which is a request an endpoint may have to answer for. A header that is not a
+    // media type has to go on raw from `configure`, since parsing it here is what a test of that
+    // case is trying to get past.
     public static Task<ProtoResponse> PostBytesAsync(
         VorcallFactory factory,
         string path,
         byte[] body,
-        string contentType,
+        string? contentType,
         string? bearer = null,
         string? key = ServerFixture.ServerKey,
         Action<HttpRequestMessage>? configure = null)
     {
         var content = new ByteArrayContent(body);
-        content.Headers.ContentType = MediaTypeHeaderValue.Parse(contentType);
+        if (contentType is not null)
+        {
+            content.Headers.ContentType = MediaTypeHeaderValue.Parse(contentType);
+        }
+
         return SendAsync(factory, HttpMethod.Post, path, content, bearer, key, configure);
     }
 
