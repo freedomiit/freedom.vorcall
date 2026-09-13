@@ -10,7 +10,7 @@
 //! their own that prints neither.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -372,7 +372,8 @@ pub enum SoundMsg {
 
 impl fmt::Debug for SoundMsg {
     /// A decoded source and a decoded clip are megabytes of samples, and a
-    /// debug file log always exists: how many, never which.
+    /// debug file log always exists: how many, never which. A clip's name is
+    /// somebody's text and never reaches the log either.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OpenPopover(at) => write!(f, "OpenPopover({at:?})"),
@@ -385,13 +386,17 @@ impl fmt::Debug for SoundMsg {
             },
             Self::Pick => f.write_str("Pick"),
             Self::Picked(result) => match result {
-                Ok(path) => write!(f, "Picked({})", path.display()),
+                // The file's own name, never the path it sits at.
+                Ok(path) => {
+                    let name = Path::new(path.file_name().unwrap_or_default());
+                    write!(f, "Picked({})", name.display())
+                }
                 Err(error) => write!(f, "Picked(Err({error}))"),
             },
             Self::Decoded(result) => match result {
-                Ok((name, source)) => write!(
+                Ok((_, source)) => write!(
                     f,
-                    "Decoded({name}, {} ms, {} samples)",
+                    "Decoded(<hidden>, {} ms, {} samples)",
                     source.duration_ms,
                     source.pcm.len()
                 ),

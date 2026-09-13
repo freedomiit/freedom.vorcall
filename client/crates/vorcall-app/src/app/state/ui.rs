@@ -359,7 +359,7 @@ impl fmt::Debug for Dialog {
                 name, source, trim, ..
             } => f
                 .debug_struct("TrimSound")
-                .field("name", name)
+                .field("name_len", &name.len())
                 .field("duration_ms", &source.duration_ms)
                 .field("samples", &source.pcm.len())
                 .field("trim", trim)

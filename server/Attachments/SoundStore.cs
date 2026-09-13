@@ -16,8 +16,11 @@ public sealed record SoundSaveOutcome(SoundSaveOutcome.Kind Status, SoundRecord?
         Saved,
         TooLarge,
 
-        // The name, or the VORCSND1 container, is not what PROTOCOL.md § Sounds describes.
+        // The VORCSND1 container is not what PROTOCOL.md § Sounds describes.
         Malformed,
+
+        // The name is not one the 32-scalar grammar accepts; the container says nothing about it.
+        InvalidName,
         Truncated,
         QuotaExceeded,
 
@@ -89,7 +92,7 @@ public sealed class SoundStore(
     {
         if (!Names.TryNormalize(name, out var normalized))
         {
-            return SoundSaveOutcome.Rejected(SoundSaveOutcome.Kind.Malformed);
+            return SoundSaveOutcome.Rejected(SoundSaveOutcome.Kind.InvalidName);
         }
 
         if (declaredLength > AttachmentsOptions.SoundMaxFileBytes)

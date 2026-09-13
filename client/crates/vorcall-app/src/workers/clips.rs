@@ -153,6 +153,12 @@ pub fn decode(path: &Path) -> Result<Source, String> {
         within_limit(frames_to_ms(pcm.len() / CHANNELS))?;
     }
 
+    // The last partial chunk and the resampler's own delay, which would otherwise
+    // cost the end of a source that was not already 48 kHz.
+    if let Some(resample) = resample.as_mut() {
+        resample.flush(&mut pcm);
+    }
+
     let frames = pcm.len() / CHANNELS;
     if frames == 0 {
         return Err("that file has no audio in it".to_string());
@@ -293,6 +299,12 @@ fn peaks(pcm: &[f32]) -> Vec<(f32, f32)> {
 /// not wait on the others.
 struct Resample {
     inner: Async<f32>,
+    /// 48 kHz frames per source frame: what the tail of a padded last chunk is
+    /// measured against.
+    ratio: f64,
+    /// Source frames taken in, and 48 kHz frames handed back.
+    frames_in: usize,
+    frames_out: usize,
     /// Input frames still waiting for a full chunk.
     pending: Vec<f32>,
     output: Vec<f32>,
@@ -301,8 +313,9 @@ struct Resample {
 impl Resample {
     fn new(rate: u32) -> Result<Self, rubato::ResamplerConstructionError> {
         let chunk = (rate as usize / 50).max(1);
+        let ratio = f64::from(SAMPLE_RATE) / f64::from(rate);
         let inner = Async::<f32>::new_sinc(
-            f64::from(SAMPLE_RATE) / f64::from(rate),
+            ratio,
             1.0,
             &SincInterpolationParameters::default(),
             chunk,
@@ -312,49 +325,85 @@ impl Resample {
         let output = vec![0.0; inner.output_frames_max() * CHANNELS];
         Ok(Self {
             inner,
+            ratio,
+            frames_in: 0,
+            frames_out: 0,
             pending: Vec::with_capacity(chunk * CHANNELS * 2),
             output,
         })
     }
 
     fn push(&mut self, samples: &[f32], out: &mut Vec<f32>) {
+        self.frames_in += samples.len() / CHANNELS;
         self.pending.extend_from_slice(samples);
         loop {
             let frames_in = self.inner.input_frames_next();
-            let needed = frames_in * CHANNELS;
-            if self.pending.len() < needed {
+            if self.pending.len() < frames_in * CHANNELS {
                 return;
             }
-
-            let frames_out = self.output.len() / CHANNELS;
-            let source = match InterleavedSlice::new(&self.pending[..needed], CHANNELS, frames_in) {
-                Ok(source) => source,
-                Err(error) => {
-                    tracing::warn!(%error, "cannot wrap the imported chunk");
-                    self.pending.clear();
-                    return;
-                }
+            let Some(produced) = self.process(frames_in) else {
+                return;
             };
-            let mut target = match InterleavedSlice::new_mut(&mut self.output, CHANNELS, frames_out)
-            {
-                Ok(target) => target,
-                Err(error) => {
-                    tracing::warn!(%error, "cannot wrap the resampler output");
-                    self.pending.clear();
-                    return;
-                }
-            };
-
-            let produced = match self.inner.process_into_buffer(&source, &mut target, None) {
-                Ok((_, produced)) => produced,
-                Err(error) => {
-                    tracing::warn!(%error, "dropping a chunk the resampler refused");
-                    0
-                }
-            };
-
             out.extend_from_slice(&self.output[..produced * CHANNELS]);
-            self.pending.drain(..needed);
+            self.frames_out += produced;
+            self.pending.drain(..frames_in * CHANNELS);
+        }
+    }
+
+    /// The tail: what never filled a chunk, plus the sinc delay the resampler is
+    /// still holding. The last chunk is padded with silence and run, then cut back
+    /// to what the source's own frames are worth, so the padding is not heard as
+    /// silence at the end of the clip.
+    fn flush(&mut self, out: &mut Vec<f32>) {
+        let expected = (self.frames_in as f64 * self.ratio).round() as usize;
+        let mut remaining = expected.saturating_sub(self.frames_out);
+        while remaining > 0 {
+            let frames_in = self.inner.input_frames_next();
+            self.pending.resize(frames_in * CHANNELS, 0.0);
+            let Some(produced) = self.process(frames_in) else {
+                break;
+            };
+            if produced == 0 {
+                break;
+            }
+            let taken = produced.min(remaining);
+            out.extend_from_slice(&self.output[..taken * CHANNELS]);
+            self.frames_out += taken;
+            remaining -= taken;
+            self.pending.clear();
+        }
+        self.pending.clear();
+    }
+
+    /// Runs one chunk out of the head of `pending` into `output`, answering how
+    /// many 48 kHz frames it produced. `None` is a chunk that could not be wrapped
+    /// at all, which is the end of this resampler's usefulness.
+    fn process(&mut self, frames_in: usize) -> Option<usize> {
+        let needed = frames_in * CHANNELS;
+        let frames_out = self.output.len() / CHANNELS;
+        let source = match InterleavedSlice::new(&self.pending[..needed], CHANNELS, frames_in) {
+            Ok(source) => source,
+            Err(error) => {
+                tracing::warn!(%error, "cannot wrap the imported chunk");
+                self.pending.clear();
+                return None;
+            }
+        };
+        let mut target = match InterleavedSlice::new_mut(&mut self.output, CHANNELS, frames_out) {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::warn!(%error, "cannot wrap the resampler output");
+                self.pending.clear();
+                return None;
+            }
+        };
+
+        match self.inner.process_into_buffer(&source, &mut target, None) {
+            Ok((_, produced)) => Some(produced),
+            Err(error) => {
+                tracing::warn!(%error, "dropping a chunk the resampler refused");
+                Some(0)
+            }
         }
     }
 }
@@ -448,6 +497,60 @@ mod tests {
         ] {
             assert!(sample.abs() < 0.05, "the {name} sample is {sample}");
         }
+    }
+
+    /// A 16-bit PCM stereo Wave file of `frames` frames at `rate`, alternating
+    /// sign like [`square`] so nothing about it is quiet.
+    fn wav(rate: u32, frames: usize) -> Vec<u8> {
+        let data_len = frames * CHANNELS * 2;
+        let mut bytes = Vec::with_capacity(44 + data_len);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&(CHANNELS as u16).to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * CHANNELS as u32 * 2).to_le_bytes());
+        bytes.extend_from_slice(&((CHANNELS * 2) as u16).to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for frame in 0..frames {
+            let value: i16 = if frame % 2 == 0 { 16_000 } else { -16_000 };
+            for _ in 0..CHANNELS {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// The import resamples 44.1 kHz to 48 kHz a 20 ms chunk at a time, and the
+    /// last partial chunk plus the sinc delay are the tail a trim to the very end
+    /// of a file would otherwise lose.
+    #[test]
+    fn a_resampled_source_keeps_its_tail() {
+        // Deliberately just short of a whole number of 20 ms chunks: 61 full ones
+        // of 882 frames and 880 frames the old code never fed the resampler at
+        // all, which is 54_682 frames — 1239.95 ms.
+        let rate = 44_100;
+        let frames = 61 * 882 + 880;
+        let path = std::env::temp_dir().join(format!(
+            "vorcall-clips-{}-{:?}.wav",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, wav(rate, frames)).expect("the fixture is written");
+
+        let decoded = decode(&path);
+        let _ = std::fs::remove_file(&path);
+        let decoded = decoded.expect("the fixture decodes");
+
+        assert!(
+            decoded.duration_ms.abs_diff(1240) <= 20,
+            "{} ms for a 1240 ms source",
+            decoded.duration_ms
+        );
     }
 
     /// The fade itself, before any codec sees it: silent at both ends and

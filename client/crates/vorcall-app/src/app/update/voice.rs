@@ -636,6 +636,15 @@ fn voice_state(app: &mut App, channel_id: i64, members: Vec<VoiceMember>) -> Tas
     Task::none()
 }
 
+/// Whether one channel's roster frame is about the session this client is in,
+/// which is what the join and leave motifs are for. `VoiceUi::channel_id` is
+/// never cleared — code after a session ends still reads it — and the server
+/// keeps sending these frames to everybody who may view the channel, so the
+/// intent is what says this client is still there at all.
+fn in_own_session(intent: bool, joined_channel_id: i64, frame_channel_id: i64) -> bool {
+    intent && joined_channel_id == frame_channel_id
+}
+
 fn member_joined(app: &mut App, channel_id: i64, member: VoiceMember) -> Task<Message> {
     let Some(main) = app.main_mut() else {
         return Task::none();
@@ -643,7 +652,8 @@ fn member_joined(app: &mut App, channel_id: i64, member: VoiceMember) -> Task<Me
     let joined = channel_id == main.voice.channel_id;
     // This account's own join never arrives as a frame; the session going live
     // is what stands for it.
-    let arrived = joined && member.user_id != main.member_id;
+    let arrived = in_own_session(main.voice.intent, main.voice.channel_id, channel_id)
+        && member.user_id != main.member_id;
     let peer = joined.then(|| (member.ssrc, main.voice.peer_audio(member.user_id)));
     main.voice.insert_member(channel_id, member);
 
@@ -668,7 +678,8 @@ fn member_left(app: &mut App, channel_id: i64, user_id: i64) -> Task<Message> {
     }
     // This account's own departure is the leave it asked for, not somebody
     // else's: that motif belongs to `leave`.
-    let departed = user_id != main.member_id;
+    let departed = user_id != main.member_id
+        && in_own_session(main.voice.intent, main.voice.channel_id, channel_id);
     // The server dropped this client's own session — a leave from another device, a
     // permission that is gone. Nothing is on the relay any more, so the media path
     // goes with it; the intent stays, and the next connection asks again.
@@ -1179,4 +1190,19 @@ fn peer_audio_map(config: &Config) -> BTreeMap<i64, PeerAudio> {
         .iter()
         .filter_map(|(user_id, audio)| Some((user_id.parse().ok()?, *audio)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client that left General still has General as its `channel_id`, and the
+    /// server still tells it who comes and goes there. None of that is a motif.
+    #[test]
+    fn a_channel_this_client_left_makes_no_motif() {
+        assert!(in_own_session(true, 5, 5));
+        assert!(!in_own_session(false, 5, 5));
+        assert!(!in_own_session(true, 5, 6));
+        assert!(!in_own_session(false, 5, 6));
+    }
 }

@@ -14,8 +14,11 @@ namespace Vorcall.Server.Api;
 // store walks as it streams and never decodes.
 public static class SoundsEndpoints
 {
-    private const string NameField = "name";
     private const string StorageFailedDetail = "sound storage failed";
+
+    // The same spelling UpdateSound answers ERROR_CODE_INVALID_ARGUMENT with, so a client can treat
+    // a name the grammar refuses alike over both paths.
+    internal const string NameField = "name";
 
     internal const string UnsupportedTypeDetail = "sounds must be " + AttachmentsOptions.SoundMediaType;
     internal const string TooLargeDetail = "sounds must be 16 MiB or smaller";
@@ -121,6 +124,8 @@ public static class SoundsEndpoints
                 return ProtobufBody.Fail(StatusCodes.Status413PayloadTooLarge, TooLargeDetail);
             case SoundSaveOutcome.Kind.Malformed:
                 return ProtobufBody.Fail(StatusCodes.Status400BadRequest, MalformedDetail);
+            case SoundSaveOutcome.Kind.InvalidName:
+                return ProtobufBody.Fail(StatusCodes.Status400BadRequest, NameField);
             case SoundSaveOutcome.Kind.IoError:
                 return ProtobufBody.Fail(StatusCodes.Status500InternalServerError, StorageFailedDetail);
             case SoundSaveOutcome.Kind.Truncated:

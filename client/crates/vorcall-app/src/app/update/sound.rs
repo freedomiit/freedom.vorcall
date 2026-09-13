@@ -205,6 +205,10 @@ fn played(app: &mut App, channel_id: i64, user_id: i64, sound_id: i64) -> Task<M
     if !in_joined_channel(app, channel_id) {
         return Task::none();
     }
+    // A second `SoundPlayed` is the cut — `PROTOCOL.md` § Sounds — so whatever the
+    // mixer holds stops now, not whenever the new clip's bytes turn up, and a clip
+    // triggered again starts over.
+    app.send_audio(AudioCommand::StopClip);
     let Some(main) = app.main_mut() else {
         return Task::none();
     };
@@ -244,22 +248,38 @@ async fn fetch_clip(
         .await
         .map_err(|e| e.to_string())?;
 
-    let decoded = match cached {
-        Some(bytes) => tokio::task::spawn_blocking(move || sounds::decode(&bytes)),
-        None => {
-            let downloaded = api::download(&endpoints, &token, sound_id)
-                .await
-                .map_err(|failure| describe(&failure))?;
-            // Stored and decoded in the one hop: the bytes are megabytes, and
-            // handing them over twice would copy them.
-            tokio::task::spawn_blocking(move || {
-                sounds::store(sound_id, &downloaded);
-                sounds::decode(&downloaded)
-            })
-        }
-    };
+    if let Some(bytes) = cached {
+        // A cached file that no longer decodes is a bad local write — an
+        // interrupted `store` leaves a truncated one — and it would fail the same
+        // way for good, so it goes and the bytes come from the server instead.
+        let decoded = tokio::task::spawn_blocking(move || {
+            let decoded = sounds::decode(&bytes);
+            if decoded.is_err() {
+                sounds::forget(sound_id);
+            }
+            decoded
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
-    decoded.await.map_err(|e| e.to_string())?.map(Arc::new)
+        match decoded {
+            Ok(samples) => return Ok(Arc::new(samples)),
+            Err(error) => tracing::debug!(sound_id, %error, "a cached sound was damaged"),
+        }
+    }
+
+    let downloaded = api::download(&endpoints, &token, sound_id)
+        .await
+        .map_err(|failure| describe(&failure))?;
+    // Stored and decoded in the one hop: the bytes are megabytes, and handing
+    // them over twice would copy them.
+    tokio::task::spawn_blocking(move || {
+        sounds::store(sound_id, &downloaded);
+        sounds::decode(&downloaded)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(Arc::new)
 }
 
 /// The samples arrived. A clip the channel has already moved past is dropped

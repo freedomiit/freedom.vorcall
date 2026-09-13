@@ -485,6 +485,7 @@ fn peer_audio<'a>(
             Message::Voice(VoiceMsg::SetPeerVolume(user_id, volume))
         })
         .on_release(Message::Voice(VoiceMsg::PeerVolumeReleased(user_id)))
+        .step(0.05_f32)
         .width(Length::Fill)
         .style(styles::slider(tokens)),
         text(format!("{:.0}%", tuning.volume * 100.0))

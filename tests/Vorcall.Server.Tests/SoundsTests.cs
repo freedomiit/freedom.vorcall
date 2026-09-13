@@ -86,6 +86,23 @@ public sealed class SoundsTests(ServerFixture fixture)
         // A byte after the last frame is not part of the container either.
         var trailing = Container(1).Concat<byte>([0x00]).ToArray();
 
+        // Past the ten-minute ceiling of 30000 frames, which the header alone settles.
+        var tooManyFrames = Container(1);
+        BinaryPrimitives.WriteUInt32LittleEndian(tooManyFrames.AsSpan(14, 4), AttachmentsOptions.SoundMaxFrames + 1u);
+
+        // A frame carrying no packet at all.
+        var emptyFrame = Container(1);
+        BinaryPrimitives.WriteUInt16LittleEndian(emptyFrame.AsSpan(18, 2), 0);
+
+        // One byte past the largest Opus packet the container may hold.
+        var hugeFrame = Container(1);
+        BinaryPrimitives.WriteUInt16LittleEndian(hugeFrame.AsSpan(18, 2), AttachmentsOptions.SoundMaxPacketBytes + 1);
+
+        // Three frames' worth of bytes under a header declaring four: the walk runs out of body
+        // mid-way, so it never lands on the end.
+        var truncatedTail = Container(3);
+        BinaryPrimitives.WriteUInt32LittleEndian(truncatedTail.AsSpan(14, 4), 4);
+
         var bodies = new (string Case, byte[] Body)[]
         {
             ("bad magic", badMagic),
@@ -93,18 +110,60 @@ public sealed class SoundsTests(ServerFixture fixture)
             ("wrong channel count", mono),
             ("non-zero reserved", reserved),
             ("zero frames", noFrames),
+            ("too many frames", tooManyFrames),
+            ("zero-length frame", emptyFrame),
+            ("frame length past the packet ceiling", hugeFrame),
             ("frame length past the end", overrunning),
+            ("truncated tail", truncatedTail),
             ("trailing bytes", trailing),
         };
 
+        // One name for the whole run, so the table below can be looked up in the library by it.
+        var name = $"broken {Names.Token()}";
         foreach (var (label, body) in bodies)
         {
-            var refused = await Uploads.UploadSoundAsync(Server, owner.Access, "broken", body);
+            var refused = await Uploads.UploadSoundAsync(Server, owner.Access, name, body);
             Assert.True(refused.Status == HttpStatusCode.BadRequest, $"{label}: {(int)refused.Status}");
             Assert.Equal(SoundsEndpoints.MalformedDetail, refused.Detail);
         }
 
-        // None of them left a row behind for the library to carry.
+        // None of them left a row behind for the library to carry — neither a broadcast nor the
+        // row the upload writes before it reads the first byte.
+        await party.Client(0).QuietAsync();
+        var contexts = Server.Services.GetRequiredService<IDbContextFactory<Data.AppDbContext>>();
+        await using (var db = await contexts.CreateDbContextAsync())
+        {
+            Assert.Empty(await db.Sounds.AsNoTracking().Where(s => s.Name == name).ToListAsync());
+        }
+    }
+
+    [Fact]
+    public async Task The_upload_refuses_a_name_the_grammar_does_not_accept()
+    {
+        await using var party = await Party.WithOwnerAsync(Server, fixture);
+        var owner = party.Account(0);
+        var body = Container(2);
+
+        // No ?name= at all: a perfectly good container with nothing to call it, which is about the
+        // name and not about the container.
+        var nameless = await Proto.PostBytesAsync(
+            Server,
+            "/api/sounds",
+            body,
+            AttachmentsOptions.SoundMediaType,
+            owner.Access);
+        Assert.Equal(HttpStatusCode.BadRequest, nameless.Status);
+        Assert.Equal(SoundsEndpoints.NameField, nameless.Detail);
+
+        // 33 scalars is one past the grammar's ceiling, and a name of nothing but whitespace
+        // normalises to the empty one.
+        foreach (var refusedName in new[] { new string('a', 33), "   ", string.Empty })
+        {
+            var refused = await Uploads.UploadSoundAsync(Server, owner.Access, refusedName, body);
+            Assert.True(refused.Status == HttpStatusCode.BadRequest, $"'{refusedName.Length}': {(int)refused.Status}");
+            Assert.Equal(SoundsEndpoints.NameField, refused.Detail);
+        }
+
         await party.Client(0).QuietAsync();
     }
 
@@ -343,6 +402,12 @@ public sealed class SoundsTests(ServerFixture fixture)
         await o1.ExpectErrorAsync(ErrorCode.UnknownSound, fatal: false);
         await o1.SendAsync(Frames.DeleteSound(sound.Id + 1_000_000));
         await o1.ExpectErrorAsync(ErrorCode.UnknownSound, fatal: false);
+
+        // A name the grammar refuses is answered as such, not as an unknown clip: the same
+        // "name" the REST upload answers with.
+        await o1.SendAsync(Frames.UpdateSound(sound.Id, string.Empty));
+        var badName = await o1.ExpectErrorAsync(ErrorCode.InvalidArgument, fatal: false);
+        Assert.Equal(SoundsEndpoints.NameField, badName.Detail);
 
         await o1.SendAsync(Frames.UpdateSound(sound.Id, "  renamed  "));
         foreach (var client in party.Clients)

@@ -44,6 +44,17 @@ pub fn store(id: i64, bytes: &[u8]) {
     }
 }
 
+/// Drops one clip from the cache. Best effort, like everything else here: a file
+/// that cannot be removed is only downloaded again next time.
+pub fn forget(id: i64) {
+    let Some(path) = cached_path(id) else {
+        return;
+    };
+    if let Err(e) = std::fs::remove_file(&path) {
+        tracing::debug!(id, error = %e, "cannot drop a cached sound");
+    }
+}
+
 /// The bytes of one cached clip. A miss and an unreadable file are the same
 /// answer: not cached.
 pub fn load(id: i64) -> Option<Vec<u8>> {
@@ -186,6 +197,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.as_deref(), Some(bytes.as_slice()));
+    }
+
+    /// What a damaged cached file gets: the fetch drops it and downloads again.
+    #[test]
+    fn a_forgotten_clip_is_a_miss_again() {
+        let id = -424_244;
+        if cached_path(id).is_none() {
+            return;
+        }
+
+        store(id, &clip_bytes(1));
+        assert!(load(id).is_some());
+        forget(id);
+
+        assert_eq!(load(id), None);
+        // A clip that is not there is not an error either.
+        forget(id);
     }
 
     #[test]
