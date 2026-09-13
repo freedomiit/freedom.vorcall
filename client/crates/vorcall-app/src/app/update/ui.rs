@@ -13,13 +13,13 @@ use vorcall_core::connection::{AdminCommand, Command};
 use crate::app::App;
 use crate::app::message::{
     AdminMsg, AuthMsg, ChannelsMsg, ChatMsg, CropMsg, DragMsg, Message, SettingsMsg, ShareMsg,
-    ToastKind, UiMsg, VoiceMsg,
+    SoundMsg, ToastKind, UiMsg, VoiceMsg,
 };
 use crate::app::state::ui::{
     ContextMenu, Dialog, DialogAction, ProfileCard, Route, SwitchEntry, SwitchTarget,
     rank_switcher, switcher_entries, validate_long, validate_name, wrap_index,
 };
-use crate::app::update::{channels, chat, drag, voice};
+use crate::app::update::{channels, chat, drag, sound, voice};
 use crate::view;
 
 /// What a dialog says when the connection loop is not there to take its command:
@@ -149,6 +149,10 @@ fn escape(app: &mut App) -> Task<Message> {
     if app.ui.context_menu.take().is_some() || app.ui.profile_card.take().is_some() {
         return Task::none();
     }
+    let padded = app.main().is_some_and(|main| main.sound.popover.is_some());
+    if padded {
+        return sound::update(app, SoundMsg::ClosePopover);
+    }
     if app.ui.quick_switcher.open {
         close_switcher(app);
         return Task::none();
@@ -214,6 +218,8 @@ fn submit(app: &mut App) -> Task<Message> {
         // The adjuster owns the crop and the upload that follows it; pressing
         // through is all this dialog had to say.
         Dialog::CropImage { .. } => Task::done(Message::Crop(CropMsg::Apply)),
+        // The same for the trim: the cut and the upload are the soundpad's.
+        Dialog::TrimSound { .. } => Task::done(Message::Sound(SoundMsg::TrimApply)),
         // The diagnostics section owns the upload; this only answered the offer.
         Dialog::CrashReport => Task::done(Message::Settings(SettingsMsg::SendCrashReport)),
         Dialog::CreateChannel {
@@ -295,6 +301,11 @@ fn submit(app: &mut App) -> Task<Message> {
         }
         Dialog::ConfirmDeleteRole { role_id } => {
             Task::done(Message::Admin(AdminMsg::RoleDelete(role_id)))
+        }
+        // The sounds page owns what a deletion does to the row it was being
+        // renamed in; this only asked.
+        Dialog::ConfirmDeleteSound { sound_id } => {
+            Task::done(Message::Sound(SoundMsg::Delete(sound_id)))
         }
         // The message list owns what a deletion does to the row; this only asked.
         Dialog::ConfirmDeleteMessage { message_id } => {

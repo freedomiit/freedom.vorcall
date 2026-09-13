@@ -30,10 +30,13 @@ app. What there is:
 
 - **Text channels and voice channels**, grouped under categories, plus two-person DMs.
 - **Voice** in every voice channel and DM: push-to-talk or voice activation, echo
-  cancellation, noise suppression, per-person volume, priority speaker.
+  cancellation, noise suppression, per-person volume, priority speaker, and sound effects
+  for joining, leaving, muting and deafening.
 - **Screen sharing** — a monitor or a single window, with its audio, watched by everyone
   else in the channel.
-- **Roles and permissions**: 21 of them, with colours, icons and a hierarchy, overridable
+- **A shared soundpad** — short clips anyone may upload once and anyone may fire into a
+  voice channel, played by every client in it.
+- **Roles and permissions**: 23 of them, with colours, icons and a hierarchy, overridable
   per channel and per member.
 - **Messages** with replies, edits, reactions and attachments of any file type — up to
   2 GiB kept on the server, anything larger streamed straight off the sender's machine;

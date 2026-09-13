@@ -198,5 +198,15 @@ internal static class Frames
             },
         };
 
+    public static ClientFrame PlaySound(long channelId, long soundId)
+        => new() { PlaySound = new PlaySound { ChannelId = channelId, SoundId = soundId } };
+
+    public static ClientFrame StopSound(long channelId) => new() { StopSound = new StopSound { ChannelId = channelId } };
+
+    public static ClientFrame UpdateSound(long soundId, string name)
+        => new() { UpdateSound = new UpdateSound { SoundId = soundId, Name = name } };
+
+    public static ClientFrame DeleteSound(long soundId) => new() { DeleteSound = new DeleteSound { SoundId = soundId } };
+
     public static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }

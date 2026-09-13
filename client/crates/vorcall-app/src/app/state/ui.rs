@@ -7,6 +7,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::{Point, Size};
@@ -20,6 +21,10 @@ use crate::app::MainState;
 use crate::app::message::{DragItem, DragSlot, MenuTarget, Message, ToastKind};
 use crate::app::state::crop::{CropDrag, CropState};
 use crate::app::state::settings::{ServerTab, SettingsTab};
+use crate::app::state::sound::{TrimDrag, TrimState};
+// `vorcall_screen::Source` above is a screen to capture; this one is a decoded
+// audio file waiting to be trimmed.
+use crate::workers::clips::Source as ClipSource;
 
 /// How long a toast stays up, and how many are stacked at once.
 pub const TOAST_LIFE: Duration = Duration::from_secs(5);
@@ -170,6 +175,9 @@ pub enum Dialog {
     ConfirmDeleteRole {
         role_id: i64,
     },
+    ConfirmDeleteSound {
+        sound_id: i64,
+    },
     ConfirmDeleteMessage {
         message_id: i64,
     },
@@ -219,6 +227,17 @@ pub enum Dialog {
         crop: CropState,
         /// The pan in flight, while the pointer is down on the frame.
         drag: Option<CropDrag>,
+    },
+    /// Where a picked audio file is cut before it goes up. The whole source is
+    /// held as it was decoded: the trim only names a span of it, and nothing is
+    /// encoded until the user presses through.
+    TrimSound {
+        /// What the clip is called, taken from the file it came off.
+        name: String,
+        source: Arc<ClipSource>,
+        trim: TrimState,
+        /// The edge in flight, while the pointer is down on a handle.
+        drag: Option<TrimDrag>,
     },
     /// What to share, before any capture starts. A system whose own picker
     /// chooses the source has nothing to list here.
@@ -281,6 +300,10 @@ impl fmt::Debug for Dialog {
                 .debug_struct("ConfirmDeleteRole")
                 .field("role_id", role_id)
                 .finish(),
+            Self::ConfirmDeleteSound { sound_id } => f
+                .debug_struct("ConfirmDeleteSound")
+                .field("sound_id", sound_id)
+                .finish(),
             Self::ConfirmDeleteMessage { message_id } => f
                 .debug_struct("ConfirmDeleteMessage")
                 .field("message_id", message_id)
@@ -330,6 +353,16 @@ impl fmt::Debug for Dialog {
                 .field("bytes", &bytes.len())
                 .field("source", source)
                 .field("crop", crop)
+                .finish_non_exhaustive(),
+            // A picked clip is somebody's own: how many samples, never which.
+            Self::TrimSound {
+                name, source, trim, ..
+            } => f
+                .debug_struct("TrimSound")
+                .field("name", name)
+                .field("duration_ms", &source.duration_ms)
+                .field("samples", &source.pcm.len())
+                .field("trim", trim)
                 .finish_non_exhaustive(),
             Self::SharePicker {
                 selected, audio, ..

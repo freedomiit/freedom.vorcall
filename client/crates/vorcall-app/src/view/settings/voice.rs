@@ -14,6 +14,7 @@ use vorcall_core::config::{
 use crate::app::message::{Message, ShareMsg, VoiceMsg};
 use crate::app::state::rules::{self, SYSTEM_DEFAULT, hotkey_sentence};
 use crate::app::state::voice::HotkeyStatus;
+use crate::app::update::voice::VOLUME_MAX;
 use crate::app::{App, MainState};
 use crate::theme::styles;
 use crate::view::settings::{choices, field, section, toggle_row};
@@ -135,6 +136,48 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
                 tokens,
             )],
         ),
+        section(
+            "Sounds",
+            tokens,
+            vec![
+                toggle_row(
+                    "Join and leave sounds",
+                    "A short motif when somebody arrives in or leaves the voice channel you are in.",
+                    config.voice_sounds,
+                    |on| Message::Voice(VoiceMsg::SetVoiceSounds(on)),
+                    tokens,
+                ),
+                toggle_row(
+                    "Mute and deafen sounds",
+                    "A short motif when you flip either of your own two switches.",
+                    config.self_sounds,
+                    |on| Message::Voice(VoiceMsg::SetSelfSounds(on)),
+                    tokens,
+                ),
+                field(
+                    "Sound volume",
+                    volume(
+                        app,
+                        config.sound_volume,
+                        VoiceMsg::SetSoundVolume,
+                        VoiceMsg::SoundVolumeReleased,
+                    ),
+                    Some("How loud those motifs are."),
+                    tokens,
+                ),
+                field(
+                    "Soundpad volume",
+                    volume(
+                        app,
+                        config.soundpad_volume,
+                        VoiceMsg::SetSoundpadVolume,
+                        VoiceMsg::SoundpadVolumeReleased,
+                    ),
+                    Some("How loud a clip somebody plays into the channel is, on this machine."),
+                    tokens,
+                ),
+            ],
+        ),
         share(app, main),
     ]
     .spacing(24)
@@ -224,6 +267,32 @@ fn bitrate<'a>(app: &'a App, kbps: u32) -> Element<'a, Message> {
         .width(METER_WIDTH)
         .style(styles::slider(tokens)),
         text(format!("{kbps} kbps"))
+            .size(TEXT_ROW)
+            .color(tokens.text_secondary),
+    ]
+    .spacing(12)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+/// One of the two sound volumes. Every step of the drag reaches the audio
+/// thread; only its end reaches the disk.
+fn volume<'a>(
+    app: &'a App,
+    value: f32,
+    on_change: fn(f32) -> VoiceMsg,
+    on_release: VoiceMsg,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    row![
+        slider(0.0..=VOLUME_MAX, value, move |value| Message::Voice(
+            on_change(value)
+        ))
+        .step(0.05_f32)
+        .on_release(Message::Voice(on_release))
+        .width(METER_WIDTH)
+        .style(styles::slider(tokens)),
+        text(format!("{:.0}%", value * 100.0))
             .size(TEXT_ROW)
             .color(tokens.text_secondary),
     ]

@@ -143,14 +143,14 @@ Visibility is maintained per member: when a role, override, channel or category 
 
 A `Role` is `{id, name, color, icon_emoji, icon_image_id, position, permissions, hoist, everyone}`. `color` and `accent_color` are `0xRRGGBB` with `0` meaning "none". `position` orders the hierarchy: higher outranks lower. `hoist` asks clients to list the role's members as their own group. At most 100 roles exist, `@everyone` counted among them, so 99 are creatable; a create beyond that is `ERROR_CODE_INVALID_ARGUMENT{"roles"}`.
 
-`@everyone` is the row with `everyone = true`. It sits at position `0`, every member holds it implicitly, it cannot be deleted, and only its `permissions` may be edited — a frame touching its name, colour, icon, hoist or position is `ERROR_CODE_INVALID_ARGUMENT`. Its default permissions are `VIEW_CHANNEL | SEND_MESSAGES | ATTACH_FILES | ADD_REACTIONS | CONNECT | SPEAK | SHARE_SCREEN | CHANGE_NICKNAME`.
+`@everyone` is the row with `everyone = true`. It sits at position `0`, every member holds it implicitly, it cannot be deleted, and only its `permissions` may be edited — a frame touching its name, colour, icon, hoist or position is `ERROR_CODE_INVALID_ARGUMENT`. Its default permissions are `VIEW_CHANNEL | SEND_MESSAGES | ATTACH_FILES | ADD_REACTIONS | CONNECT | SPEAK | SHARE_SCREEN | CHANGE_NICKNAME | SOUNDPAD`.
 
 A member holds any number of further roles (`Profile.role_ids`). The name is painted by the highest-positioned role of that member whose `color` is non-zero; if none has one, the client's default text colour applies.
 
-`Permission` is a bit set (`uint64` on the wire, 21 bits defined). Bits split into two scopes:
+`Permission` is a bit set (`uint64` on the wire, 23 bits defined). Bits split into two scopes:
 
-- **server-scoped** — `MANAGE_SERVER`, `MANAGE_ROLES`, `MANAGE_MEMBERS`, `MANAGE_INVITES`, `KICK_MEMBERS`, `BAN_MEMBERS`, `CHANGE_NICKNAME`. They are held server-wide and **never** appear in an override; an override carrying one has that bit masked away.
-- **channel-scoped** — every other bit: `MANAGE_CHANNELS`, `MANAGE_MESSAGES`, `VIEW_CHANNEL`, `SEND_MESSAGES`, `ATTACH_FILES`, `ADD_REACTIONS`, `MENTION_EVERYONE`, `CONNECT`, `SPEAK`, `SHARE_SCREEN`, `MUTE_MEMBERS`, `DEAFEN_MEMBERS`, `MOVE_MEMBERS`, `PRIORITY_SPEAKER`.
+- **server-scoped** — `MANAGE_SERVER` (1), `MANAGE_ROLES` (4), `MANAGE_MEMBERS` (8), `MANAGE_INVITES` (32), `KICK_MEMBERS` (64), `BAN_MEMBERS` (128), `CHANGE_NICKNAME` (1048576), `MANAGE_SOUNDS` (4194304). They are held server-wide and **never** appear in an override; an override carrying one has that bit masked away.
+- **channel-scoped** — every other bit: `MANAGE_CHANNELS` (2), `MANAGE_MESSAGES` (16), `VIEW_CHANNEL` (256), `SEND_MESSAGES` (512), `ATTACH_FILES` (1024), `ADD_REACTIONS` (2048), `MENTION_EVERYONE` (4096), `CONNECT` (8192), `SPEAK` (16384), `SHARE_SCREEN` (32768), `MUTE_MEMBERS` (65536), `DEAFEN_MEMBERS` (131072), `MOVE_MEMBERS` (262144), `PRIORITY_SPEAKER` (524288), `SOUNDPAD` (2097152).
 
 ### Resolution
 
@@ -364,6 +364,30 @@ The server keeps at most `Vorcall:MaxSharersPerRoom` (default 3) sharers per cha
 
 Sharing and watching are client intent and survive a reconnect the way "in voice" does: after `Welcome` and the new `JoinVoice`/`VoiceReady`, a client that was sharing sends `StartShare` again, and a client that was watching sends `WatchShare` again — the latter only if the watched user is still listed as sharing in the new `VoiceState`.
 
+### Sounds
+
+A **sound** is a short audio clip in one shared library. The library is server-wide: every member sees every clip, there is nothing per member or per channel. The whole of it travels in `ServerSnapshot.sounds`, and `SoundUpserted{sound}` / `SoundDeleted{sound_id}` keep it current — both go to **everyone**, like a role delta.
+
+Playback is entirely client-side. The server broadcasts the fact that a clip was triggered and nothing more: **no media packet type is involved**, the relay never carries a sound, and each client plays its own cached copy of the bytes. The server therefore never learns that a clip finished — a record older than its own `duration_ms` is finished.
+
+- `PlaySound{channel_id, sound_id}` — unknown or invisible channel: non-fatal `ERROR_CODE_UNKNOWN_CHANNEL`. Unknown clip: non-fatal `ERROR_CODE_UNKNOWN_SOUND`. Without `SOUNDPAD` in that channel: non-fatal `ERROR_CODE_PERMISSION_DENIED{"SOUNDPAD"}`. Without a live voice session in it — which a text channel can never have: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Otherwise `SoundPlayed{channel_id, user_id, sound_id}` is broadcast to every member who may view the channel, the caller included — the same audience as `Speaking` — and only a member with a live voice session there plays it.
+- One clip plays per channel. A second `PlaySound` replaces the record and rebroadcasts `SoundPlayed`, and **no `SoundStopped` is sent for a cut**: a `SoundPlayed` means "stop whatever this channel was playing, start this".
+- `StopSound{channel_id}` — unknown or invisible channel: non-fatal `ERROR_CODE_UNKNOWN_CHANNEL`. There is **no voice-session requirement**: stopping is a moderation action, allowed to whoever started the clip, or to any holder of `MANAGE_SOUNDS`; anyone else is `ERROR_CODE_PERMISSION_DENIED{"MANAGE_SOUNDS"}`. It broadcasts `SoundStopped{channel_id}` to the same audience.
+- `UpdateSound{sound_id, name}` and `DeleteSound{sound_id}` require `MANAGE_SOUNDS` (server-scoped, so a channel never grants it), else `ERROR_CODE_PERMISSION_DENIED{"MANAGE_SOUNDS"}`; an unknown id is `ERROR_CODE_UNKNOWN_SOUND`. They broadcast `SoundUpserted` and `SoundDeleted` to everyone.
+
+The bytes are uploaded with `POST /api/sounds?name=<name>`, which answers the `Sound`, and read back with `GET /api/sounds/{id}`. They are a **VORCSND1** container — a header and a run of length-prefixed Opus packets, so the duration is known without decoding anything:
+
+```
+offset 0   magic       8 bytes   "VORCSND1"
+offset 8   sample_rate u32 LE    48000
+offset 12  channels    u8        2
+offset 13  reserved    u8        0
+offset 14  frames      u32 LE    count of 20 ms Opus packets, 1..30000
+offset 18  frames x [ length u16 LE (1..1275) ][ opus packet ]
+```
+
+Media type `application/vnd.vorcall.sound`. Duration is `frames * 20` ms. The server validates the container's shape and **never decodes a sample**: it accepts the body only when the magic matches, the rate is 48000, `channels` is 2, `reserved` is 0, `frames` is in range, every `length` is in range, and walking all the lengths lands exactly on end-of-body.
+
 ### Media transport
 
 Media takes a separate UDP path, IPv4, default port 5005 (`Vorcall:VoicePort`), advertised in `VoiceReady`. An empty `VoiceReady.host` means the host part of the WebSocket URL.
@@ -495,6 +519,10 @@ The protocol version stays 1, but a 0.4.x client cannot be served: it knows no c
 | Unlinked stream offer sweep | older than 1 h, every 10 min |
 | Image upload | 8 MiB, png/jpeg/gif/webp, magic-checked (avatar / server icon 512², banner 1600×600, role icon 128², client-side) |
 | Unreferenced image sweep | older than 1 h |
+| Sound clip length | 10 min (1..30000 Opus frames of 20 ms) |
+| Sound clip size | 16 MiB |
+| Sound name | 1..32 scalars after trim, no control chars |
+| Sound storage quota | shared with attachments and images |
 | Write frame rate limit | bucket of 20 per account, refilling 2/s, configurable |
 | Diagnostics report | 4 MiB per file, text only |
 | Diagnostics rate limit | 10 reports/hour per account, configurable |

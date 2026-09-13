@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.WebSockets;
 using Vorcall.Server.Attachments;
 using Vorcall.Server.Permissions;
@@ -20,6 +21,7 @@ public enum OpStatus
     UnknownRole,
     UnknownUser,
     UnknownImage,
+    UnknownSound,
     NotInVoice,
     NotLive,
 }
@@ -1777,6 +1779,215 @@ public sealed partial class ConnectionRegistry
         AnnounceSilenced(silenced);
     }
 
+    // The endpoint's follow-up to a stored upload: it has already checked MANAGE_SOUNDS and
+    // written both the row and the bytes, so there is nothing left to refuse. The library is
+    // server-wide, so the upsert goes to everyone the way a role delta does.
+    public void CreateSound(SoundRecord record)
+    {
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            _soundById[record.Id] = record;
+            BroadcastToAllLocked(SoundUpsertedOf(record), except: null, ref slow);
+        }
+
+        CloseSlow(slow);
+    }
+
+    // MANAGE_SOUNDS is server-scoped, hence the null channel: no override can grant it.
+    public async Task<OpResult> UpdateSoundAsync(
+        ClientConnection connection,
+        long soundId,
+        string name,
+        CancellationToken ct)
+    {
+        if (connection.UserId is not { } actorId)
+        {
+            return OpResult.Of(OpStatus.NotLive);
+        }
+
+        lock (_gate)
+        {
+            if (!IsLive(connection, actorId) || !_memberById.TryGetValue(actorId, out var actor))
+            {
+                return OpResult.Of(OpStatus.NotLive);
+            }
+
+            var allowed = CheckLocked(actor, null, Perm.ManageSounds);
+            if (!allowed.IsOk)
+            {
+                return allowed;
+            }
+
+            if (!_soundById.ContainsKey(soundId))
+            {
+                return OpResult.Of(OpStatus.UnknownSound);
+            }
+        }
+
+        if (!await _sounds.RenameAsync(soundId, name, ct))
+        {
+            return OpResult.Of(OpStatus.UnknownSound);
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (_soundById.TryGetValue(soundId, out var record))
+            {
+                var renamed = record with { Name = name };
+                _soundById[soundId] = renamed;
+                BroadcastToAllLocked(SoundUpsertedOf(renamed), except: null, ref slow);
+            }
+        }
+
+        CloseSlow(slow);
+        return OpResult.Ok;
+    }
+
+    public async Task<OpResult> DeleteSoundAsync(ClientConnection connection, long soundId, CancellationToken ct)
+    {
+        if (connection.UserId is not { } actorId)
+        {
+            return OpResult.Of(OpStatus.NotLive);
+        }
+
+        lock (_gate)
+        {
+            if (!IsLive(connection, actorId) || !_memberById.TryGetValue(actorId, out var actor))
+            {
+                return OpResult.Of(OpStatus.NotLive);
+            }
+
+            var allowed = CheckLocked(actor, null, Perm.ManageSounds);
+            if (!allowed.IsOk)
+            {
+                return allowed;
+            }
+
+            if (!_soundById.ContainsKey(soundId))
+            {
+                return OpResult.Of(OpStatus.UnknownSound);
+            }
+        }
+
+        if (!await _sounds.DeleteAsync(soundId, ct))
+        {
+            return OpResult.Of(OpStatus.UnknownSound);
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            _soundById.Remove(soundId);
+            BroadcastToAllLocked(SoundDeletedOf(soundId), except: null, ref slow);
+
+            // A client cannot keep playing bytes that no longer exist, so a channel still on this
+            // clip is cut as well.
+            foreach (var channel in _channelById.Values)
+            {
+                if (channel.Playing?.SoundId == soundId)
+                {
+                    channel.Playing = null;
+                    BroadcastToChannelLocked(channel, SoundStoppedOf(channel.Record.Id), except: null, ref slow);
+                }
+            }
+        }
+
+        CloseSlow(slow);
+        return OpResult.Ok;
+    }
+
+    // One clip plays per channel: this replaces whatever was playing, finished or not, and the
+    // second SoundPlayed is the cut — PROTOCOL.md § Sounds sends no SoundStopped for one. The
+    // audience is every member who may view the channel, the caller included, since the caller
+    // plays the clip too.
+    public OpResult PlaySound(ClientConnection connection, long channelId, long soundId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return OpResult.Of(OpStatus.NotLive);
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId) || !_memberById.TryGetValue(userId, out var member))
+            {
+                return OpResult.Of(OpStatus.NotLive);
+            }
+
+            if (!VisibleLocked(member, channelId, out var channel))
+            {
+                return OpResult.Of(OpStatus.UnknownChannel);
+            }
+
+            if (!Perms.Has(ResolveLocked(member, channel), Perm.Soundpad))
+            {
+                return OpResult.Denied(Perm.Soundpad);
+            }
+
+            if (!channel.Voice.ContainsKey(userId))
+            {
+                return OpResult.Of(OpStatus.NotInVoice);
+            }
+
+            // An incomplete upload is not in the mirror, so an id that names one is as unknown
+            // here as an id that names nothing.
+            if (!_soundById.TryGetValue(soundId, out var sound))
+            {
+                return OpResult.Of(OpStatus.UnknownSound);
+            }
+
+            channel.Playing = new PlayingSound(soundId, userId, Stopwatch.GetTimestamp(), sound.DurationMs);
+            BroadcastToChannelLocked(channel, SoundPlayedOf(channelId, userId, soundId), except: null, ref slow);
+        }
+
+        CloseSlow(slow);
+        return OpResult.Ok;
+    }
+
+    // Stopping belongs to whoever started the clip and to a holder of MANAGE_SOUNDS. A channel
+    // playing nothing, or playing something that has already run its length, is a success that
+    // broadcasts nothing: the stop is idempotent and nobody has to be told twice.
+    public OpResult StopSound(ClientConnection connection, long channelId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return OpResult.Of(OpStatus.NotLive);
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId) || !_memberById.TryGetValue(userId, out var member))
+            {
+                return OpResult.Of(OpStatus.NotLive);
+            }
+
+            if (!VisibleLocked(member, channelId, out var channel))
+            {
+                return OpResult.Of(OpStatus.UnknownChannel);
+            }
+
+            if (channel.Playing is not { } playing || playing.Finished)
+            {
+                return OpResult.Ok;
+            }
+
+            if (playing.UserId != userId && !Perms.Has(ResolveLocked(member, null), Perm.ManageSounds))
+            {
+                return OpResult.Denied(Perm.ManageSounds);
+            }
+
+            channel.Playing = null;
+            BroadcastToChannelLocked(channel, SoundStoppedOf(channelId), except: null, ref slow);
+        }
+
+        CloseSlow(slow);
+        return OpResult.Ok;
+    }
+
     public async Task<OpResult> OpenDmAsync(long callerId, long otherId, CancellationToken ct)
     {
         lock (_gate)
@@ -1883,6 +2094,18 @@ public sealed partial class ConnectionRegistry
 
     private static ServerFrame CategoryDeletedOf(long categoryId)
         => new() { CategoryDeleted = new CategoryDeleted { Id = categoryId } };
+
+    private static ServerFrame SoundUpsertedOf(SoundRecord sound)
+        => new() { SoundUpserted = new SoundUpserted { Sound = SoundOf(sound) } };
+
+    private static ServerFrame SoundDeletedOf(long soundId)
+        => new() { SoundDeleted = new SoundDeleted { SoundId = soundId } };
+
+    private static ServerFrame SoundPlayedOf(long channelId, long userId, long soundId)
+        => new() { SoundPlayed = new SoundPlayed { ChannelId = channelId, UserId = userId, SoundId = soundId } };
+
+    private static ServerFrame SoundStoppedOf(long channelId)
+        => new() { SoundStopped = new SoundStopped { ChannelId = channelId } };
 
     private static ServerFrame MemberRemovedOf(long userId)
         => new() { MemberRemoved = new MemberRemoved { UserId = userId } };

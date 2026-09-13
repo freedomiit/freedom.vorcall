@@ -34,6 +34,19 @@ public sealed record AttachmentsOptions
     // Enough for the longest magic number the four accepted image types use (RIFF....WEBP).
     public const int ImageMagicLength = 12;
 
+    // A soundpad clip: the VORCSND1 container of PROTOCOL.md § Sounds. 10 minutes of 96 kbit/s
+    // stereo Opus is about 7.2 MB, so this leaves real headroom without letting an album through.
+    public const int SoundMaxFileBytes = 16 << 20;
+
+    // 30000 packets of 20 ms is the 10 minutes above; the packet cap is libopus's largest frame.
+    public const int SoundMaxFrames = 30_000;
+
+    public const int SoundMaxPacketBytes = 1275;
+
+    public const int SoundHeaderBytes = 18;
+
+    public const string SoundMediaType = "application/vnd.vorcall.sound";
+
     // An upload nothing linked to a message within this is swept, file and row together; the same
     // age makes an unreferenced image sweepable.
     public static readonly TimeSpan UnlinkedTtl = TimeSpan.FromHours(1);
@@ -52,6 +65,8 @@ public sealed record AttachmentsOptions
     private static ReadOnlySpan<byte> PngMagic => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
     private static ReadOnlySpan<byte> JpegMagic => [0xFF, 0xD8, 0xFF];
+
+    public static ReadOnlySpan<byte> SoundMagic => "VORCSND1"u8;
 
     private AttachmentsOptions(string dir, long maxBytes)
     {

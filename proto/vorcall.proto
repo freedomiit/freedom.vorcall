@@ -105,9 +105,11 @@ enum Permission {                        // bit masks; server-scoped bits never 
   PERMISSION_MOVE_MEMBERS     = 262144;  // 1<<18
   PERMISSION_PRIORITY_SPEAKER = 524288;  // 1<<19
   PERMISSION_CHANGE_NICKNAME  = 1048576; // 1<<20 server-scoped: own nickname
+  PERMISSION_SOUNDPAD         = 2097152; // 1<<21 channel-scoped: trigger a soundpad clip
+  PERMISSION_MANAGE_SOUNDS    = 4194304; // 1<<22 server-scoped: add, rename and delete clips
 }
-// ALL = 0x1FFFFF. SERVER_SCOPED = MANAGE_SERVER|MANAGE_ROLES|MANAGE_MEMBERS|MANAGE_INVITES|KICK|BAN|CHANGE_NICKNAME.
-// EVERYONE_DEFAULT = VIEW|SEND|ATTACH|REACT|CONNECT|SPEAK|SHARE_SCREEN|CHANGE_NICKNAME (= 1109760).
+// ALL = 0x7FFFFF. SERVER_SCOPED = MANAGE_SERVER|MANAGE_ROLES|MANAGE_MEMBERS|MANAGE_INVITES|KICK|BAN|CHANGE_NICKNAME|MANAGE_SOUNDS.
+// EVERYONE_DEFAULT = VIEW|SEND|ATTACH|REACT|CONNECT|SPEAK|SHARE_SCREEN|CHANGE_NICKNAME|SOUNDPAD (= 3206912).
 
 // The one server's shared facts.
 message Server {
@@ -236,6 +238,10 @@ message ClientFrame {
     VoiceModerate voice_moderate = 38;
     UpdateProfile update_profile = 39;
     VoiceSelfState voice_self_state = 40;
+    PlaySound play_sound = 41;
+    StopSound stop_sound = 42;
+    UpdateSound update_sound = 43;
+    DeleteSound delete_sound = 44;
   }
 }
 
@@ -456,6 +462,10 @@ message ServerFrame {
     MemberRemoved member_removed = 33;
     VoiceMoved voice_moved = 34;
     StreamRequest stream_request = 35;
+    SoundUpserted sound_upserted = 36;
+    SoundDeleted sound_deleted = 37;
+    SoundPlayed sound_played = 38;
+    SoundStopped sound_stopped = 39;
   }
 }
 
@@ -477,6 +487,7 @@ message ServerSnapshot {
   repeated Channel channels = 4;    // every non-DM channel the reader may view, overrides included, plus the reader's DMs
   repeated Profile members = 5;     // every member of the server
   repeated ReadState read_states = 6; // one per viewable text channel and DM
+  repeated Sound sounds = 7;         // the whole shared soundpad library, which is server-wide
 }
 
 // Replaces what the client knows about the server's shared facts.
@@ -624,6 +635,61 @@ message ShareWatchers {
   uint32 count = 2;
 }
 
+// A clip in the server's shared soundpad. The bytes are the VORCSND1 container of
+// PROTOCOL.md § Sounds; the server validates its shape and never decodes a sample.
+// REST: POST /api/sounds?name=<name> -> Sound
+// REST: GET  /api/sounds/{id}        -> the bytes
+message Sound {
+  int64  id          = 1;
+  string name        = 2;   // 1..32 scalars after trim, no control chars
+  int64  uploader_id = 3;
+  uint32 duration_ms = 4;
+  int64  size        = 5;   // bytes
+}
+
+// Plays a clip into a voice session; requires SOUNDPAD in that channel and a live voice
+// session there. One clip plays per channel: this replaces whatever was playing.
+message PlaySound {
+  int64 channel_id = 1;     // a voice or DM channel
+  int64 sound_id = 2;
+}
+
+// Stops the clip playing in that channel. Allowed to whoever started it, or to a holder of
+// MANAGE_SOUNDS.
+message StopSound {
+  int64 channel_id = 1;
+}
+
+message UpdateSound {
+  int64 sound_id = 1;
+  string name = 2;
+}
+
+message DeleteSound {
+  int64 sound_id = 1;
+}
+
+// Sent to everyone: the library is server-wide.
+message SoundUpserted {
+  Sound sound = 1;
+}
+
+message SoundDeleted {
+  int64 sound_id = 1;
+}
+
+// Sent to everyone who may view the channel; only a member with a live voice session there
+// plays it. A second one for the same channel is what cuts the first short.
+message SoundPlayed {
+  int64 channel_id = 1;
+  int64 user_id = 2;
+  int64 sound_id = 3;
+}
+
+message SoundStopped {
+  int64 channel_id = 1;
+}
+
 message MessageEdited {
   ChatMessage message = 1;
 }
@@ -671,6 +737,7 @@ enum ErrorCode {
   ERROR_CODE_UNKNOWN_IMAGE = 26;     // non-fatal: image id unknown, not the caller's, or of the wrong purpose
   ERROR_CODE_RATE_LIMITED = 27;      // non-fatal: too many write frames from this account; retry after a moment
   ERROR_CODE_INVALID_STREAM = 28;    // non-fatal: streamed file unknown, foreign, wrong channel or already linked
+  ERROR_CODE_UNKNOWN_SOUND = 29;     // non-fatal: soundpad clip id unknown
 }
 
 message Error {

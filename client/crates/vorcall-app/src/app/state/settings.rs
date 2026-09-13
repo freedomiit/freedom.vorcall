@@ -64,16 +64,18 @@ pub enum ServerTab {
     Channels,
     Roles,
     Members,
+    Sounds,
     Invites,
     Bans,
 }
 
 impl ServerTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Overview,
         Self::Channels,
         Self::Roles,
         Self::Members,
+        Self::Sounds,
         Self::Invites,
         Self::Bans,
     ];
@@ -84,6 +86,7 @@ impl ServerTab {
             Self::Channels => "Channels",
             Self::Roles => "Roles",
             Self::Members => "Members",
+            Self::Sounds => "Sounds",
             Self::Invites => "Invites",
             Self::Bans => "Bans",
         }
@@ -100,6 +103,7 @@ impl ServerTab {
             // A member's roles are assigned from this page, so whoever manages
             // roles needs it as much as whoever manages members.
             Self::Members => perms::MANAGE_MEMBERS | perms::MANAGE_ROLES,
+            Self::Sounds => perms::MANAGE_SOUNDS,
             Self::Invites => perms::MANAGE_INVITES,
             Self::Bans => perms::BAN_MEMBERS,
         }
@@ -304,6 +308,9 @@ pub struct AdminState {
     /// edited.
     pub nicknames: BTreeMap<i64, String>,
     pub ban_reason: String,
+    /// Clip names being typed on the sounds page, by clip id; an entry only
+    /// exists while one is being edited.
+    pub sound_names: BTreeMap<i64, String>,
     pub invite_days: u32,
     pub invites: RestList<Invite>,
     pub bans: RestList<Ban>,

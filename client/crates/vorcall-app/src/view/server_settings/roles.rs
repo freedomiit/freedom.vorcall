@@ -484,6 +484,7 @@ fn permission_groups<'a>(
                 permissions::KICK_MEMBERS,
                 permissions::BAN_MEMBERS,
                 permissions::CHANGE_NICKNAME,
+                permissions::MANAGE_SOUNDS,
             ],
         ),
         (
@@ -508,6 +509,7 @@ fn permission_groups<'a>(
                 permissions::DEAFEN_MEMBERS,
                 permissions::MOVE_MEMBERS,
                 permissions::PRIORITY_SPEAKER,
+                permissions::SOUNDPAD,
             ],
         ),
     ];

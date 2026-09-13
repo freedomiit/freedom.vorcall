@@ -29,6 +29,7 @@ use vorcall_clipboard::Clipboard;
 use vorcall_core::connection::{self, Blob, Command};
 use vorcall_core::update::{PublicKey, Ready, Version};
 use vorcall_core::{Config, Endpoints, Event, Session, config, session};
+use vorcall_voice::Sfx;
 
 use crate::brand;
 use crate::theme::{self, ThemeTokens};
@@ -36,13 +37,14 @@ use crate::view;
 use crate::workers::images::ImageKey;
 use crate::workers::share::{ShareCommand, ShareHandle};
 use crate::workers::voice::{AudioCommand, AudioHandle};
-use crate::workers::{audio, images, notify, share, voice};
+use crate::workers::{audio, images, notify, share, sounds, voice};
 
 pub use message::Message;
 use message::{ChatMsg, TickMsg, UiMsg, WindowMsg};
 use state::chat::{ChatState, ImageState};
 use state::server::ServerModel;
 use state::settings::{AdminState, SettingsState};
+use state::sound::SoundState;
 use state::ui::UiState;
 use state::update::UpdateState;
 use state::voice::VoiceUi;
@@ -226,6 +228,7 @@ pub struct MainState {
     pub server: ServerModel,
     pub chat: ChatState,
     pub voice: VoiceUi,
+    pub sound: SoundState,
     pub settings: SettingsState,
     pub admin: AdminState,
     pub status: Status,
@@ -281,6 +284,7 @@ impl MainState {
             server: ServerModel::default(),
             chat: ChatState::new(),
             voice: VoiceUi::default(),
+            sound: SoundState::default(),
             settings: SettingsState::default(),
             admin: AdminState::default(),
             status: Status::Connecting,
@@ -417,7 +421,10 @@ impl App {
             }
             None => app.open_main(),
         };
-        (app, Task::batch([task, prune_image_cache()]))
+        (
+            app,
+            Task::batch([task, prune_image_cache(), prune_sound_cache()]),
+        )
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -746,6 +753,29 @@ impl App {
         }
     }
 
+    /// A motif goes out the voice output device when there is a session, so it
+    /// lands on the device the user chose and reaches the echo canceller's
+    /// reference. Without one it falls back to the chime's own mixer.
+    pub fn play_sfx(&mut self, sfx: Sfx) {
+        if self.main().is_some_and(|main| main.voice.is_live()) {
+            self.send_audio(AudioCommand::PlaySfx(sfx));
+            return;
+        }
+
+        if self.audio.is_none() && !self.audio_unavailable {
+            match audio::open() {
+                Ok(audio) => self.audio = Some(audio),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no audio output; the motifs are off for this run");
+                    self.audio_unavailable = true;
+                }
+            }
+        }
+        if let Some(audio) = &self.audio {
+            audio.play(sfx.samples(), self.config.sound_volume);
+        }
+    }
+
     /// Whether the loading creature is on screen, which is what makes its
     /// per-frame clock worth running.
     pub fn creature_visible(&self) -> bool {
@@ -993,6 +1023,19 @@ fn prune_image_cache() -> Task<Message> {
             if let Err(e) = tokio::task::spawn_blocking(|| images::prune(images::CACHE_LIMIT)).await
             {
                 tracing::warn!(error = %e, "the image cache was not pruned");
+            }
+        },
+        |()| Message::Noop,
+    )
+}
+
+/// Trims the soundpad clip cache once per run, off the UI thread.
+fn prune_sound_cache() -> Task<Message> {
+    Task::perform(
+        async {
+            if let Err(e) = tokio::task::spawn_blocking(|| sounds::prune(sounds::CACHE_LIMIT)).await
+            {
+                tracing::warn!(error = %e, "the sound cache was not pruned");
             }
         },
         |()| Message::Noop,

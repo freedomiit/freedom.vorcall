@@ -474,6 +474,18 @@ public sealed class ChatSocketHandler(
             case ClientFrame.PayloadOneofCase.UpdateProfile:
                 return Flow(await HandleUpdateProfileAsync(connection, userId, frame.UpdateProfile));
 
+            case ClientFrame.PayloadOneofCase.PlaySound:
+                return Flow(HandlePlaySound(connection, frame.PlaySound));
+
+            case ClientFrame.PayloadOneofCase.StopSound:
+                return Flow(HandleStopSound(connection, frame.StopSound));
+
+            case ClientFrame.PayloadOneofCase.UpdateSound:
+                return Flow(await HandleUpdateSoundAsync(connection, frame.UpdateSound));
+
+            case ClientFrame.PayloadOneofCase.DeleteSound:
+                return Flow(Answer(connection, await registry.DeleteSoundAsync(connection, frame.DeleteSound.SoundId, Persist)));
+
             default:
                 return Dispatch.EmptyPayload;
         }
@@ -873,6 +885,36 @@ public sealed class ChatSocketHandler(
         }
     }
 
+    private bool HandlePlaySound(ClientConnection connection, PlaySound play)
+    {
+        if (!Validation.TryParseChannelId(play.ChannelId, out var channelId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+        }
+
+        return Answer(connection, registry.PlaySound(connection, channelId, play.SoundId));
+    }
+
+    private bool HandleStopSound(ClientConnection connection, StopSound stop)
+    {
+        if (!Validation.TryParseChannelId(stop.ChannelId, out var channelId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+        }
+
+        return Answer(connection, registry.StopSound(connection, channelId));
+    }
+
+    private async Task<bool> HandleUpdateSoundAsync(ClientConnection connection, UpdateSound update)
+    {
+        if (!Names.TryNormalize(update.Name, out var name))
+        {
+            return NonFatal(connection, ErrorCode.InvalidArgument, "name");
+        }
+
+        return Answer(connection, await registry.UpdateSoundAsync(connection, update.SoundId, name, Persist));
+    }
+
     private async Task<bool> HandleCreateChannelAsync(ClientConnection connection, long userId, CreateChannel create)
     {
         // A DM is opened with OpenDm, never created here.
@@ -1139,6 +1181,7 @@ public sealed class ChatSocketHandler(
         OpStatus.UnknownRole => ErrorCode.UnknownRole,
         OpStatus.UnknownUser => ErrorCode.UnknownUser,
         OpStatus.UnknownImage => ErrorCode.UnknownImage,
+        OpStatus.UnknownSound => ErrorCode.UnknownSound,
         OpStatus.NotInVoice => ErrorCode.NotInVoice,
         _ => throw new ArgumentOutOfRangeException(nameof(status), status, "this verdict is answered before it is mapped"),
     };
@@ -1179,20 +1222,29 @@ public sealed class ChatSocketHandler(
         or ClientFrame.PayloadOneofCase.UpdateServer
         or ClientFrame.PayloadOneofCase.TransferOwnership
         or ClientFrame.PayloadOneofCase.VoiceModerate
-        or ClientFrame.PayloadOneofCase.UpdateProfile;
+        or ClientFrame.PayloadOneofCase.UpdateProfile
+        or ClientFrame.PayloadOneofCase.PlaySound
+        or ClientFrame.PayloadOneofCase.StopSound
+        or ClientFrame.PayloadOneofCase.UpdateSound
+        or ClientFrame.PayloadOneofCase.DeleteSound;
 
-    // These five are every frame an unprivileged account can send at will, so they are what a
-    // flood would actually come from; the write limiter charges only them. Every management and
-    // moderation frame in IsWrite above sits behind a permission bit (MANAGE_CHANNELS,
-    // MANAGE_ROLES, BAN_MEMBERS, ...) that only a trusted member holds, and a settings page
-    // legitimately fires many of them in one burst — e.g. one SetOverride per switch while
-    // editing a role's permissions.
+    // Every frame an unprivileged account can send at will, so they are what a flood would
+    // actually come from; the write limiter charges only them. Most management and moderation
+    // frames in IsWrite above sit behind a permission bit (MANAGE_CHANNELS, MANAGE_ROLES,
+    // BAN_MEMBERS, ...) that only a trusted member holds, and a settings page legitimately fires
+    // many of them in one burst — e.g. one SetOverride per switch while editing a role's
+    // permissions. The four soundpad frames are charged whatever bit they sit behind: this bucket
+    // is the only spam control the soundpad has, SOUNDPAD being an @everyone default.
     private static bool IsRateLimited(ClientFrame.PayloadOneofCase payloadCase) => payloadCase is
         ClientFrame.PayloadOneofCase.Send
         or ClientFrame.PayloadOneofCase.EditMessage
         or ClientFrame.PayloadOneofCase.DeleteMessage
         or ClientFrame.PayloadOneofCase.React
-        or ClientFrame.PayloadOneofCase.OpenDm;
+        or ClientFrame.PayloadOneofCase.OpenDm
+        or ClientFrame.PayloadOneofCase.PlaySound
+        or ClientFrame.PayloadOneofCase.StopSound
+        or ClientFrame.PayloadOneofCase.UpdateSound
+        or ClientFrame.PayloadOneofCase.DeleteSound;
 
     // Non-fatal errors ride the same outbox as everything else, so a refusal means the sender
     // itself has fallen behind and the caller closes it as a slow consumer.

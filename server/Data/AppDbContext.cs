@@ -37,6 +37,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
     public DbSet<StreamedFile> StreamedFiles => Set<StreamedFile>();
 
+    public DbSet<Sound> Sounds => Set<Sound>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         var message = modelBuilder.Entity<Message>();
@@ -246,6 +248,22 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // The sweeper reads by created_at.
         image.HasIndex(i => i.CreatedAt);
         image.HasOne<User>().WithMany().HasForeignKey(i => i.UploaderId).OnDelete(DeleteBehavior.SetNull);
+
+        var sound = modelBuilder.Entity<Sound>();
+        sound.ToTable("sounds");
+        sound.HasKey(s => s.Id);
+        sound.Property(s => s.Id).HasColumnName("id").UseIdentityByDefaultColumn();
+        sound.Property(s => s.Name).HasColumnName("name").HasMaxLength(32).IsRequired();
+        sound.Property(s => s.UploaderId).HasColumnName("uploader_id");
+        sound.Property(s => s.ContentType).HasColumnName("content_type").HasMaxLength(64).IsRequired();
+        sound.Property(s => s.Size).HasColumnName("size").IsRequired();
+        sound.Property(s => s.DurationMs).HasColumnName("duration_ms").IsRequired();
+        sound.Property(s => s.Complete).HasColumnName("complete").IsRequired();
+        sound.Property(s => s.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
+
+        // The sweeper reads by created_at.
+        sound.HasIndex(s => s.CreatedAt);
+        sound.HasOne<User>().WithMany().HasForeignKey(s => s.UploaderId).OnDelete(DeleteBehavior.SetNull);
 
         var reaction = modelBuilder.Entity<Reaction>();
         reaction.ToTable("reactions");

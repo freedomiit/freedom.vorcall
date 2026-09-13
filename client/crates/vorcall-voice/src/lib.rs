@@ -14,6 +14,8 @@
 //!   suppression and automatic gain, applied before anything else sees a frame.
 //!
 //! [`gate`] sits on the capture side, deciding which frames are worth sending;
+//! [`sound`] is the container a soundpad clip is stored in and [`sfx`] the
+//! synthesized interface motifs, neither of which ever reaches the wire;
 //! [`tone`] is a test/diagnostic source; nothing here touches an audio device,
 //! a window, or the network beyond the single UDP socket the engine owns.
 
@@ -30,6 +32,8 @@ pub mod gate;
 pub mod jitter;
 pub mod packet;
 pub mod playout;
+pub mod sfx;
+pub mod sound;
 pub mod tone;
 pub mod video;
 
@@ -38,4 +42,6 @@ pub use codec::{STEREO_FRAME_SAMPLES, StereoDecoder, StereoEncoder};
 pub use engine::{FrameSender, Link, MediaConfig, MediaEngine, Stats};
 pub use gate::{GateDecision, NoiseGate};
 pub use playout::{PeerStats, Playout};
+pub use sfx::Sfx;
+pub use sound::{SoundClip, SoundError};
 pub use video::{AccessUnit, Depacketizer, FragmentHeader, VideoStats};

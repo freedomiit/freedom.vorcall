@@ -134,9 +134,9 @@ with `certbot certonly --webroot -w /var/www/certbot -d chat.example.org` first.
 The unbuffered `location` blocks are not optional: uploads, streamed files and update
 downloads are raw streamed bodies, and a plain `/api/` proxy would apply nginx's 1 MiB
 default and buffer whole files into memory. Each of them sets its own
-`client_max_body_size`, because the three upload paths have three different ceilings: an
-attachment stops at 2 GiB, a picture at 8 MiB, and a streamed file's range is as large as
-the file it came from.
+`client_max_body_size`, because the upload paths have different ceilings: an attachment
+stops at 2 GiB, a picture at 8 MiB, a soundpad clip at 16 MiB, and a streamed file's range
+is as large as the file it came from.
 
 ```nginx
 server {
@@ -184,6 +184,13 @@ server {
     # Avatars, banners and icons are a separate, much smaller store.
     location /api/images {
         client_max_body_size 9m;
+        include /etc/nginx/snippets/vorcall-upload.conf;
+    }
+
+    # Soundpad clips: capped between an image and an attachment, and charged
+    # against the same storage quota as both.
+    location /api/sounds {
+        client_max_body_size 17m;
         include /etc/nginx/snippets/vorcall-upload.conf;
     }
 
@@ -298,6 +305,17 @@ chat.example.org {
 		}
 	}
 
+	# A soundpad clip sits between an image and an attachment on purpose.
+	@sounds path /api/sounds*
+	handle @sounds {
+		request_body {
+			max_size 17MB
+		}
+		reverse_proxy 127.0.0.1:5000 {
+			flush_interval -1
+		}
+	}
+
 	handle /api/admin/* {
 		respond 404
 	}
@@ -399,8 +417,10 @@ larger than that is sent as a **streamed file** instead — the server records t
 proxies the bytes but never stores them, so it is readable only while the sender's client is
 online; those are capped at 1 TiB, also four per message. Avatars, banners and icons are a
 separate, stricter store: PNG, JPEG, GIF or WebP only, checked against the type's magic
-number, 8 MiB each. Only attachments and images are charged against
-`Vorcall__AttachmentsMaxBytes`; a streamed file occupies no disk here at all.
+number, 8 MiB each. A soundpad clip is 16 MiB, and unlike an image it is referenced by
+definition — it *is* the library, so it never becomes unreferenced and swept. Attachments,
+images and sound clips are all charged against `Vorcall__AttachmentsMaxBytes`; a streamed
+file occupies no disk here at all.
 
 ### Where the data lives
 
@@ -590,10 +610,10 @@ The kernel clamped the relay's socket buffers. Apply the
 [sysctl settings](#kernel-buffers) and restart the backend.
 
 **Uploads fail at around 1 MB, or large ones fail at 9 MB.**
-The reverse proxy is applying a body limit. `/api/attachments`, `/api/images` and
-`/api/streams` each need their own `client_max_body_size` — 2 GiB, 9 MB and unlimited
-respectively — and unbuffered proxying. A config written before 0.6.0 caps all of them at
-`9m`, which stops every attachment above that and every streamed file.
+The reverse proxy is applying a body limit. `/api/attachments`, `/api/images`,
+`/api/sounds` and `/api/streams` each need their own `client_max_body_size` — 2 GiB, 9 MB,
+17 MB and unlimited respectively — and unbuffered proxying. A config written before 0.6.0
+caps all of them at `9m`, which stops every attachment above that and every streamed file.
 
 **Screen share starts and immediately stops on Linux.**
 The client needs PipeWire (`libpipewire-0.3.so.0`) and a desktop portal. Every share raises

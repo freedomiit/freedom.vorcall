@@ -27,7 +27,7 @@ use crate::app::state::settings::ServerTab;
 use crate::app::state::ui::{Dialog, Route, TransferState};
 // The two named rather than the module: `chat` is already the state module here.
 use crate::app::update::chat::{advance_dialog, finish_dialog};
-use crate::app::update::{admin, channels, check, settings, share, voice};
+use crate::app::update::{admin, channels, check, settings, share, sound, voice};
 use crate::app::{App, MainState, Status, decode_task};
 use crate::view;
 use crate::workers::images::{self, ImageKey};
@@ -184,7 +184,10 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
             detail,
             fatal,
         } => on_server_error(app, code, detail, fatal),
-        Event::Snapshot(snapshot) => {
+        Event::Snapshot(mut snapshot) => {
+            // Taken before the rest of the snapshot is moved into the model: the
+            // library is the soundpad's, not the server model's.
+            sound::on_snapshot(app, std::mem::take(&mut snapshot.sounds));
             let images = {
                 let Some(main) = app.main_mut() else {
                     return Task::none();
@@ -588,6 +591,10 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
         | Event::ShareStopped { .. }
         | Event::WatchState { .. }
         | Event::ShareWatchers { .. } => share::on_event(app, event),
+        Event::SoundUpserted { .. }
+        | Event::SoundDeleted { .. }
+        | Event::SoundPlayed { .. }
+        | Event::SoundStopped { .. } => sound::on_event(app, event),
     }
 }
 

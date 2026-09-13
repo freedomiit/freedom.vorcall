@@ -31,10 +31,13 @@ aplicativo móvel. O que há:
 
 - **Canais de texto e de voz**, agrupados em categorias, além de DMs entre duas pessoas.
 - **Voz** em todo canal de voz e em toda DM: push-to-talk ou ativação por voz, cancelamento
-  de eco, supressão de ruído, volume por pessoa, orador prioritário.
+  de eco, supressão de ruído, volume por pessoa, orador prioritário, e efeitos sonoros para
+  entrar, sair, mutar e ensurdecer.
 - **Compartilhamento de tela** — um monitor ou uma janela só, com o áudio dela, assistido
   por quem mais estiver no canal.
-- **Cargos e permissões**: 21 delas, com cores, ícones e hierarquia, sobrescrevíveis por
+- **Um soundpad compartilhado** — clipes curtos que qualquer um pode enviar uma vez e
+  qualquer um pode disparar num canal de voz, tocados por todos os clientes nele.
+- **Cargos e permissões**: 23 delas, com cores, ícones e hierarquia, sobrescrevíveis por
   canal e por membro.
 - **Mensagens** com resposta, edição, reações e anexos de qualquer tipo de arquivo — até
   2 GiB guardados no servidor, e o que passar disso vai direto da máquina de quem

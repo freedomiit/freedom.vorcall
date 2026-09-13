@@ -17,7 +17,9 @@
 //! receive task keeps fed; that source also keeps the mono downmix of what it
 //! played in two rings, the far-end reference the microphone's echo canceller
 //! subtracts here and the one a screen share's own canceller subtracts on its
-//! thread.
+//! thread. Two more sounds ride that same output: a soundpad clip, which the
+//! mixer carries like a voice and a deafen silences with them, and the interface
+//! motifs, mixed in past the deafen so the deafen pair still confirms the press.
 //!
 //! This thread is also the only writer of per-peer volume and mute. Quietening
 //! the room for a priority speaker has to multiply into the same single gain the
@@ -42,7 +44,7 @@ use vorcall_voice::cleanup::FAR_END_MAX_SAMPLES;
 use vorcall_voice::codec::Encoder;
 use vorcall_voice::{
     CleanupSettings, FRAME_SAMPLES, FrameSender, GateDecision, InputCleanup, NoiseGate, Playout,
-    SAMPLE_RATE, STEREO_FRAME_SAMPLES,
+    SAMPLE_RATE, STEREO_FRAME_SAMPLES, Sfx,
 };
 
 /// How often the thread wakes up to cut frames when no command arrives. Well
@@ -83,6 +85,14 @@ const DUCK_FACTOR: f32 = 0.25;
 /// peers are never touched in the interface, so without this pass a duck would
 /// only quieten the few the listener happens to have a slider on.
 const DUCK_SWEEP: Duration = Duration::from_millis(100);
+
+/// How many interface motifs may sound at once; a fifth drops the oldest. They
+/// last 50-150 ms, so the bound is never reached in practice and is only here so
+/// a stuck caller cannot grow the list without end.
+const MAX_SFX: usize = 4;
+
+/// The ceiling the motif volume shares with every other volume in the mixer.
+const MAX_SFX_GAIN: f32 = 2.0;
 
 /// Shown for a device the host refuses to name; it is still usable.
 const UNNAMED_DEVICE: &str = "Unknown device";
@@ -163,6 +173,16 @@ pub enum AudioCommand {
         active: bool,
         exempt: Vec<u32>,
     },
+    /// One of the interface motifs, played locally and never sent anywhere.
+    PlaySfx(Sfx),
+    /// A soundpad clip, already decoded to interleaved stereo 48 kHz. Replaces
+    /// whatever clip was playing: one is heard at a time.
+    PlayClip(Arc<Vec<f32>>),
+    StopClip,
+    /// The listener's own volume for the motifs, 0.0..=2.0.
+    SetSfxVolume(f32),
+    /// The listener's own volume for soundpad clips, 0.0..=2.0.
+    SetClipVolume(f32),
     /// Drops both streams. The thread stays alive for a later `Open`.
     Close,
 }
@@ -272,6 +292,10 @@ struct AudioThread {
     /// Shared with the [`VoiceSource`] in the mixer, which keeps pulling frames
     /// while deafened so the jitter buffers do not back up.
     deafened: Arc<AtomicBool>,
+    /// The interface motifs, shared with that same [`VoiceSource`]. It belongs to
+    /// the thread rather than to a session: a motif is local, so it is played
+    /// whether or not a voice channel is open.
+    sfx: Arc<Mutex<SfxMixer>>,
 
     /// What the listener chose per peer, by ssrc. The mixer is given the product
     /// of it and the ducking factor, so the chosen value survives a duck.
@@ -360,6 +384,66 @@ impl Ducking {
     }
 }
 
+/// The interface motifs waiting to be heard. Several may overlap — a join and a
+/// mute can land in the same frame — so this is a list rather than a slot.
+struct SfxMixer {
+    playing: Vec<SfxPlayback>,
+    gain: f32,
+}
+
+/// One motif part-way through.
+struct SfxPlayback {
+    /// Mono 48 kHz.
+    samples: Vec<f32>,
+    cursor: usize,
+    bypass_deafen: bool,
+}
+
+impl SfxMixer {
+    fn new() -> Self {
+        Self {
+            playing: Vec::new(),
+            gain: 1.0,
+        }
+    }
+
+    /// Starts one motif, dropping the oldest rather than growing past [`MAX_SFX`].
+    fn play(&mut self, sfx: Sfx) {
+        if self.playing.len() >= MAX_SFX {
+            self.playing.remove(0);
+        }
+        self.playing.push(SfxPlayback {
+            samples: sfx.samples(),
+            cursor: 0,
+            bypass_deafen: sfx.bypass_deafen(),
+        });
+    }
+
+    fn set_gain(&mut self, gain: f32) {
+        self.gain = gain.clamp(0.0, MAX_SFX_GAIN);
+    }
+
+    /// Sums the next mono frame of everything playing into `out`. While
+    /// `deafened` only the motifs that bypass it are heard, but every one of them
+    /// still advances and retires: a motif held back must not resume mid-way when
+    /// the listener undeafens.
+    fn next_frame(&mut self, out: &mut [f32; FRAME_SAMPLES], deafened: bool) {
+        out.fill(0.0);
+        let gain = self.gain;
+        self.playing.retain_mut(|playback| {
+            let remaining = &playback.samples[playback.cursor..];
+            let taken = remaining.len().min(FRAME_SAMPLES);
+            if !deafened || playback.bypass_deafen {
+                for (sum, sample) in out.iter_mut().zip(&remaining[..taken]) {
+                    *sum += *sample * gain;
+                }
+            }
+            playback.cursor += taken;
+            playback.cursor < playback.samples.len()
+        });
+    }
+}
+
 impl AudioThread {
     fn new(
         events: async_mpsc::UnboundedSender<AudioEvent>,
@@ -381,6 +465,7 @@ impl AudioThread {
             ptt: false,
             muted: false,
             deafened: Arc::new(AtomicBool::new(false)),
+            sfx: Arc::new(Mutex::new(SfxMixer::new())),
             peers: HashMap::new(),
             ducking: Ducking::default(),
             duck_swept_at: None,
@@ -454,6 +539,26 @@ impl AudioThread {
                 self.apply_peer(ssrc);
             }
             AudioCommand::SetDucking { active, exempt } => self.set_ducking(active, exempt),
+            AudioCommand::PlaySfx(sfx) => lock(&self.sfx).play(sfx),
+            AudioCommand::PlayClip(samples) => {
+                // Unlike a motif, a clip only means anything inside a channel.
+                let Some(playout) = self.playout.as_ref() else {
+                    tracing::debug!("no voice session, dropping a soundpad clip");
+                    return;
+                };
+                lock(playout).set_clip(samples);
+            }
+            AudioCommand::StopClip => {
+                if let Some(playout) = self.playout.as_ref() {
+                    lock(playout).stop_clip();
+                }
+            }
+            AudioCommand::SetSfxVolume(volume) => lock(&self.sfx).set_gain(volume),
+            AudioCommand::SetClipVolume(volume) => {
+                if let Some(playout) = self.playout.as_ref() {
+                    lock(playout).set_clip_gain(volume);
+                }
+            }
             AudioCommand::Close => {
                 self.close_streams();
                 self.sender = None;
@@ -513,6 +618,7 @@ impl AudioThread {
         sink.mixer().add(VoiceSource::new(
             playout,
             self.deafened.clone(),
+            self.sfx.clone(),
             self.far_end.clone(),
             self.share_far_end.clone(),
         ));
@@ -905,6 +1011,9 @@ fn apply_tuning(playout: &mut Playout, ssrc: u32, tuning: PeerTuning, ducking: &
 struct VoiceSource {
     playout: Arc<Mutex<Playout>>,
     deafened: Arc<AtomicBool>,
+    /// The interface motifs, mixed in past the deafen so the deafen pair is
+    /// still heard.
+    sfx: Arc<Mutex<SfxMixer>>,
     /// What the mixer was given, for the echo canceller on the audio thread to
     /// subtract from what the microphone hears.
     far_end: Arc<Mutex<VecDeque<f32>>>,
@@ -914,6 +1023,8 @@ struct VoiceSource {
     frame: [f32; STEREO_FRAME_SAMPLES],
     /// `frame` in mono, which is what both cancellers take as a reference.
     downmix: [f32; FRAME_SAMPLES],
+    /// The motifs' own mono frame, before they are folded into `frame`.
+    sfx_frame: [f32; FRAME_SAMPLES],
     cursor: usize,
 }
 
@@ -921,16 +1032,19 @@ impl VoiceSource {
     fn new(
         playout: Arc<Mutex<Playout>>,
         deafened: Arc<AtomicBool>,
+        sfx: Arc<Mutex<SfxMixer>>,
         far_end: Arc<Mutex<VecDeque<f32>>>,
         share_far_end: Arc<Mutex<VecDeque<f32>>>,
     ) -> Self {
         Self {
             playout,
             deafened,
+            sfx,
             far_end,
             share_far_end,
             frame: [0.0; STEREO_FRAME_SAMPLES],
             downmix: [0.0; FRAME_SAMPLES],
+            sfx_frame: [0.0; FRAME_SAMPLES],
             // Past the end, so the first sample pulls a frame.
             cursor: STEREO_FRAME_SAMPLES,
         }
@@ -945,13 +1059,26 @@ impl Iterator for VoiceSource {
             lock(&self.playout).next_stereo_frame(&mut self.frame);
             self.cursor = 0;
 
-            // The reference has to be what the speakers are given, and deafened
-            // means silence.
-            if self.deafened.load(Ordering::Relaxed) {
-                self.downmix.fill(0.0);
-            } else {
-                downmix(&self.frame, &mut self.downmix);
+            // Deafened silences everything the mixer holds alike: the voices, a
+            // watched share and a soundpad clip.
+            let deafened = self.deafened.load(Ordering::Relaxed);
+            if deafened {
+                self.frame.fill(0.0);
             }
+
+            // The motifs come in past that, so the deafen pair is still heard:
+            // it is the confirmation of the press itself.
+            lock(&self.sfx).next_frame(&mut self.sfx_frame, deafened);
+            let (pairs, _) = self.frame.as_chunks_mut::<2>();
+            for (pair, motif) in pairs.iter_mut().zip(&self.sfx_frame) {
+                pair[0] = (pair[0] + motif).clamp(-1.0, 1.0);
+                pair[1] = (pair[1] + motif).clamp(-1.0, 1.0);
+            }
+
+            // The reference has to be what the speakers are given, motifs
+            // included: the microphone picks one up, so a canceller that did not
+            // have it would let everyone else hear it back.
+            downmix(&self.frame, &mut self.downmix);
             push_far_end(&self.far_end, &self.downmix);
             push_far_end(&self.share_far_end, &self.downmix);
         }
@@ -960,11 +1087,7 @@ impl Iterator for VoiceSource {
 
         // Frames are still pulled while deafened: skipping them would let the
         // jitter buffers fill up and turn undeafening into a burst of stale audio.
-        Some(if self.deafened.load(Ordering::Relaxed) {
-            0.0
-        } else {
-            sample
-        })
+        Some(sample)
     }
 }
 
@@ -1209,25 +1332,42 @@ mod tests {
     /// can be read against.
     const QUIET_PEER: f32 = 0.8;
 
+    /// A motif is at most 150 ms, so eight 20 ms frames outlast every one of them.
+    const MOTIF_FRAMES: usize = 8;
+
     struct Mixed {
         source: VoiceSource,
         deafened: Arc<AtomicBool>,
+        playout: Arc<Mutex<Playout>>,
+        sfx: Arc<Mutex<SfxMixer>>,
         far_end: Arc<Mutex<VecDeque<f32>>>,
         share_far_end: Arc<Mutex<VecDeque<f32>>>,
     }
 
     fn mixed() -> Mixed {
+        mixed_over(
+            Arc::new(Mutex::new(Playout::new())),
+            Arc::new(Mutex::new(SfxMixer::new())),
+        )
+    }
+
+    /// The same source over a playout and a motif mixer the caller keeps, so a
+    /// test can drive it through the commands the app will send.
+    fn mixed_over(playout: Arc<Mutex<Playout>>, sfx: Arc<Mutex<SfxMixer>>) -> Mixed {
         let deafened = Arc::new(AtomicBool::new(false));
         let far_end = Arc::new(Mutex::new(VecDeque::new()));
         let share_far_end = Arc::new(Mutex::new(VecDeque::new()));
         Mixed {
             source: VoiceSource::new(
-                Arc::new(Mutex::new(Playout::new())),
+                playout.clone(),
                 deafened.clone(),
+                sfx.clone(),
                 far_end.clone(),
                 share_far_end.clone(),
             ),
             deafened,
+            playout,
+            sfx,
             far_end,
             share_far_end,
         }
@@ -1307,6 +1447,149 @@ mod tests {
         // undeafening would start with a burst of stale audio.
         assert_eq!(lock(&mixed.far_end).len(), 2 * FRAME_SAMPLES);
         assert_eq!(lock(&mixed.share_far_end).len(), 2 * FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn an_undeafened_listener_hears_a_motif() {
+        let mut mixed = mixed();
+        lock(&mixed.sfx).play(Sfx::Join);
+
+        let level = rms(pull(&mut mixed.source, 1).into_iter());
+        assert!(level > 0.01, "the motif is silent: {level}");
+    }
+
+    #[test]
+    fn a_deafened_listener_hears_the_deafen_pair_and_nothing_else() {
+        // The confirmation of the press itself, so it survives the deafen.
+        for sfx in [Sfx::Deafen, Sfx::Undeafen] {
+            let mut mixed = mixed();
+            mixed.deafened.store(true, Ordering::Relaxed);
+            lock(&mixed.sfx).play(sfx);
+
+            let level = rms(pull(&mut mixed.source, 1).into_iter());
+            assert!(level > 0.01, "{sfx:?} was silenced by the deafen");
+        }
+
+        for sfx in [Sfx::Join, Sfx::Leave, Sfx::Mute, Sfx::Unmute] {
+            let mut mixed = mixed();
+            mixed.deafened.store(true, Ordering::Relaxed);
+            lock(&mixed.sfx).play(sfx);
+
+            let played = pull(&mut mixed.source, MOTIF_FRAMES);
+            assert!(
+                played.iter().all(|sample| *sample == 0.0),
+                "{sfx:?} was heard through the deafen"
+            );
+        }
+    }
+
+    #[test]
+    fn a_motif_played_while_deafened_still_reaches_both_far_end_rings() {
+        let mut mixed = mixed();
+        mixed.deafened.store(true, Ordering::Relaxed);
+        lock(&mixed.sfx).play(Sfx::Deafen);
+        pull(&mut mixed.source, 1);
+
+        // The microphone hears a motif whatever the deafen does, so a canceller
+        // without it in its reference would send it back to the room.
+        for ring in [&mixed.far_end, &mixed.share_far_end] {
+            let level = rms(lock(ring).iter().copied());
+            assert!(level > 0.01, "a far-end ring only holds {level}");
+        }
+    }
+
+    #[test]
+    fn a_motif_advances_while_deafened_so_undeafening_does_not_replay_it() {
+        let mut mixed = mixed();
+        mixed.deafened.store(true, Ordering::Relaxed);
+        lock(&mixed.sfx).play(Sfx::Join);
+
+        // Long enough for the whole motif to have run out unheard.
+        let played = pull(&mut mixed.source, MOTIF_FRAMES);
+        assert!(played.iter().all(|sample| *sample == 0.0));
+
+        mixed.deafened.store(false, Ordering::Relaxed);
+        let after = pull(&mut mixed.source, MOTIF_FRAMES);
+        assert!(
+            after.iter().all(|sample| *sample == 0.0),
+            "undeafening replayed a motif that had already run out"
+        );
+    }
+
+    /// The level of a motif's first frame at one volume, set the way the app
+    /// sets it.
+    fn motif_level(volume: f32) -> f32 {
+        let mut room = listening();
+        let mut mixed = mixed_over(room.playout.clone(), room.audio.sfx.clone());
+        room.audio.handle(AudioCommand::SetSfxVolume(volume));
+        room.audio.handle(AudioCommand::PlaySfx(Sfx::Join));
+        rms(pull(&mut mixed.source, 1).into_iter())
+    }
+
+    #[test]
+    fn the_motif_volume_scales_and_clamps_at_both_ends() {
+        let full = motif_level(1.0);
+        assert!(full > 0.01, "the reference motif is silent: {full}");
+
+        let half = motif_level(0.5) / full;
+        assert!((half - 0.5).abs() < 0.01, "half gave {half}");
+
+        // Clamped to 0.0..=2.0, like every other volume the mixer takes.
+        assert_eq!(motif_level(-1.0), 0.0);
+        let boosted = motif_level(5.0) / full;
+        assert!((boosted - 2.0).abs() < 0.01, "5.0 gave {boosted}");
+    }
+
+    #[test]
+    fn a_fifth_motif_drops_the_oldest_rather_than_growing_the_list() {
+        let mut mixed = mixed();
+        // The deafen pair is the only one a deafen lets through, and here it is
+        // the oldest: keeping it would be heard below.
+        for sfx in [Sfx::Deafen, Sfx::Join, Sfx::Leave, Sfx::Mute, Sfx::Unmute] {
+            lock(&mixed.sfx).play(sfx);
+        }
+        assert_eq!(lock(&mixed.sfx).playing.len(), MAX_SFX);
+
+        mixed.deafened.store(true, Ordering::Relaxed);
+        let played = pull(&mut mixed.source, MOTIF_FRAMES);
+        assert!(
+            played.iter().all(|sample| *sample == 0.0),
+            "the oldest motif outlived the newest"
+        );
+    }
+
+    #[test]
+    fn a_deafened_listener_hears_nothing_of_a_soundpad_clip() {
+        let samples = Arc::new(vec![0.5f32; STEREO_FRAME_SAMPLES]);
+
+        let mut plain = mixed();
+        lock(&plain.playout).set_clip(Arc::clone(&samples));
+        let level = rms(pull(&mut plain.source, 1).into_iter());
+        assert!(level > 0.01, "the reference clip is silent: {level}");
+
+        let mut silent = mixed();
+        silent.deafened.store(true, Ordering::Relaxed);
+        lock(&silent.playout).set_clip(samples);
+        let played = pull(&mut silent.source, 1);
+        assert!(played.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn a_motif_on_an_already_loud_frame_stays_in_range() {
+        let mut mixed = mixed();
+        // Full scale out of the playout, which clamps its own mix there.
+        lock(&mixed.playout).set_clip(Arc::new(vec![1.0f32; STEREO_FRAME_SAMPLES]));
+        lock(&mixed.sfx).play(Sfx::Join);
+
+        let played = pull(&mut mixed.source, 1);
+        assert!(
+            played.contains(&1.0),
+            "the frame never reached full scale to begin with"
+        );
+        assert!(
+            played.iter().all(|sample| (-1.0..=1.0).contains(sample)),
+            "a motif pushed the mix out of range"
+        );
     }
 
     #[test]

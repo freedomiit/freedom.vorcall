@@ -10,9 +10,14 @@
 //! Unlike a speaker it is never reaped for going quiet — a shared window that
 //! plays nothing sends nothing, and the stream is the watcher's choice rather
 //! than something inferred from traffic.
+//!
+//! A soundpad clip sits in a third slot beside them, already decoded: it is a
+//! local file being played, not a stream, so it has neither buffer nor decoder
+//! and simply runs out.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::FRAME_SAMPLES;
@@ -51,6 +56,15 @@ struct Share {
     decoded_frames: u64,
 }
 
+/// A soundpad clip playing locally. Unlike a speaker or a share this is not a
+/// stream: the whole clip is decoded before it starts, so there is no jitter
+/// buffer and no concealment.
+struct ClipPlayback {
+    /// Interleaved stereo, 48 kHz.
+    samples: Arc<Vec<f32>>,
+    cursor: usize,
+}
+
 /// What the listener did to a speaker's volume.
 #[derive(Clone, Copy)]
 struct Tuning {
@@ -75,6 +89,9 @@ pub struct Playout {
     share: Option<Share>,
     /// Outside `share` for the same reason `tuning` is outside `speakers`.
     share_gain: f32,
+    clip: Option<ClipPlayback>,
+    /// Outside `clip` too, so a volume set before or between clips survives.
+    clip_gain: f32,
 }
 
 impl Playout {
@@ -84,6 +101,8 @@ impl Playout {
             tuning: HashMap::new(),
             share: None,
             share_gain: 1.0,
+            clip: None,
+            clip_gain: 1.0,
         }
     }
 
@@ -160,6 +179,7 @@ impl Playout {
         }
 
         audible |= self.mix_share(out, stereo, now);
+        audible |= self.mix_clip(out, stereo);
 
         if audible {
             for sample in out.iter_mut() {
@@ -213,6 +233,64 @@ impl Playout {
             }
         }
         true
+    }
+
+    /// Adds the playing clip to `out` and advances it; `true` when anything was
+    /// heard. A clip that runs out retires itself on the pass that drains it.
+    fn mix_clip(&mut self, out: &mut [f32], stereo: bool) -> bool {
+        let gain = self.clip_gain;
+        let Some(clip) = self.clip.as_mut() else {
+            return false;
+        };
+        // Cloned rather than borrowed so the cursor can move in the same pass.
+        let samples = Arc::clone(&clip.samples);
+        let remaining = &samples[clip.cursor.min(samples.len())..];
+
+        let mut taken = 0;
+        if stereo {
+            for (pair, source) in out
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(remaining.chunks(2))
+            {
+                pair[0] += source[0] * gain;
+                pair[1] += source.get(1).copied().unwrap_or(0.0) * gain;
+                taken += source.len();
+            }
+        } else {
+            for (sum, source) in out.iter_mut().zip(remaining.chunks(2)) {
+                let right = source.get(1).copied().unwrap_or(0.0);
+                *sum += (source[0] + right) * 0.5 * gain;
+                taken += source.len();
+            }
+        }
+
+        clip.cursor += taken;
+        if clip.cursor >= samples.len() {
+            self.clip = None;
+        }
+        taken > 0 && gain != 0.0
+    }
+
+    /// Starts a clip, replacing whatever was playing: one clip is heard at a
+    /// time. The samples are interleaved stereo at 48 kHz.
+    pub fn set_clip(&mut self, samples: Arc<Vec<f32>>) {
+        self.clip = Some(ClipPlayback { samples, cursor: 0 });
+    }
+
+    pub fn stop_clip(&mut self) {
+        self.clip = None;
+    }
+
+    /// The clip's volume, clamped to 0.0..=2.0 like a speaker's. Default 1.0,
+    /// and it outlives the clip it applies to.
+    pub fn set_clip_gain(&mut self, gain: f32) {
+        self.clip_gain = gain.clamp(0.0, MAX_GAIN);
+    }
+
+    pub fn clip_playing(&self) -> bool {
+        self.clip.is_some()
     }
 
     /// Feeds the watched share's audio. A packet from a different ssrc starts a
@@ -747,5 +825,152 @@ mod tests {
 
         playout.remove_share();
         assert!(playout.share_stats().is_none());
+    }
+
+    /// `frames` 20 ms stereo frames of a left-only 440 Hz tone, already decoded.
+    fn clip_samples(frames: usize) -> Arc<Vec<f32>> {
+        let mut tone = Tone::new(440.0, 0.5);
+        let mut left = [0.0f32; FRAME_SAMPLES];
+        let mut pcm = Vec::with_capacity(frames * STEREO_FRAME_SAMPLES);
+        for _ in 0..frames {
+            tone.fill(&mut left);
+            for sample in left {
+                pcm.push(sample);
+                pcm.push(0.0);
+            }
+        }
+        Arc::new(pcm)
+    }
+
+    #[test]
+    fn a_clip_is_heard_in_stereo_and_in_mono() {
+        let samples = clip_samples(3);
+
+        let mut stereo = Playout::new();
+        stereo.set_clip(Arc::clone(&samples));
+        let (frame, mixed) = stereo_frame_after(&mut stereo, 1);
+        // Heard, but not a speaker.
+        assert_eq!(mixed, 0);
+        let (left, right) = (channel(&frame, 0), channel(&frame, 1));
+        assert!(rms(&left) > 0.01, "the clip is silent: {}", rms(&left));
+        assert_eq!(rms(&right), 0.0);
+
+        let mut mono = Playout::new();
+        mono.set_clip(Arc::clone(&samples));
+        let (down, mixed) = frame_after(&mut mono, 1);
+        assert_eq!(mixed, 0);
+        // Left only in, so the downmix is half of it.
+        let down = rms(&down);
+        let loud = rms(&left);
+        assert!(
+            (down - loud * 0.5).abs() < loud * 0.01,
+            "downmix {down}, expected about {}",
+            loud * 0.5
+        );
+    }
+
+    #[test]
+    fn the_clip_gain_clamps_and_outlives_the_clip() {
+        let samples = clip_samples(3);
+
+        let mut plain = Playout::new();
+        plain.set_clip(Arc::clone(&samples));
+        let (plain_frame, _) = stereo_frame_after(&mut plain, 1);
+
+        let mut quiet = Playout::new();
+        // Set before the clip ever starts, and it survives the one before it.
+        quiet.set_clip_gain(0.5);
+        quiet.set_clip(Arc::clone(&samples));
+        quiet.stop_clip();
+        quiet.set_clip(Arc::clone(&samples));
+        let (quiet_frame, _) = stereo_frame_after(&mut quiet, 1);
+
+        let loud = rms(&channel(&plain_frame, 0));
+        let half = rms(&channel(&quiet_frame, 0));
+        assert!(loud > 0.01, "the reference clip is silent: {loud}");
+        assert!(
+            (half - loud * 0.5).abs() < loud * 0.01,
+            "half gain gave {half}, expected about {}",
+            loud * 0.5
+        );
+
+        let mut clamped = Playout::new();
+        clamped.set_clip_gain(5.0);
+        clamped.set_clip(Arc::clone(&samples));
+        let (boosted, _) = stereo_frame_after(&mut clamped, 1);
+        assert!(
+            boosted.iter().all(|sample| (-1.0..=1.0).contains(sample)),
+            "the boosted clip left the valid range"
+        );
+        assert!(rms(&channel(&boosted, 0)) > loud);
+
+        let mut silent = Playout::new();
+        silent.set_clip_gain(-1.0);
+        silent.set_clip(Arc::clone(&samples));
+        let (nothing, _) = stereo_frame_after(&mut silent, 1);
+        assert_eq!(rms(&nothing), 0.0);
+    }
+
+    #[test]
+    fn a_clip_retires_when_it_runs_out() {
+        let mut playout = Playout::new();
+        playout.set_clip(clip_samples(2));
+        assert!(playout.clip_playing());
+
+        let (_, mixed) = stereo_frame_after(&mut playout, 1);
+        assert_eq!(mixed, 0);
+        assert!(playout.clip_playing());
+
+        // The second pass drains the last frame.
+        stereo_frame_after(&mut playout, 1);
+        assert!(!playout.clip_playing());
+
+        let (after, _) = stereo_frame_after(&mut playout, 1);
+        assert_eq!(rms(&after), 0.0);
+    }
+
+    #[test]
+    fn a_second_clip_replaces_the_first() {
+        let mut playout = Playout::new();
+        playout.set_clip(clip_samples(10));
+        stereo_frame_after(&mut playout, 3);
+        playout.set_clip(clip_samples(1));
+
+        // The replacement starts from its own beginning and is one frame long.
+        let (frame, _) = stereo_frame_after(&mut playout, 1);
+        assert!(rms(&channel(&frame, 0)) > 0.01);
+        assert!(!playout.clip_playing());
+    }
+
+    #[test]
+    fn a_clip_that_is_not_a_whole_number_of_frames_drains() {
+        let whole = clip_samples(1);
+        let mut ragged = whole.as_ref().clone();
+        ragged.truncate(STEREO_FRAME_SAMPLES / 2 + 1);
+        let mut playout = Playout::new();
+        playout.set_clip(Arc::new(ragged));
+
+        let (frame, mixed) = stereo_frame_after(&mut playout, 1);
+        assert_eq!(mixed, 0);
+        assert!(rms(&channel(&frame, 0)) > 0.0);
+        assert!(!playout.clip_playing());
+    }
+
+    #[test]
+    fn a_clip_outlives_the_speaker_timeout() {
+        let mut playout = Playout::new();
+        playout.set_clip(clip_samples(6));
+        feed(&mut playout, 7, &opus_frames(0.5, 6));
+
+        let (_, mixed) = stereo_frame_after(&mut playout, 3);
+        // Three frames of the clip are gone, and only the voice was counted.
+        assert_eq!(mixed, 1);
+
+        // Long past the speaker timeout: the voice is reaped, the clip is not.
+        let mut out = [0.0f32; STEREO_FRAME_SAMPLES];
+        let later = Instant::now() + SPEAKER_TIMEOUT + Duration::from_secs(1);
+        playout.mix(later, &mut out, true);
+        assert!(playout.stats().is_empty());
+        assert!(playout.clip_playing());
     }
 }

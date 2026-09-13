@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Net.WebSockets;
 using Google.Protobuf;
+using Vorcall.Server.Attachments;
 using Vorcall.Server.Permissions;
 using Vorcall.Server.Protocol;
 using Vorcall.Server.Streams;
@@ -156,6 +158,10 @@ public sealed partial class ConnectionRegistry
     private readonly Dictionary<long, CategoryRecord> _categories = [];
     private readonly Dictionary<long, ChannelState> _channelById = [];
 
+    // The soundpad library. Server-wide and unfiltered: every member sees every clip, so unlike a
+    // channel there is nothing to resolve per reader.
+    private readonly Dictionary<long, SoundRecord> _soundById = [];
+
     // Every account that is not banned, online or not.
     private readonly Dictionary<long, MemberState> _memberById = [];
 
@@ -168,6 +174,7 @@ public sealed partial class ConnectionRegistry
     private readonly ServerDirectory _server;
     private readonly VoiceRelay _relay;
     private readonly StreamRegistry _streams;
+    private readonly SoundStore _sounds;
     private readonly ILogger<ConnectionRegistry> _logger;
 
     private long _everyoneRoleId;
@@ -183,6 +190,7 @@ public sealed partial class ConnectionRegistry
         ServerDirectory server,
         VoiceRelay relay,
         StreamRegistry streams,
+        SoundStore sounds,
         ILogger<ConnectionRegistry> logger)
     {
         _channels = channels;
@@ -191,6 +199,7 @@ public sealed partial class ConnectionRegistry
         _server = server;
         _relay = relay;
         _streams = streams;
+        _sounds = sounds;
         _logger = logger;
         _relay.SpeakingChanged += OnSpeakingChanged;
     }
@@ -281,6 +290,7 @@ public sealed partial class ConnectionRegistry
         var (roles, rolesByUser) = await _roles.LoadAllAsync(ct);
         var (categories, channels, overrides) = await _channels.LoadAllAsync(ct);
         var members = await _members.LoadAllAsync(ct);
+        var sounds = await _sounds.ListAsync(ct);
 
         int roleCount;
         int categoryCount;
@@ -368,6 +378,12 @@ public sealed partial class ConnectionRegistry
                 }
 
                 _memberById[member.UserId] = state;
+            }
+
+            _soundById.Clear();
+            foreach (var sound in sounds)
+            {
+                _soundById[sound.Id] = sound;
             }
 
             roleCount = _roleById.Count;
@@ -1346,6 +1362,14 @@ public sealed partial class ConnectionRegistry
 
         channel.Voice.Remove(userId);
         removed.Add(slot.Session.Ssrc);
+
+        // Nobody is left to hear it, and the record would otherwise outlive the session it was
+        // played into: the next joiner must not inherit a clip from a previous one.
+        if (channel.Voice.Count == 0)
+        {
+            channel.Playing = null;
+        }
+
         BroadcastToChannelLocked(
             channel,
             new ServerFrame { VoiceMemberLeft = new VoiceMemberLeft { ChannelId = channel.Record.Id, UserId = userId } },
@@ -1581,6 +1605,13 @@ public sealed partial class ConnectionRegistry
             snapshot.Members.Add(ProfileOf(member));
         }
 
+        // The whole soundpad library, unfiltered: it is server-wide, so there is no reader it is
+        // shown a part of.
+        foreach (var sound in _soundById.Values.OrderBy(sound => sound.Id))
+        {
+            snapshot.Sounds.Add(SoundOf(sound));
+        }
+
         return new ServerFrame { ServerSnapshot = snapshot };
     }
 
@@ -1606,6 +1637,16 @@ public sealed partial class ConnectionRegistry
             Permissions = role.Permissions,
             Hoist = role.Hoist,
             Everyone = role.IsEveryone,
+        };
+
+    private static Protocol.Sound SoundOf(SoundRecord sound)
+        => new()
+        {
+            Id = sound.Id,
+            Name = sound.Name,
+            UploaderId = sound.UploaderId ?? 0,
+            DurationMs = (uint)sound.DurationMs,
+            Size = sound.Size,
         };
 
     private static Protocol.Category CategoryOf(CategoryRecord category)
@@ -1849,6 +1890,9 @@ public sealed partial class ConnectionRegistry
         // By user id: an account holds at most one slot in a channel.
         public Dictionary<long, VoiceSlot> Voice { get; } = [];
 
+        // What is playing in this channel's voice session, if anything.
+        public PlayingSound? Playing { get; set; }
+
         // Rebuilt by RebuildDefLocked after any override change and whenever general moves.
         public ChannelDef Def { get; set; } = new(record.Id, false, []);
 
@@ -1870,6 +1914,14 @@ public sealed partial class ConnectionRegistry
 
         // Maintained for online members only, and cleared when the session ends.
         public HashSet<long> Visible { get; } = [];
+    }
+
+    // What is playing in this channel's voice session, if anything. Playback is entirely
+    // client-side, so the server is never told a clip ended: a record older than its own
+    // duration is finished. PROTOCOL.md § Sounds.
+    private sealed record PlayingSound(long SoundId, long UserId, long StartedAtTicks, int DurationMs)
+    {
+        public bool Finished => Stopwatch.GetElapsedTime(StartedAtTicks).TotalMilliseconds >= DurationMs;
     }
 
     // One account's live voice session in one channel. The connection is kept alongside the session

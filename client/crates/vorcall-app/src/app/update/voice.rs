@@ -15,17 +15,22 @@ use vorcall_core::config::{Config, PeerAudio, TransmitMode, VAD_MAX_DB, VAD_MIN_
 use vorcall_core::connection::{AdminCommand, Command, MediaKey};
 use vorcall_core::{Event, VoiceMember};
 use vorcall_hotkey::{ActionId, Binding, Edge, Listener, Shortcut, Unavailable};
-use vorcall_voice::{CleanupSettings, MediaConfig, MediaEngine};
+use vorcall_voice::{CleanupSettings, MediaConfig, MediaEngine, Sfx};
 
 use crate::app::message::{Message, ToastKind, VoiceMsg};
 use crate::app::state::rules::{
     self, GLOBAL_ACTIONS, PUSH_TO_TALK, TOGGLE_DEAFEN, TOGGLE_MUTE, WINDOW_GENERATION,
 };
+use crate::app::state::sound::{Switch, Switches, press};
 use crate::app::state::voice::{EngineHandoff, HotkeyHandoff, HotkeyStatus, MediaSession, VoiceUi};
 use crate::app::update::share;
 use crate::app::{App, SPEAKING_WINDOW, STATS_EVERY, VOICE_TICK};
 use crate::workers::share::ShareCommand;
 use crate::workers::voice::{AudioCommand, AudioEvent, AudioSettings, TransmitSettings, lock};
+
+/// The loudest either sound volume goes, which is the range the configuration
+/// stores and the same 200 % a peer's own volume allows.
+pub const VOLUME_MAX: f32 = 2.0;
 
 pub fn update(app: &mut App, message: VoiceMsg) -> Task<Message> {
     match message {
@@ -70,6 +75,32 @@ pub fn update(app: &mut App, message: VoiceMsg) -> Task<Message> {
             app.config.priority_ducking = value;
             app.save_config();
             push_ducking(app);
+            Task::none()
+        }
+        VoiceMsg::SetVoiceSounds(value) => {
+            app.config.voice_sounds = value;
+            app.save_config();
+            Task::none()
+        }
+        VoiceMsg::SetSelfSounds(value) => {
+            app.config.self_sounds = value;
+            app.save_config();
+            Task::none()
+        }
+        // Every step of either drag reaches the audio thread; only its end
+        // reaches the disk.
+        VoiceMsg::SetSoundVolume(volume) => {
+            app.config.sound_volume = volume.clamp(0.0, VOLUME_MAX);
+            push_volumes(app);
+            Task::none()
+        }
+        VoiceMsg::SetSoundpadVolume(volume) => {
+            app.config.soundpad_volume = volume.clamp(0.0, VOLUME_MAX);
+            push_volumes(app);
+            Task::none()
+        }
+        VoiceMsg::SoundVolumeReleased | VoiceMsg::SoundpadVolumeReleased => {
+            app.save_config();
             Task::none()
         }
         VoiceMsg::SetPeerVolume(user_id, volume) => {
@@ -253,13 +284,24 @@ pub fn leave(app: &mut App) -> Task<Message> {
         return Task::none();
     };
     let channel_id = main.voice.channel_id;
+    // Read before the teardown: afterwards nothing says this client was in
+    // voice at all.
+    let leaving = main.voice.intent;
     main.voice.give_up_intents();
     // The intent is cleared either way: the server drops the session when the
     // socket ends.
     if !main.send_command(Command::LeaveVoice { channel_id }) {
         main.notice = Some("Not connected".to_owned());
     }
-    close_session(app)
+
+    let closing = close_session(app);
+    // After the session is down rather than before it: the mixer that would
+    // have carried the motif is being closed in the same breath, so this one
+    // goes out the fallback.
+    if leaving && app.config.voice_sounds {
+        app.play_sfx(Sfx::Leave);
+    }
+    closing
 }
 
 /// Ends the media path and everything drawn from it, keeping the intents. The
@@ -269,6 +311,9 @@ pub fn close_session(app: &mut App) -> Task<Message> {
     let Some(main) = app.main_mut() else {
         return stage;
     };
+    // The clip belonged to that session, and no `SoundStopped` is coming for a
+    // channel this client is no longer in.
+    main.sound.left();
     let voice = &mut main.voice;
     // Dropping the listener stops it: nothing outside a session observes the
     // bindings.
@@ -497,15 +542,25 @@ fn media_connected(app: &mut App, handoff: EngineHandoff) -> Task<Message> {
 
     // The switches may have moved between the JoinVoice and the session going live:
     // the audio thread outlives a session and keeps its own copy of every flag, and
-    // the server heard only the values the join carried.
+    // the server heard only the values the join carried. The two sound volumes go
+    // the same way, so one set before joining is in force.
     app.send_audio(AudioCommand::SetMuted(muted));
     app.send_audio(AudioCommand::SetDeafened(deafened));
     app.send_audio(AudioCommand::SetPtt(ptt_held));
+    push_volumes(app);
     push_self_state(app, muted, deafened);
     // `Open` forgets every peer, so the stored tuning follows it rather than
     // preceding it.
     push_peers(app);
     push_ducking(app);
+
+    // The server sends no `VoiceMemberJoined` for this account, so the session
+    // going live is what stands for its own join. Never `voice_state`, which
+    // replaces a whole roster: joining a busy channel is one arrival, not one
+    // per occupant.
+    if app.config.voice_sounds {
+        app.play_sfx(Sfx::Join);
+    }
 
     // The share starts again on the new sender. The `VoiceState` behind the
     // `VoiceReady` normally lands before this, so the watch is usually decided
@@ -586,6 +641,9 @@ fn member_joined(app: &mut App, channel_id: i64, member: VoiceMember) -> Task<Me
         return Task::none();
     };
     let joined = channel_id == main.voice.channel_id;
+    // This account's own join never arrives as a frame; the session going live
+    // is what stands for it.
+    let arrived = joined && member.user_id != main.member_id;
     let peer = joined.then(|| (member.ssrc, main.voice.peer_audio(member.user_id)));
     main.voice.insert_member(channel_id, member);
 
@@ -593,6 +651,9 @@ fn member_joined(app: &mut App, channel_id: i64, member: VoiceMember) -> Task<Me
     if let Some((ssrc, audio)) = peer {
         send_peer(app, ssrc, audio);
         push_ducking(app);
+    }
+    if arrived && app.config.voice_sounds {
+        app.play_sfx(Sfx::Join);
     }
     Task::none()
 }
@@ -605,6 +666,9 @@ fn member_left(app: &mut App, channel_id: i64, user_id: i64) -> Task<Message> {
     if channel_id != main.voice.channel_id {
         return Task::none();
     }
+    // This account's own departure is the leave it asked for, not somebody
+    // else's: that motif belongs to `leave`.
+    let departed = user_id != main.member_id;
     // The server dropped this client's own session — a leave from another device, a
     // permission that is gone. Nothing is on the relay any more, so the media path
     // goes with it; the intent stays, and the next connection asks again.
@@ -612,6 +676,9 @@ fn member_left(app: &mut App, channel_id: i64, user_id: i64) -> Task<Message> {
         return close_session(app);
     }
     push_ducking(app);
+    if departed && app.config.voice_sounds {
+        app.play_sfx(Sfx::Leave);
+    }
     Task::none()
 }
 
@@ -642,36 +709,38 @@ fn moderate(
 }
 
 fn toggle_mute(app: &mut App) -> Task<Message> {
-    let Some(main) = app.main_mut() else {
-        return Task::none();
-    };
-    let voice = &mut main.voice;
-    voice.muted = !voice.muted;
-    // Speaking again while deafened means hearing again too.
-    if !voice.muted {
-        voice.deafened = false;
-    }
-    let (muted, deafened) = (voice.muted, voice.deafened);
-    push_flags(app, muted, deafened);
-    push_self_state(app, muted, deafened);
-    Task::none()
+    switched(app, Switch::Mute)
 }
 
 fn toggle_deafen(app: &mut App) -> Task<Message> {
+    switched(app, Switch::Deafen)
+}
+
+/// One press of either switch. `press` is what moves the flags and names the one
+/// motif the press is worth: deafening also mutes and unmuting also un-deafens,
+/// and neither of those second moves is a press anybody made.
+fn switched(app: &mut App, switch: Switch) -> Task<Message> {
     let Some(main) = app.main_mut() else {
         return Task::none();
     };
     let voice = &mut main.voice;
-    voice.deafened = !voice.deafened;
-    if voice.deafened {
-        voice.muted_before_deafen = voice.muted;
-        voice.muted = true;
-    } else {
-        voice.muted = voice.muted_before_deafen;
+    let (next, motif) = press(
+        Switches {
+            muted: voice.muted,
+            deafened: voice.deafened,
+            muted_before_deafen: voice.muted_before_deafen,
+        },
+        switch,
+    );
+    voice.muted = next.muted;
+    voice.deafened = next.deafened;
+    voice.muted_before_deafen = next.muted_before_deafen;
+
+    push_flags(app, next.muted, next.deafened);
+    push_self_state(app, next.muted, next.deafened);
+    if app.config.self_sounds {
+        app.play_sfx(motif);
     }
-    let (muted, deafened) = (voice.muted, voice.deafened);
-    push_flags(app, muted, deafened);
-    push_self_state(app, muted, deafened);
     Task::none()
 }
 
@@ -992,6 +1061,13 @@ fn push_self_state(app: &mut App, muted: bool, deafened: bool) {
 
 fn push_transmit(app: &App) {
     app.send_audio(AudioCommand::SetTransmit(transmit_settings(&app.config)));
+}
+
+/// The listener's own volumes for the motifs and the soundpad. The audio thread
+/// outlives a session and keeps its own copy of both.
+pub fn push_volumes(app: &App) {
+    app.send_audio(AudioCommand::SetSfxVolume(app.config.sound_volume));
+    app.send_audio(AudioCommand::SetClipVolume(app.config.soundpad_volume));
 }
 
 fn push_cleanup(app: &App) {

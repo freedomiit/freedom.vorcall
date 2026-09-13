@@ -636,6 +636,7 @@ mod tests {
                 mentions: 1,
                 last_message_id: 40,
             }],
+            sounds: vec![],
         });
         model
     }

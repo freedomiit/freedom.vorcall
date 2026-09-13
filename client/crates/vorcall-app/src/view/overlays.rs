@@ -10,22 +10,27 @@
 //! that `update::ui` turns into the command. No dialog keeps a draft anywhere
 //! else, so closing one forgets it.
 
+use std::sync::Arc;
+
 use iced::alignment::{Horizontal, Vertical};
+use iced::widget::canvas::{self, Canvas, Frame, Program};
 use iced::widget::{
     Id, Space, TextInput, button, column, container, image, mouse_area, opaque, progress_bar, row,
     scrollable, slider, stack, text, text_input, toggler,
 };
-use iced::{ContentFit, Element, Length, mouse};
+use iced::{Color, ContentFit, Element, Length, Rectangle, Renderer, Size, Theme, mouse};
 use vorcall_core::ChannelKind;
 use vorcall_core::images::ImagePurpose;
+use vorcall_core::permissions;
 use vorcall_screen::{Source, SourceId, SourceKind};
 
 use crate::app::message::{
-    AdminMsg, AuthMsg, ChatMsg, CropMsg, Message, SettingsMsg, ShareMsg, UiMsg,
+    AdminMsg, AuthMsg, ChatMsg, CropMsg, Message, SettingsMsg, ShareMsg, SoundMsg, UiMsg,
 };
 use crate::app::state::chat::ImageState;
 use crate::app::state::crop::{self, CropState, FRAME_WIDTH, ZOOM_MAX, ZOOM_MIN};
 use crate::app::state::rules::{format_bytes, progress_fraction};
+use crate::app::state::sound::{TRIM_WIDTH, TrimEdge, TrimState, can_stop, clock, span_ms};
 use crate::app::state::ui::{
     Dialog, DialogAction, SourcesState, TransferSource, TransferState, validate_long, validate_name,
 };
@@ -35,8 +40,8 @@ use crate::theme::ThemeTokens;
 use crate::theme::styles;
 use crate::view::widgets;
 use crate::view::{
-    CURRENT_PASSWORD_ID, TEXT_BODY, TEXT_ROW, TEXT_SECTION, context_menu, profile_card,
-    quick_switcher, toasts,
+    CURRENT_PASSWORD_ID, TEXT_BADGE, TEXT_BODY, TEXT_ROW, TEXT_SECONDARY, TEXT_SECTION,
+    context_menu, profile_card, quick_switcher, toasts,
 };
 use crate::workers::images::ImageKey;
 
@@ -47,6 +52,15 @@ const PICKER_WIDTH: f32 = 440.0;
 const SOURCES_HEIGHT: f32 = 220.0;
 /// The bar a running transfer draws.
 const TRANSFER_BAR_GIRTH: f32 = 6.0;
+/// The trim view: as tall as it is wide is far too much for a waveform, so it
+/// draws in a strip, with a grip at either end.
+const TRIM_HEIGHT: f32 = 96.0;
+const TRIM_GRIP: f32 = 9.0;
+/// The soundpad popover: how wide it is, and how many clips a row holds.
+const PAD_WIDTH: f32 = 280.0;
+const PAD_COLUMNS: usize = 2;
+/// How many rows of clips are on screen before the grid scrolls.
+const PAD_HEIGHT: f32 = 220.0;
 
 /// The stacked overlays, topmost last. Nothing is drawn when nothing is open.
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
@@ -60,6 +74,9 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     }
     if app.ui.profile_card.is_some() {
         layers.push(profile_card::view(app, main));
+    }
+    if let Some(at) = main.sound.popover {
+        layers.push(soundpad(app, main, at));
     }
     if app.ui.context_menu.is_some() {
         layers.push(context_menu::view(app, main));
@@ -150,6 +167,12 @@ fn modal<'a>(app: &'a App, main: &'a MainState, dialog: &'a Dialog) -> Element<'
             "Everybody who has it loses it, and the permissions it granted.",
             "Delete role",
         ),
+        Dialog::ConfirmDeleteSound { sound_id } => confirm(
+            app,
+            format!("Delete {}?", sound_name(main, *sound_id)),
+            "It goes from the soundpad for everybody, and anyone playing it is cut off.",
+            "Delete clip",
+        ),
         Dialog::ConfirmDeleteMessage { .. } => confirm(
             app,
             "Delete this message?".to_owned(),
@@ -179,6 +202,9 @@ fn modal<'a>(app: &'a App, main: &'a MainState, dialog: &'a Dialog) -> Element<'
             crop,
             ..
         } => crop_image(app, *purpose, handle, *source, *crop),
+        Dialog::TrimSound {
+            name, source, trim, ..
+        } => trim_sound(app, name, source.duration_ms, &source.peaks, *trim),
         Dialog::SharePicker {
             sources,
             selected,
@@ -1040,6 +1066,271 @@ fn category_name(main: &MainState, id: i64) -> String {
         || "this category".to_owned(),
         |category| category.name.clone(),
     )
+}
+
+fn sound_name(main: &MainState, id: i64) -> String {
+    main.sound
+        .library
+        .get(&id)
+        .map_or_else(|| "this clip".to_owned(), |sound| sound.name.clone())
+}
+
+/// The trim adjuster a picked audio file goes through before it is uploaded: the
+/// waveform, a grip at either end of the selection, and what the selection is.
+///
+/// The whole source is held as it was decoded; the grips only name a span of it,
+/// and nothing is encoded until the user presses through.
+fn trim_sound<'a>(
+    app: &'a App,
+    name: &'a str,
+    duration_ms: u32,
+    peaks: &'a Arc<Vec<(f32, f32)>>,
+    trim: TrimState,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let (start_ms, end_ms) = span_ms(trim, duration_ms);
+
+    let waveform = Canvas::new(Waveform {
+        peaks: peaks.clone(),
+        trim,
+        body: tokens.track,
+        selection: tokens.accent,
+        edge: tokens.thumb,
+    })
+    .width(TRIM_WIDTH)
+    .height(TRIM_HEIGHT);
+
+    // The two grips sit over the waveform, each at its own edge; the fill
+    // between them is what keeps them there as the selection moves.
+    let start_px = (trim.start.clamp(0.0, 1.0) * TRIM_WIDTH).clamp(0.0, TRIM_WIDTH);
+    let end_px = (trim.end.clamp(0.0, 1.0) * TRIM_WIDTH).clamp(start_px, TRIM_WIDTH);
+    let grips = row![
+        Space::new().width((start_px - TRIM_GRIP / 2.0).max(0.0)),
+        grip(app, TrimEdge::Start),
+        Space::new().width(Length::Fill),
+        grip(app, TrimEdge::End),
+        Space::new().width((TRIM_WIDTH - end_px - TRIM_GRIP / 2.0).max(0.0)),
+    ]
+    .width(TRIM_WIDTH)
+    .height(TRIM_HEIGHT);
+
+    // One area over the whole strip carries the drag: a grip only says which
+    // edge went down, and a release outside the frame never arrives.
+    let frame_area = mouse_area(
+        container(stack![waveform, grips])
+            .width(TRIM_WIDTH)
+            .height(TRIM_HEIGHT)
+            .style(styles::container::input(tokens)),
+    )
+    .on_move(|at| Message::Sound(SoundMsg::TrimMove(at.x)))
+    .on_release(Message::Sound(SoundMsg::TrimEnd))
+    .on_exit(Message::Sound(SoundMsg::TrimEnd));
+
+    let times = row![
+        text(clock(start_ms))
+            .size(TEXT_SECONDARY)
+            .color(tokens.text_muted),
+        Space::new().width(Length::Fill),
+        text(clock(end_ms.saturating_sub(start_ms)))
+            .size(TEXT_ROW)
+            .color(tokens.text_secondary),
+        Space::new().width(Length::Fill),
+        text(clock(end_ms))
+            .size(TEXT_SECONDARY)
+            .color(tokens.text_muted),
+    ]
+    .width(TRIM_WIDTH)
+    .align_y(Vertical::Center);
+
+    let rows: Vec<Element<'_, Message>> = vec![
+        note(tokens, name.to_owned()),
+        container(column![frame_area, times].spacing(6))
+            .center_x(Length::Fill)
+            .into(),
+        note(
+            tokens,
+            "Drag either end to choose the part that becomes the clip.".to_owned(),
+        ),
+    ];
+
+    sized_frame(
+        app,
+        "Trim the clip",
+        rows,
+        actions(app, "Add clip", true, false),
+        PICKER_WIDTH,
+    )
+}
+
+/// One draggable end of the selection.
+fn grip<'a>(app: &'a App, edge: TrimEdge) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let thumb = tokens.thumb;
+    mouse_area(
+        container(Space::new())
+            .width(TRIM_GRIP)
+            .height(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(thumb.into()),
+                border: iced::border::rounded(TRIM_GRIP / 2.0),
+                ..container::Style::default()
+            }),
+    )
+    .interaction(mouse::Interaction::Grab)
+    .on_press(Message::Sound(SoundMsg::TrimStart(edge)))
+    .into()
+}
+
+/// The decoded source as a waveform, with the selection painted in the accent
+/// and the rest of it in the track colour.
+struct Waveform {
+    peaks: Arc<Vec<(f32, f32)>>,
+    trim: TrimState,
+    body: Color,
+    selection: Color,
+    edge: Color,
+}
+
+impl Program<Message> for Waveform {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let buckets = self.peaks.len();
+        if buckets == 0 {
+            return vec![frame.into_geometry()];
+        }
+
+        let middle = bounds.height / 2.0;
+        let width = bounds.width / buckets as f32;
+        let (start, end) = (
+            self.trim.start.clamp(0.0, 1.0),
+            self.trim.end.clamp(0.0, 1.0),
+        );
+
+        for (index, (low, high)) in self.peaks.iter().enumerate() {
+            let along = (index as f32 + 0.5) / buckets as f32;
+            let color = if along >= start && along <= end {
+                self.selection
+            } else {
+                self.body
+            };
+            // A bucket of silence still draws a hairline, so the strip reads as
+            // a waveform rather than a gap.
+            let top = middle - high.clamp(-1.0, 1.0) * middle;
+            let bottom = middle - low.clamp(-1.0, 1.0) * middle;
+            let height = (bottom - top).max(1.0);
+            frame.fill_rectangle(
+                iced::Point::new(index as f32 * width, top),
+                Size::new(width.max(1.0), height),
+                color,
+            );
+        }
+
+        for at in [start, end] {
+            frame.fill_rectangle(
+                iced::Point::new((at * bounds.width - 1.0).max(0.0), 0.0),
+                Size::new(2.0, bounds.height),
+                self.edge,
+            );
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// The soundpad over the voice bar: every clip in the library, and the control
+/// that cuts whatever is playing.
+fn soundpad<'a>(app: &'a App, main: &'a MainState, at: iced::Point) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let clips = main.sound.ordered();
+    let at = app
+        .ui
+        .clamp_popover(at, Size::new(PAD_WIDTH, PAD_HEIGHT + 64.0));
+
+    let mut grid = column![].spacing(6).width(Length::Fill);
+    if clips.is_empty() {
+        grid = grid.push(
+            text("The soundpad is empty.")
+                .size(TEXT_SECONDARY)
+                .color(tokens.text_muted),
+        );
+    }
+    for chunk in clips.chunks(PAD_COLUMNS) {
+        let mut line = row![].spacing(6).width(Length::Fill);
+        for clip in chunk {
+            line = line.push(
+                button(
+                    column![
+                        text(clip.name.clone())
+                            .size(TEXT_ROW)
+                            .color(tokens.text_primary),
+                        text(clock(clip.duration_ms))
+                            .size(TEXT_BADGE)
+                            .color(tokens.text_muted),
+                    ]
+                    .spacing(2),
+                )
+                .width(Length::Fill)
+                .padding([6.0, 8.0])
+                .style(styles::button::secondary(tokens))
+                .on_press(Message::Sound(SoundMsg::Play(clip.id))),
+            );
+        }
+        // A last row with one clip in it must not stretch it across the card.
+        for _ in chunk.len()..PAD_COLUMNS {
+            line = line.push(Space::new().width(Length::Fill));
+        }
+        grid = grid.push(line);
+    }
+
+    let mut head = row![
+        text("Soundpad").size(TEXT_ROW).color(tokens.text_secondary),
+        Space::new().width(Length::Fill),
+    ]
+    .align_y(Vertical::Center);
+    if can_stop(
+        main.sound.playing,
+        main.member_id,
+        main.server.can(permissions::MANAGE_SOUNDS, None),
+    ) {
+        head = head.push(widgets::icon_button(
+            Icon::SpeakerOff,
+            "Stop the clip",
+            Some(Message::Sound(SoundMsg::Stop)),
+            tokens,
+        ));
+    }
+
+    let card = container(
+        column![
+            head,
+            scrollable(grid)
+                .height(Length::Shrink)
+                .style(styles::scrollable(tokens)),
+        ]
+        .spacing(8),
+    )
+    .width(PAD_WIDTH)
+    .max_height(PAD_HEIGHT + 64.0)
+    .padding(10)
+    .style(styles::container::popover(tokens));
+
+    // A press anywhere else is what closes it, whichever button it was.
+    let dismiss = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::Sound(SoundMsg::ClosePopover))
+        .on_right_press(Message::Sound(SoundMsg::ClosePopover));
+
+    stack![dismiss, context_menu::anchored(card.into(), at)]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn role_name(main: &MainState, id: i64) -> String {

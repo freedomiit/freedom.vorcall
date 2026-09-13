@@ -4,11 +4,15 @@ namespace Vorcall.Server.Attachments;
 // that picks a file and then abandons the composer leaves a row and a file behind. Deleting a
 // message takes its own attachments with it, so this only ever sees the unlinked ones. Images are
 // the same story with a different reference — a profile, the server row or a role — and are swept
-// on the same schedule. An attachment row whose bytes never finished arriving waits for the far
-// longer incomplete cutoff instead, since a large upload can still be in flight.
+// on the same schedule. A soundpad clip is referenced by nothing and is only ever deleted on
+// purpose, so its two passes reclaim what an upload that died mid-flight left behind: the rows
+// whose bytes never arrived, and the files no row names. An attachment row whose bytes never
+// finished arriving waits for the far longer incomplete cutoff instead, since a large upload can
+// still be in flight — a 16 MiB clip cannot, which is why its own cutoff is the short one.
 public sealed class AttachmentSweeper(
     AttachmentStore store,
     ImageStore images,
+    SoundStore sounds,
     ILogger<AttachmentSweeper> logger) : BackgroundService
 {
     // Late enough that a restart does not compete with the migration and the first connections.
@@ -34,16 +38,24 @@ public sealed class AttachmentSweeper(
                         AttachmentsOptions.UnlinkedTtl,
                         now,
                         stoppingToken);
-                    if (removed > 0 || removedImages > 0)
+                    var incompleteSounds = await sounds.SweepIncompleteAsync(
+                        now - AttachmentsOptions.UnlinkedTtl,
+                        stoppingToken);
+                    var orphanSoundFiles = await sounds.SweepOrphanFilesAsync(stoppingToken);
+                    if (removed > 0 || removedImages > 0 || incompleteSounds > 0 || orphanSoundFiles > 0)
                     {
                         logger.LogInformation(
-                            "Swept {Count} unlinked attachments and {ImageCount} unreferenced images",
+                            "Swept {Count} unlinked attachments, {ImageCount} unreferenced images, "
+                            + "{SoundCount} incomplete sounds and {SoundFileCount} orphaned sound files",
                             removed,
-                            removedImages);
+                            removedImages,
+                            incompleteSounds,
+                            orphanSoundFiles);
                     }
                     else
                     {
-                        logger.LogDebug("Swept no unlinked attachments and no unreferenced images");
+                        logger.LogDebug(
+                            "Swept no unlinked attachments, no unreferenced images, no incomplete sounds and no orphaned sound files");
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)

@@ -29,6 +29,8 @@ public enum Perm : ulong
     MoveMembers = 1UL << 18,
     PrioritySpeaker = 1UL << 19,
     ChangeNickname = 1UL << 20,
+    Soundpad = 1UL << 21,
+    ManageSounds = 1UL << 22,
 }
 
 // The proto spellings without the PERMISSION_ prefix: PROTOCOL.md § Roles and permissions makes one
@@ -59,6 +61,8 @@ public static class PermNames
         "MOVE_MEMBERS",
         "PRIORITY_SPEAKER",
         "CHANGE_NICKNAME",
+        "SOUNDPAD",
+        "MANAGE_SOUNDS",
     ];
 
     // Empty for anything that is not one defined bit: only a single bit has a name on the wire.

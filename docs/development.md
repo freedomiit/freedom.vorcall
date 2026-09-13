@@ -165,6 +165,10 @@ compiles only on a macOS runner.
 
 The voice and screen-share media paths. They are covered by runtime oracles instead.
 
+The soundpad is different: it has unit tests on both sides (mixing, the container parser,
+playback state) but no runtime oracle. Playing a clip never touches the media relay — it is
+a broadcast frame plus local playback — so `vorcall-probe` has nothing new to prove.
+
 ---
 
 ## Runtime oracles
@@ -225,6 +229,7 @@ server/                 ASP.NET Core (.NET 10)
   Permissions/            the pure permission engine — no database, no wire
   Chat/                   the in-memory mirror of the server, and the directories behind it
   Voice/                  the UDP media relay
+  Attachments/            uploads, images and the shared soundpad's clip store
   Api/                    REST endpoints
   Auth/                   accounts, tokens, invites, the door key
   Data/                   entities, DbContext, seeding
@@ -233,7 +238,8 @@ server/                 ASP.NET Core (.NET 10)
 client/                 Cargo workspace
   vorcall-proto           generated protobuf code
   vorcall-core            connection and protocol logic, the permission mirror, the updater
-  vorcall-voice           media engine: framing, AEAD, Opus, jitter buffer, echo cancellation
+  vorcall-voice           media engine: framing, AEAD, Opus, jitter buffer, echo cancellation,
+                          the soundpad's clip codec and sound-effect mixing
   vorcall-screen          screen capture backends and the OpenH264 codec
   vorcall-hotkey          system-wide input listener for push-to-talk and friends
   vorcall-clipboard       reading files and images off the clipboard, one backend per platform

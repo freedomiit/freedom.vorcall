@@ -20,6 +20,7 @@ pub mod permissions;
 pub mod registry;
 pub mod report;
 pub mod session;
+pub mod sounds;
 pub mod streams;
 mod transfer;
 pub mod update;
@@ -35,5 +36,5 @@ pub use streams::StreamError;
 pub use vorcall_proto::v1::{
     Attachment, Ban, Category, Channel, ChannelKind, ChannelPosition, ChatMessage, ErrorCode,
     Image, Invite, InviteCreated, MessagePage, Override, Permission, Profile, Reaction, ReadState,
-    ReplyRef, Role, Server, ServerSnapshot, StreamedFile, TokenResponse, VoiceMember,
+    ReplyRef, Role, Server, ServerSnapshot, Sound, StreamedFile, TokenResponse, VoiceMember,
 };

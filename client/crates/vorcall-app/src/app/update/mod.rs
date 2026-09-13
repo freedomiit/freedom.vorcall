@@ -14,6 +14,7 @@ pub mod events;
 pub mod keys;
 pub mod settings;
 pub mod share;
+pub mod sound;
 pub mod ui;
 pub mod voice;
 
@@ -39,6 +40,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Settings(message) => settings::update(app, message),
         Message::Admin(message) => admin::update(app, message),
         Message::Crop(message) => crop::update(app, message),
+        Message::Sound(message) => sound::update(app, message),
         Message::Ui(message) => ui::update(app, message),
         Message::Keys(message) => keys::update(app, message),
         Message::Update(message) => updates(app, message),

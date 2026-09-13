@@ -194,6 +194,18 @@ pub struct Config {
     /// Playback volume for a watched share, 0.0..=2.0.
     #[serde(default = "default_volume")]
     pub share_volume: f32,
+    /// Somebody joining or leaving the voice channel this client is in.
+    #[serde(default = "default_true")]
+    pub voice_sounds: bool,
+    /// This client's own mute and deafen switches.
+    #[serde(default = "default_true")]
+    pub self_sounds: bool,
+    /// Playback volume for the interface motifs, 0.0..=2.0.
+    #[serde(default = "default_volume")]
+    pub sound_volume: f32,
+    /// Playback volume for soundpad clips, 0.0..=2.0.
+    #[serde(default = "default_volume")]
+    pub soundpad_volume: f32,
     /// `"vorcall-dark"`, `"vorcall-light"` or `"custom:<slug>"`.
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -264,6 +276,10 @@ impl Default for Config {
             share_bitrate_kbps: None,
             share_audio: true,
             share_volume: 1.0,
+            voice_sounds: true,
+            self_sounds: true,
+            sound_volume: 1.0,
+            soundpad_volume: 1.0,
             theme: DEFAULT_THEME.to_owned(),
             density: Density::default(),
             font_scale: FONT_SCALE_DEFAULT,
@@ -485,6 +501,18 @@ fn normalize(config: &mut Config) {
         1.0
     } else {
         config.share_volume.clamp(0.0, 2.0)
+    };
+
+    config.sound_volume = if config.sound_volume.is_nan() {
+        1.0
+    } else {
+        config.sound_volume.clamp(0.0, 2.0)
+    };
+
+    config.soundpad_volume = if config.soundpad_volume.is_nan() {
+        1.0
+    } else {
+        config.soundpad_volume.clamp(0.0, 2.0)
     };
 
     for audio in config.peer_audio.values_mut() {

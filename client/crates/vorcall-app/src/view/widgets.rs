@@ -12,9 +12,10 @@ use iced::widget::text::Wrapping;
 use iced::widget::{Space, Text, button, column, container, image, row, stack, text, tooltip};
 use iced::{Background, Color, ContentFit, Element, Length, Renderer, Theme, border};
 use vorcall_core::config::Density;
+use vorcall_core::permissions;
 use vorcall_core::{Config, Profile, Role};
 
-use crate::app::message::{Message, SettingsMsg, ShareMsg, VoiceMsg};
+use crate::app::message::{Message, SettingsMsg, ShareMsg, SoundMsg, VoiceMsg};
 use crate::app::state::chat::{ChatState, ImageState};
 use crate::app::state::settings::SettingsTab;
 use crate::app::{App, MainState};
@@ -672,7 +673,7 @@ pub fn user_bar<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let name = main.server.display_name(main.member_id).to_owned();
     let handle = format!("@{}", main.username);
 
-    let bar = row![
+    let mut bar = row![
         member_avatar_on(main, main.member_id, AVATAR_ROW, tokens.bg_rail, tokens),
         column![
             clipped_name(
@@ -708,15 +709,21 @@ pub fn user_bar<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
             ICON_SIZE,
             tokens,
         ),
-        icon_button(
-            Icon::Gear,
-            "User settings",
-            Some(Message::Settings(SettingsMsg::Open(SettingsTab::Account))),
-            tokens,
-        ),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
+
+    // Only while in voice: a clip is played into a session, and outside one
+    // there is nothing for the popover to play into.
+    if main.voice.intent {
+        bar = bar.push(soundpad_button(app, main));
+    }
+    bar = bar.push(icon_button(
+        Icon::Gear,
+        "User settings",
+        Some(Message::Settings(SettingsMsg::Open(SettingsTab::Account))),
+        tokens,
+    ));
 
     container(bar)
         .width(Length::Fill)
@@ -724,6 +731,35 @@ pub fn user_bar<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
         .center_y(metrics.height(USER_BAR_HEIGHT))
         .style(styles::container::rail(tokens))
         .into()
+}
+
+/// The way into the soundpad, beside the two switches. Drawn disabled with the
+/// permission it wants in its tooltip rather than hidden, the way every other
+/// permission-gated control in this interface is.
+fn soundpad_button<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let allowed = main.voice.is_live()
+        && main
+            .server
+            .can(permissions::SOUNDPAD, Some(main.voice.channel_id));
+    let open = main.sound.popover.is_some();
+
+    icon_button_in(
+        Icon::Speaker,
+        if allowed {
+            "Soundpad"
+        } else {
+            "Requires Use soundpad"
+        },
+        allowed.then(|| Message::Sound(SoundMsg::OpenPopover(app.ui.cursor))),
+        if open {
+            tokens.accent
+        } else {
+            tokens.text_secondary
+        },
+        ICON_SIZE,
+        tokens,
+    )
 }
 
 /// One role, as the profile panes list it: a swatch of its own colour, its name,

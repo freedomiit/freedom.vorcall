@@ -27,9 +27,11 @@ pub const DEAFEN_MEMBERS: u64 = 1 << 17;
 pub const MOVE_MEMBERS: u64 = 1 << 18;
 pub const PRIORITY_SPEAKER: u64 = 1 << 19;
 pub const CHANGE_NICKNAME: u64 = 1 << 20;
+pub const SOUNDPAD: u64 = 1 << 21;
+pub const MANAGE_SOUNDS: u64 = 1 << 22;
 
 /// Every bit the schema defines.
-pub const ALL: u64 = 0x1F_FFFF;
+pub const ALL: u64 = 0x7F_FFFF;
 
 /// Held server-wide: these never appear in a channel override, and a channel
 /// never takes one away.
@@ -39,7 +41,8 @@ pub const SERVER_SCOPED: u64 = MANAGE_SERVER
     | MANAGE_INVITES
     | KICK_MEMBERS
     | BAN_MEMBERS
-    | CHANGE_NICKNAME;
+    | CHANGE_NICKNAME
+    | MANAGE_SOUNDS;
 
 /// Everything an override may touch.
 pub const CHANNEL_SCOPED: u64 = ALL & !SERVER_SCOPED;
@@ -52,12 +55,13 @@ pub const EVERYONE_DEFAULT: u64 = VIEW_CHANNEL
     | CONNECT
     | SPEAK
     | SHARE_SCREEN
-    | CHANGE_NICKNAME;
+    | CHANGE_NICKNAME
+    | SOUNDPAD;
 
 /// Every bit with the spelling the wire uses, ascending: the proto constant
 /// without its `PERMISSION_` prefix, which is also what the server sends as the
 /// `detail` of a `PERMISSION_DENIED`.
-pub const BITS: [(u64, &str); 21] = [
+pub const BITS: [(u64, &str); 23] = [
     (MANAGE_SERVER, "MANAGE_SERVER"),
     (MANAGE_CHANNELS, "MANAGE_CHANNELS"),
     (MANAGE_ROLES, "MANAGE_ROLES"),
@@ -79,6 +83,8 @@ pub const BITS: [(u64, &str); 21] = [
     (MOVE_MEMBERS, "MOVE_MEMBERS"),
     (PRIORITY_SPEAKER, "PRIORITY_SPEAKER"),
     (CHANGE_NICKNAME, "CHANGE_NICKNAME"),
+    (SOUNDPAD, "SOUNDPAD"),
+    (MANAGE_SOUNDS, "MANAGE_SOUNDS"),
 ];
 
 /// Whether `set` carries every bit of `bit`.
@@ -129,6 +135,8 @@ pub fn label(bit: u64) -> &'static str {
         MOVE_MEMBERS => "Move members",
         PRIORITY_SPEAKER => "Priority speaker",
         CHANGE_NICKNAME => "Change nickname",
+        SOUNDPAD => "Use soundpad",
+        MANAGE_SOUNDS => "Manage sounds",
         _ => "",
     }
 }
@@ -157,6 +165,8 @@ pub fn describe(bit: u64) -> &'static str {
         MOVE_MEMBERS => "Move another member between voice channels, or disconnect them",
         PRIORITY_SPEAKER => "Others are quieter while this member speaks",
         CHANGE_NICKNAME => "Change their own nickname",
+        SOUNDPAD => "Play a clip from the server's soundpad into a voice channel",
+        MANAGE_SOUNDS => "Add, rename and delete clips in the server's soundpad",
         _ => "",
     }
 }
@@ -398,10 +408,10 @@ mod tests {
     const OTHER_ID: i64 = 11;
     const CHANNEL_ID: i64 = 7;
 
-    /// The 21 defined bits and the 7 server-scoped ones, listed here rather than
+    /// The 23 defined bits and the 8 server-scoped ones, listed here rather than
     /// taken from the engine so the matrix never agrees with the code by
     /// construction.
-    const ALL_BITS: [u64; 21] = [
+    const ALL_BITS: [u64; 23] = [
         MANAGE_SERVER,
         MANAGE_CHANNELS,
         MANAGE_ROLES,
@@ -423,9 +433,11 @@ mod tests {
         MOVE_MEMBERS,
         PRIORITY_SPEAKER,
         CHANGE_NICKNAME,
+        SOUNDPAD,
+        MANAGE_SOUNDS,
     ];
 
-    const SERVER_SCOPED_BITS: [u64; 7] = [
+    const SERVER_SCOPED_BITS: [u64; 8] = [
         MANAGE_SERVER,
         MANAGE_ROLES,
         MANAGE_MEMBERS,
@@ -433,6 +445,7 @@ mod tests {
         KICK_MEMBERS,
         BAN_MEMBERS,
         CHANGE_NICKNAME,
+        MANAGE_SOUNDS,
     ];
 
     /// Which layer of `PROTOCOL.md` § Resolution a matrix case puts its single
@@ -443,7 +456,7 @@ mod tests {
 
     #[test]
     fn every_bit_keeps_its_wire_value_and_its_wire_name() {
-        let rows: [(u64, u64, &str); 21] = [
+        let rows: [(u64, u64, &str); 23] = [
             (MANAGE_SERVER, 1, "MANAGE_SERVER"),
             (MANAGE_CHANNELS, 2, "MANAGE_CHANNELS"),
             (MANAGE_ROLES, 4, "MANAGE_ROLES"),
@@ -465,6 +478,8 @@ mod tests {
             (MOVE_MEMBERS, 262144, "MOVE_MEMBERS"),
             (PRIORITY_SPEAKER, 524288, "PRIORITY_SPEAKER"),
             (CHANGE_NICKNAME, 1048576, "CHANGE_NICKNAME"),
+            (SOUNDPAD, 2097152, "SOUNDPAD"),
+            (MANAGE_SOUNDS, 4194304, "MANAGE_SOUNDS"),
         ];
 
         for (bit, value, spelling) in rows {
@@ -479,14 +494,15 @@ mod tests {
         let all = ALL_BITS.iter().fold(0u64, |acc, bit| acc | bit);
         let server_scoped = SERVER_SCOPED_BITS.iter().fold(0u64, |acc, bit| acc | bit);
 
-        // 1 | 4 | 8 | 32 | 64 | 128 | 1048576 = 1048813, which leaves 1048338 channel-scoped.
-        assert_eq!(all, 0x1F_FFFF);
-        assert_eq!(server_scoped, 1_048_813);
-        assert_eq!(all & !server_scoped, 1_048_338);
+        // 1 | 4 | 8 | 32 | 64 | 128 | 1048576 | 4194304 = 5243117, which leaves 3145490
+        // channel-scoped.
+        assert_eq!(all, 0x7F_FFFF);
+        assert_eq!(server_scoped, 5_243_117);
+        assert_eq!(all & !server_scoped, 3_145_490);
 
-        assert_eq!(ALL, 0x1F_FFFF);
-        assert_eq!(SERVER_SCOPED, 1_048_813);
-        assert_eq!(CHANNEL_SCOPED, 1_048_338);
+        assert_eq!(ALL, 0x7F_FFFF);
+        assert_eq!(SERVER_SCOPED, 5_243_117);
+        assert_eq!(CHANNEL_SCOPED, 3_145_490);
         assert_eq!(SERVER_SCOPED & CHANNEL_SCOPED, 0);
         assert_eq!(SERVER_SCOPED | CHANNEL_SCOPED, ALL);
     }
@@ -500,10 +516,11 @@ mod tests {
             | CONNECT
             | SPEAK
             | SHARE_SCREEN
-            | CHANGE_NICKNAME;
+            | CHANGE_NICKNAME
+            | SOUNDPAD;
 
-        assert_eq!(expected, 1_109_760);
-        assert_eq!(EVERYONE_DEFAULT, 1_109_760);
+        assert_eq!(expected, 3_206_912);
+        assert_eq!(EVERYONE_DEFAULT, 3_206_912);
     }
 
     #[test]
@@ -516,15 +533,15 @@ mod tests {
         ));
         assert!(!has(SEND_MESSAGES, VIEW_CHANNEL | SEND_MESSAGES));
 
-        assert_eq!(clean(SEND_MESSAGES | (1 << 21) | (1 << 63)), SEND_MESSAGES);
-        assert_eq!(clean(u64::MAX), 0x1F_FFFF);
+        assert_eq!(clean(SEND_MESSAGES | (1 << 23) | (1 << 63)), SEND_MESSAGES);
+        assert_eq!(clean(u64::MAX), 0x7F_FFFF);
     }
 
     #[test]
     fn name_has_nothing_to_say_about_a_mask_that_is_not_one_defined_bit() {
         assert_eq!(name(0), None);
         assert_eq!(name(VIEW_CHANNEL | SEND_MESSAGES), None);
-        assert_eq!(name(1 << 21), None);
+        assert_eq!(name(1 << 23), None);
     }
 
     #[test]
@@ -540,10 +557,10 @@ mod tests {
             bits(MANAGE_SERVER | VIEW_CHANNEL | CHANGE_NICKNAME),
             vec![MANAGE_SERVER, VIEW_CHANNEL, CHANGE_NICKNAME]
         );
-        assert_eq!(bits(0x1F_FFFF), ALL_BITS.to_vec());
+        assert_eq!(bits(0x7F_FFFF), ALL_BITS.to_vec());
         assert!(bits(0).is_empty());
         assert_eq!(
-            bits(SEND_MESSAGES | (1 << 21) | (1 << 40)),
+            bits(SEND_MESSAGES | (1 << 23) | (1 << 40)),
             vec![SEND_MESSAGES]
         );
     }
@@ -562,8 +579,8 @@ mod tests {
 
         let resolved = resolve(&h, &owner, Some(chan(CHANNEL_ID, false, &overrides)));
 
-        assert_eq!(resolved, 0x1F_FFFF);
-        assert_eq!(resolve(&h, &owner, None), 0x1F_FFFF);
+        assert_eq!(resolved, 0x7F_FFFF);
+        assert_eq!(resolve(&h, &owner, None), 0x7F_FFFF);
         for bit in ALL_BITS {
             assert!(has(resolved, bit), "{:?}", name(bit));
         }
@@ -622,7 +639,7 @@ mod tests {
         );
     }
 
-    // 21 bits x 3 layers x {allow, deny, inherit} x {base has the bit, base lacks it} = 378 cases.
+    // 23 bits x 3 layers x {allow, deny, inherit} x {base has the bit, base lacks it} = 414 cases.
     #[test]
     fn one_override_on_one_layer_resolves_exactly_as_the_protocol_says() {
         for bit in ALL_BITS {
@@ -1021,8 +1038,8 @@ mod tests {
         let h = hierarchy(OWNER_ID, &roles);
         let owner = member(OWNER_ID, &[]);
 
-        assert!(can_grant(&h, &owner, 0x1F_FFFF));
-        assert_eq!(missing_grant(&h, &owner, 0x1F_FFFF), None);
+        assert!(can_grant(&h, &owner, 0x7F_FFFF));
+        assert_eq!(missing_grant(&h, &owner, 0x7F_FFFF), None);
     }
 
     #[test]
@@ -1032,15 +1049,15 @@ mod tests {
         let actor = member(ACTOR_ID, &[]);
 
         // Cleaned away rather than refused, so the two answers can never disagree.
-        assert!(can_grant(&h, &actor, 1 << 21));
-        assert_eq!(missing_grant(&h, &actor, 1 << 21), None);
+        assert!(can_grant(&h, &actor, 1 << 23));
+        assert_eq!(missing_grant(&h, &actor, 1 << 23), None);
 
         for bits in [
             0,
             VIEW_CHANNEL,
             MANAGE_SERVER,
             1_109_760,
-            0x1F_FFFF,
+            0x7F_FFFF,
             u64::MAX,
         ] {
             assert_eq!(
@@ -1228,13 +1245,13 @@ mod tests {
         labels.dedup();
         assert_eq!(labels.len(), count, "two bits share a label");
 
-        assert_eq!(label(1 << 21), "");
-        assert_eq!(describe(1 << 21), "");
+        assert_eq!(label(1 << 23), "");
+        assert_eq!(describe(1 << 23), "");
     }
 
     #[test]
     fn mirror_only_an_undefined_bit_in_a_role_is_dropped_at_resolve_time() {
-        let undefined = 1 << 21;
+        let undefined = 1 << 23;
         let roles = [everyone_role(VIEW_CHANNEL | undefined)];
         let h = hierarchy(OWNER_ID, &roles);
         let actor = member(ACTOR_ID, &[]);

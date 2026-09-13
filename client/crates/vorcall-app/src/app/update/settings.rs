@@ -31,7 +31,7 @@ use crate::workers::voice;
 
 /// A cancelled file dialog answers with this rather than a complaint: nothing was
 /// picked, which is not a failure anybody needs to be told about.
-const CANCELLED: &str = "";
+pub const CANCELLED: &str = "";
 
 /// What the pickers and the import dialog offer.
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];

@@ -85,9 +85,12 @@ asked to be locked out. A ban is a moderation decision about a person.
 
 ## Roles and permissions
 
-Roles carry 21 permissions, a colour, an icon, a position in a hierarchy and a "hoist" flag
+Roles carry 23 permissions, a colour, an icon, a position in a hierarchy and a "hoist" flag
 that decides whether their members are listed separately. A role can only be managed by
-someone whose own highest role sits above it, and the owner bypasses every check.
+someone whose own highest role sits above it, and the owner bypasses every check. The two
+newest are **Soundpad** (channel-scoped, granted to `@everyone` by default) and **Manage
+Sounds** (server-scoped, granted to nobody by default, required to add, rename or delete a
+clip in the shared soundpad).
 
 Permissions resolve in this order, which is deliberately **not** Discord's union-of-allows
 rule:

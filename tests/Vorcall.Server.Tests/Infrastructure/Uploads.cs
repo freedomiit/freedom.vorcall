@@ -81,6 +81,42 @@ internal static class Uploads
                 }
             });
 
+    // POST /api/sounds?name=..., the soundpad store's own upload: a VORCSND1 container at
+    // 16 MiB, behind MANAGE_SOUNDS. Same door key, bearer and rate-limit policy as an attachment's.
+    public static Task<ProtoResponse> UploadSoundAsync(
+        VorcallFactory factory,
+        string bearer,
+        string name,
+        byte[] body,
+        string? contentType = Vorcall.Server.Attachments.AttachmentsOptions.SoundMediaType,
+        long? declaredLength = null)
+        => Proto.PostBytesAsync(
+            factory,
+            $"/api/sounds?name={Uri.EscapeDataString(name)}",
+            body,
+            contentType,
+            bearer,
+            configure: request =>
+            {
+                if (declaredLength is { } length)
+                {
+                    request.Content!.Headers.ContentLength = length;
+                }
+            });
+
+    public static Task<ProtoResponse> DownloadSoundAsync(VorcallFactory factory, string bearer, long id, string? range = null)
+        => Proto.GetAsync(
+            factory,
+            $"/api/sounds/{id}",
+            bearer,
+            configure: request =>
+            {
+                if (range is not null)
+                {
+                    request.Headers.Range = RangeHeaderValue.Parse(range);
+                }
+            });
+
     public static Task<ProtoResponse> DownloadImageAsync(VorcallFactory factory, string bearer, long id, string? range = null)
         => Proto.GetAsync(
             factory,

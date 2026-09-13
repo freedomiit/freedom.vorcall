@@ -138,6 +138,12 @@ public sealed class VoiceSession : IDisposable
 
     private ChaCha20Poly1305 Cipher { get; }
 
+    // ChaCha20Poly1305 is one OpenSSL cipher context, and OpenSSL does not tolerate two threads
+    // in one context: a watcher's cipher is driven by the receive loop (audio) and by a sharer's
+    // worker (video) at once, and without this gate that shows up as a spurious tag failure at
+    // best and a SIGSEGV that takes the whole server down at worst.
+    private readonly Lock _cipherGate = new();
+
     // A tag mismatch is the ordinary fate of a forged or corrupted datagram, and a disposed
     // cipher means the session was removed while this packet was in flight. Both are drops, and
     // neither may take the receive loop down.
@@ -150,7 +156,11 @@ public sealed class VoiceSession : IDisposable
     {
         try
         {
-            Cipher.Decrypt(nonce, ciphertext, tag, plaintext, associatedData);
+            lock (_cipherGate)
+            {
+                Cipher.Decrypt(nonce, ciphertext, tag, plaintext, associatedData);
+            }
+
             return true;
         }
         catch (Exception ex) when (ex is CryptographicException or ObjectDisposedException)
@@ -173,7 +183,11 @@ public sealed class VoiceSession : IDisposable
     {
         try
         {
-            Cipher.Encrypt(nonce, plaintext, ciphertext, tag, associatedData);
+            lock (_cipherGate)
+            {
+                Cipher.Encrypt(nonce, plaintext, ciphertext, tag, associatedData);
+            }
+
             return true;
         }
         catch (Exception ex) when (ex is CryptographicException or ObjectDisposedException)
@@ -218,7 +232,13 @@ public sealed class VoiceSession : IDisposable
     // Harmless twice: the second call finds the queue already completed and says so.
     internal void CompleteShareQueue() => Volatile.Read(ref _shareQueue).Writer.TryComplete();
 
-    public void Dispose() => Cipher.Dispose();
+    public void Dispose()
+    {
+        lock (_cipherGate)
+        {
+            Cipher.Dispose();
+        }
+    }
 
     // An eviction is the one drop nobody else is in a position to see: it happens inside the
     // channel, on whichever thread was writing, so the rental goes back to the pool and the

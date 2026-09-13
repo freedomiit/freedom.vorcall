@@ -23,6 +23,7 @@ rubato.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+symphonia.workspace = true
 tiny-skia.workspace = true
 tokio.workspace = true
 tracing.workspace = true

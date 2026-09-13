@@ -31,13 +31,14 @@ use tokio_tungstenite::tungstenite::{
 use vorcall_proto::v1::{
     Attachment, Ban, BanMember, Category, Channel, ChannelKind, ChannelPosition, ChatMessage,
     ClientFrame, CreateCategory, CreateChannel, CreateRole, DeleteCategory, DeleteChannel,
-    DeleteMessage, DeleteRole, EditMessage, ErrorCode, Hello, Image, Invite, InviteCreated,
-    JoinVoice, KickMember, LeaveVoice, MarkRead, MessagePage, OpenDm, Override, Ping, Profile,
-    React, Reaction, ReorderCategories, ReorderChannels, ReorderRoles, Role, SendMessage, Server,
-    ServerFrame, ServerSnapshot, SetMemberRoles, SetNickname, SetOverride, StartShare, StopShare,
-    StreamRequest, StreamedFile, TransferOwnership, UnbanMember, UnwatchShare, UpdateCategory,
-    UpdateChannel, UpdateProfile, UpdateRole, UpdateServer, VoiceMember, VoiceModerate,
-    VoiceSelfState, WatchShare, client_frame, server_frame,
+    DeleteMessage, DeleteRole, DeleteSound, EditMessage, ErrorCode, Hello, Image, Invite,
+    InviteCreated, JoinVoice, KickMember, LeaveVoice, MarkRead, MessagePage, OpenDm, Override,
+    Ping, PlaySound, Profile, React, Reaction, ReorderCategories, ReorderChannels, ReorderRoles,
+    Role, SendMessage, Server, ServerFrame, ServerSnapshot, SetMemberRoles, SetNickname,
+    SetOverride, Sound, StartShare, StopShare, StopSound, StreamRequest, StreamedFile,
+    TransferOwnership, UnbanMember, UnwatchShare, UpdateCategory, UpdateChannel, UpdateProfile,
+    UpdateRole, UpdateServer, UpdateSound, VoiceMember, VoiceModerate, VoiceSelfState, WatchShare,
+    client_frame, server_frame,
 };
 
 use crate::admin;
@@ -210,6 +211,25 @@ pub enum Command {
     UnwatchShare {
         channel_id: i64,
     },
+    /// Plays a soundpad clip into a voice session. Needs SOUNDPAD in that
+    /// channel and a live voice session there; one clip plays per channel, so
+    /// this replaces whatever was playing.
+    PlaySound {
+        channel_id: i64,
+        sound_id: i64,
+    },
+    /// Stops the clip playing in that channel. The server allows it to whoever
+    /// started it, or to a holder of MANAGE_SOUNDS.
+    StopSound {
+        channel_id: i64,
+    },
+    UpdateSound {
+        sound_id: i64,
+        name: String,
+    },
+    DeleteSound {
+        sound_id: i64,
+    },
     /// One management frame. Nothing is awaited: the server answers with an
     /// `Error` or with the delta the change produced.
     Admin(AdminCommand),
@@ -246,6 +266,10 @@ impl Command {
             Self::StopShare { .. } => "StopShare",
             Self::WatchShare { .. } => "WatchShare",
             Self::UnwatchShare { .. } => "UnwatchShare",
+            Self::PlaySound { .. } => "PlaySound",
+            Self::StopSound { .. } => "StopSound",
+            Self::UpdateSound { .. } => "UpdateSound",
+            Self::DeleteSound { .. } => "DeleteSound",
             Self::Admin(inner) => inner.kind_name(),
             Self::Rest(_) => "Rest",
         }
@@ -718,6 +742,20 @@ pub enum Event {
         channel_id: i64,
         count: u32,
     },
+    SoundUpserted {
+        sound: Sound,
+    },
+    SoundDeleted {
+        sound_id: i64,
+    },
+    SoundPlayed {
+        channel_id: i64,
+        user_id: i64,
+        sound_id: i64,
+    },
+    SoundStopped {
+        channel_id: i64,
+    },
     SendDropped,
     /// A management frame the loop could not send, named by its kind.
     AdminDropped {
@@ -801,6 +839,37 @@ fn describe(frame: &ServerFrame) -> String {
             Some(message) => format!("MessageEdited {{ {} }}", describe_message(message)),
             None => "MessageEdited { message: None }".to_owned(),
         },
+        // A clip's name is what somebody typed, so it is reduced to a length
+        // the way a message's text is.
+        Some(server_frame::Payload::SoundUpserted(upserted)) => match &upserted.sound {
+            Some(sound) => {
+                let id = sound.id;
+                let uploader_id = sound.uploader_id;
+                let name_len = sound.name.len();
+                let duration_ms = sound.duration_ms;
+                let size = sound.size;
+                format!(
+                    "SoundUpserted {{ id: {id}, uploader_id: {uploader_id}, name_len: {name_len}, duration_ms: {duration_ms}, size: {size} }}"
+                )
+            }
+            None => "SoundUpserted { sound: None }".to_owned(),
+        },
+        Some(server_frame::Payload::SoundDeleted(deleted)) => {
+            let sound_id = deleted.sound_id;
+            format!("SoundDeleted {{ sound_id: {sound_id} }}")
+        }
+        Some(server_frame::Payload::SoundPlayed(played)) => {
+            let channel_id = played.channel_id;
+            let user_id = played.user_id;
+            let sound_id = played.sound_id;
+            format!(
+                "SoundPlayed {{ channel_id: {channel_id}, user_id: {user_id}, sound_id: {sound_id} }}"
+            )
+        }
+        Some(server_frame::Payload::SoundStopped(stopped)) => {
+            let channel_id = stopped.channel_id;
+            format!("SoundStopped {{ channel_id: {channel_id} }}")
+        }
         // Nothing here needs redacting today; naming every field keeps a later
         // addition to the frame out of the `{frame:?}` catch-all by accident.
         Some(server_frame::Payload::StreamRequest(request)) => {
@@ -878,6 +947,10 @@ fn classify_first_frame(payload: Option<server_frame::Payload>) -> FirstFrame {
         Some(server_frame::Payload::MemberRemoved(_)) => FirstFrame::Ignore("MemberRemoved"),
         Some(server_frame::Payload::VoiceMoved(_)) => FirstFrame::Ignore("VoiceMoved"),
         Some(server_frame::Payload::StreamRequest(_)) => FirstFrame::Ignore("StreamRequest"),
+        Some(server_frame::Payload::SoundUpserted(_)) => FirstFrame::Ignore("SoundUpserted"),
+        Some(server_frame::Payload::SoundDeleted(_)) => FirstFrame::Ignore("SoundDeleted"),
+        Some(server_frame::Payload::SoundPlayed(_)) => FirstFrame::Ignore("SoundPlayed"),
+        Some(server_frame::Payload::SoundStopped(_)) => FirstFrame::Ignore("SoundStopped"),
         None => FirstFrame::Unknown,
     }
 }
@@ -1443,6 +1516,16 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
         | Command::WatchShare { channel_id, .. }
         | Command::UnwatchShare { channel_id } => {
             tracing::debug!(channel_id, "cannot change screen share while disconnected");
+            true
+        }
+        // No event: the soundpad is disabled while disconnected, and a clip
+        // that was playing is over as soon as the voice session is.
+        Command::PlaySound { channel_id, .. } | Command::StopSound { channel_id } => {
+            tracing::debug!(channel_id, "cannot play a sound while disconnected");
+            true
+        }
+        Command::UpdateSound { sound_id, .. } | Command::DeleteSound { sound_id } => {
+            tracing::debug!(sound_id, "cannot manage a sound while disconnected");
             true
         }
         // No event either: the UI disables these while disconnected.
@@ -2726,6 +2809,7 @@ where
                                     categories = snapshot.categories.len(),
                                     channels = snapshot.channels.len(),
                                     members = snapshot.members.len(),
+                                    sounds = snapshot.sounds.len(),
                                     "server snapshot"
                                 );
                                 emit_or_break!('live, events, Event::Snapshot(snapshot));
@@ -2879,6 +2963,29 @@ where
                                 emit_or_break!('live, events, Event::ShareWatchers {
                                     channel_id: watchers.channel_id,
                                     count: watchers.count,
+                                });
+                            }
+                            Some(server_frame::Payload::SoundUpserted(upserted)) => {
+                                match upserted.sound {
+                                    Some(sound) => emit_or_break!('live, events, Event::SoundUpserted { sound }),
+                                    None => tracing::warn!("ignoring a SoundUpserted without a sound"),
+                                }
+                            }
+                            Some(server_frame::Payload::SoundDeleted(deleted)) => {
+                                emit_or_break!('live, events, Event::SoundDeleted {
+                                    sound_id: deleted.sound_id,
+                                });
+                            }
+                            Some(server_frame::Payload::SoundPlayed(played)) => {
+                                emit_or_break!('live, events, Event::SoundPlayed {
+                                    channel_id: played.channel_id,
+                                    user_id: played.user_id,
+                                    sound_id: played.sound_id,
+                                });
+                            }
+                            Some(server_frame::Payload::SoundStopped(stopped)) => {
+                                emit_or_break!('live, events, Event::SoundStopped {
+                                    channel_id: stopped.channel_id,
                                 });
                             }
                             // The app owns the registry: it resolves the id to a
@@ -3150,6 +3257,22 @@ where
                     Command::UnwatchShare { channel_id } => send_or_break!(
                         'live, sink, "UnwatchShare",
                         client_frame::Payload::UnwatchShare(UnwatchShare { channel_id })
+                    ),
+                    Command::PlaySound { channel_id, sound_id } => send_or_break!(
+                        'live, sink, "PlaySound",
+                        client_frame::Payload::PlaySound(PlaySound { channel_id, sound_id })
+                    ),
+                    Command::StopSound { channel_id } => send_or_break!(
+                        'live, sink, "StopSound",
+                        client_frame::Payload::StopSound(StopSound { channel_id })
+                    ),
+                    Command::UpdateSound { sound_id, name } => send_or_break!(
+                        'live, sink, "UpdateSound",
+                        client_frame::Payload::UpdateSound(UpdateSound { sound_id, name })
+                    ),
+                    Command::DeleteSound { sound_id } => send_or_break!(
+                        'live, sink, "DeleteSound",
+                        client_frame::Payload::DeleteSound(DeleteSound { sound_id })
                     ),
                     // Fire and forget: the server answers with an `Error` or
                     // with the delta the change produced.
@@ -3862,9 +3985,13 @@ mod tests {
             server_frame::Payload::MemberRemoved(Default::default()),
             server_frame::Payload::VoiceMoved(Default::default()),
             server_frame::Payload::StreamRequest(Default::default()),
+            server_frame::Payload::SoundUpserted(Default::default()),
+            server_frame::Payload::SoundDeleted(Default::default()),
+            server_frame::Payload::SoundPlayed(Default::default()),
+            server_frame::Payload::SoundStopped(Default::default()),
         ];
-        // `ServerFrame` carries 30 payloads: these are all but Welcome and Error.
-        assert_eq!(ignored.len(), 28);
+        // `ServerFrame` carries 34 payloads: these are all but Welcome and Error.
+        assert_eq!(ignored.len(), 32);
 
         for payload in ignored {
             let printed = format!("{payload:?}");

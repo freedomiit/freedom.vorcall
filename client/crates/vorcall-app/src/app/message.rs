@@ -21,13 +21,17 @@ use vorcall_core::config::{Density, Entrance, TransmitMode};
 use vorcall_core::connection::Blob;
 use vorcall_core::images::ImagePurpose;
 use vorcall_core::update;
-use vorcall_core::{ApiFailure, ChannelKind, Session};
+use vorcall_core::{ApiFailure, ChannelKind, Session, Sound};
 use vorcall_hotkey::Edge;
 use vorcall_screen::{Source, SourceId};
 
 use crate::app::state::settings::{ServerTab, SettingsTab};
+use crate::app::state::sound::TrimEdge;
 use crate::app::state::ui::{Dialog, TransferSource};
 use crate::app::state::voice::{EngineHandoff, HotkeyHandoff};
+// `vorcall_screen::Source` is a screen to capture; this one is a decoded audio
+// file waiting to be trimmed.
+use crate::workers::clips::Source as ClipSource;
 use crate::workers::share::{ShareEvent, StageEvent};
 use crate::workers::voice::{AudioEvent, DeviceLists};
 
@@ -42,6 +46,8 @@ pub enum Message {
     Channels(ChannelsMsg),
     Voice(VoiceMsg),
     Share(ShareMsg),
+    /// The interface motifs and the shared soundpad.
+    Sound(SoundMsg),
     Settings(SettingsMsg),
     Admin(AdminMsg),
     /// Framing a picked picture before it is uploaded.
@@ -264,6 +270,15 @@ pub enum VoiceMsg {
     SetEchoCancellation(bool),
     SetAutoGain(bool),
     SetPriorityDucking(bool),
+    /// Whether somebody joining or leaving this client's voice channel is worth
+    /// a motif, and whether its own two switches are.
+    SetVoiceSounds(bool),
+    SetSelfSounds(bool),
+    SetSoundVolume(f32),
+    SetSoundpadVolume(f32),
+    /// The end of either volume drag, which is what writes it to disk.
+    SoundVolumeReleased,
+    SoundpadVolumeReleased,
     SetPeerVolume(i64, f32),
     PeerVolumeReleased(i64),
     TogglePeerMute(i64),
@@ -319,6 +334,82 @@ pub enum ShareMsg {
     SetBitrate(u32),
     BitrateReleased,
     SetShareAudio(bool),
+}
+
+/// The shared soundpad: playing a clip, and the library behind it.
+#[derive(Clone)]
+pub enum SoundMsg {
+    /// The popover over the voice bar, anchored where the pointer was.
+    OpenPopover(Point),
+    ClosePopover,
+    /// Ask the server to play one clip into the joined channel. Nothing is
+    /// heard until its `SoundPlayed` comes back.
+    Play(i64),
+    Stop,
+    /// The bytes of one clip, decoded and ready for the mixer, or why they are
+    /// not.
+    Ready(i64, Result<Arc<Vec<f32>>, String>),
+    /// Add a clip: the file dialog, off the interface thread.
+    Pick,
+    /// What the dialog picked. An empty error is a dismissal rather than a
+    /// failure, the same convention the picture pickers use.
+    Picked(Result<PathBuf, String>),
+    /// The picked file, decoded into the samples the trim view draws over.
+    Decoded(Result<(String, Arc<ClipSource>), String>),
+    /// A press on one of the two edge handles.
+    TrimStart(TrimEdge),
+    /// Where the pointer is inside the trim frame, in its own pixels.
+    TrimMove(f32),
+    TrimEnd,
+    /// Cut the selection out and upload it, off the interface thread.
+    TrimApply,
+    Uploaded(Result<Sound, String>),
+    /// One clip's name as it is being typed on the sounds page.
+    RenameDraft(i64, String),
+    RenameSave(i64),
+    Delete(i64),
+}
+
+impl fmt::Debug for SoundMsg {
+    /// A decoded source and a decoded clip are megabytes of samples, and a
+    /// debug file log always exists: how many, never which.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpenPopover(at) => write!(f, "OpenPopover({at:?})"),
+            Self::ClosePopover => f.write_str("ClosePopover"),
+            Self::Play(id) => write!(f, "Play({id})"),
+            Self::Stop => f.write_str("Stop"),
+            Self::Ready(id, result) => match result {
+                Ok(samples) => write!(f, "Ready({id}, {} samples)", samples.len()),
+                Err(error) => write!(f, "Ready({id}, Err({error}))"),
+            },
+            Self::Pick => f.write_str("Pick"),
+            Self::Picked(result) => match result {
+                Ok(path) => write!(f, "Picked({})", path.display()),
+                Err(error) => write!(f, "Picked(Err({error}))"),
+            },
+            Self::Decoded(result) => match result {
+                Ok((name, source)) => write!(
+                    f,
+                    "Decoded({name}, {} ms, {} samples)",
+                    source.duration_ms,
+                    source.pcm.len()
+                ),
+                Err(error) => write!(f, "Decoded(Err({error}))"),
+            },
+            Self::TrimStart(edge) => write!(f, "TrimStart({edge:?})"),
+            Self::TrimMove(at) => write!(f, "TrimMove({at})"),
+            Self::TrimEnd => f.write_str("TrimEnd"),
+            Self::TrimApply => f.write_str("TrimApply"),
+            Self::Uploaded(result) => match result {
+                Ok(sound) => write!(f, "Uploaded({}, {} bytes)", sound.id, sound.size),
+                Err(error) => write!(f, "Uploaded(Err({error}))"),
+            },
+            Self::RenameDraft(id, _) => write!(f, "RenameDraft({id}, <hidden>)"),
+            Self::RenameSave(id) => write!(f, "RenameSave({id})"),
+            Self::Delete(id) => write!(f, "Delete({id})"),
+        }
+    }
 }
 
 /// The user settings pages.
