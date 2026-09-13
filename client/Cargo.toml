@@ -4,12 +4,12 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.7.0"
+version = "0.7.1"
 license = "MIT"
 
 # Oldest client version the current release still lets chat. Clients below it
 # show the "Update required" screen; release.yml asserts min_version <= version.
-# Equal to version this release: a 0.6.0 client knows nothing of the soundpad,
+# Raised to 0.7.0 with that release: a 0.6.0 client knows nothing of the soundpad,
 # and the owner chose to have the whole group update together rather than
 # leave some people silently missing sounds others hear.
 [workspace.metadata.vorcall]
