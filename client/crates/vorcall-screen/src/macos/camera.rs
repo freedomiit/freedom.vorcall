@@ -27,7 +27,7 @@ use objc2_av_foundation::{
     AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureOutput, AVCaptureSession,
     AVCaptureSessionPreset, AVCaptureSessionPreset640x480, AVCaptureSessionPreset1280x720,
     AVCaptureSessionPresetHigh, AVCaptureVideoDataOutput,
-    AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeVideo,
+    AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaType, AVMediaTypeVideo,
 };
 use objc2_core_foundation::CFString;
 use objc2_core_media::CMSampleBuffer;
@@ -264,18 +264,32 @@ unsafe fn discovered() -> Retained<NSArray<AVCaptureDevice>> {
         let session =
             AVCaptureDeviceDiscoverySession::discoverySessionWithDeviceTypes_mediaType_position(
                 &kinds,
-                Some(AVMediaTypeVideo),
+                AVMediaTypeVideo,
                 AVCaptureDevicePosition::Unspecified,
             );
         session.devices()
     }
 }
 
+/// AVFoundation's `AVMediaTypeVideo`, which the bindings expose as an
+/// `Option` because the framework header does not mark it non-null. `None`
+/// would mean AVFoundation itself did not load, which is reported like any
+/// other reason the camera cannot be used rather than panicking on the
+/// capture thread.
+///
+/// # Safety
+///
+/// Reads a framework static.
+unsafe fn video_media_type() -> Result<&'static AVMediaType, Unavailable> {
+    unsafe { AVMediaTypeVideo }
+        .ok_or_else(|| Unavailable::Unsupported("AVFoundation has no video media type".to_string()))
+}
+
 /// Makes sure the camera may be used at all, asking the user once when macOS
 /// has never asked on Vorcall's behalf.
 fn authorise() -> Result<(), Unavailable> {
     // SAFETY: reads a framework static and a class method.
-    let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(AVMediaTypeVideo) };
+    let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(video_media_type()?) };
     match status {
         AVAuthorizationStatus::Authorized => Ok(()),
         AVAuthorizationStatus::NotDetermined => request_access(),
@@ -291,7 +305,8 @@ fn request_access() -> Result<(), Unavailable> {
     // SAFETY: the block has the completion handler's signature, and the call
     // itself returns at once — the answer arrives on some other queue.
     unsafe {
-        AVCaptureDevice::requestAccessForMediaType_completionHandler(AVMediaTypeVideo, &handler);
+        let media_type = video_media_type()?;
+        AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type, &handler);
     }
 
     match rx.recv_timeout(ACCESS_TIMEOUT) {
@@ -456,7 +471,8 @@ fn device(wanted: Option<&CameraSource>) -> Result<Retained<AVCaptureDevice>, Un
             Some(wanted) => AVCaptureDevice::deviceWithUniqueID(&NSString::from_str(&wanted.id))
                 .ok_or_else(|| Unavailable::Failed(format!("the camera {} is gone", wanted.name))),
             None => {
-                AVCaptureDevice::defaultDeviceWithMediaType(AVMediaTypeVideo).ok_or_else(|| {
+                let media_type = video_media_type()?;
+                AVCaptureDevice::defaultDeviceWithMediaType(media_type).ok_or_else(|| {
                     Unavailable::Unsupported("there is no camera on this Mac".to_string())
                 })
             }
