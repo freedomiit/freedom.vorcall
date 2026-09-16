@@ -1,5 +1,5 @@
 //! The Voice page: the devices, how audio leaves the machine, the cleanup chain in
-//! front of it, and what a screen share is encoded as.
+//! front of it, and what a screen share and a camera are encoded as.
 
 use std::fmt;
 
@@ -10,8 +10,10 @@ use vorcall_core::config::{
     SHARE_DEFAULT_RESOLUTION, SHARE_FRAME_RATES, SHARE_MAX_BITRATE_KBPS, SHARE_MIN_BITRATE_KBPS,
     SHARE_RESOLUTIONS, TransmitMode, VAD_MAX_DB, VAD_MIN_DB,
 };
+use vorcall_screen::CameraSource;
+use vorcall_screen::preset::CameraResolution;
 
-use crate::app::message::{Message, ShareMsg, VoiceMsg};
+use crate::app::message::{CameraMsg, Message, ShareMsg, VoiceMsg};
 use crate::app::state::rules::{self, SYSTEM_DEFAULT, hotkey_sentence};
 use crate::app::state::voice::HotkeyStatus;
 use crate::app::update::voice::VOLUME_MAX;
@@ -179,10 +181,74 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
             ],
         ),
         share(app, main),
+        camera(app, main),
     ]
     .spacing(24)
     .width(Length::Fill)
     .into()
+}
+
+/// The device a camera opens and what it is encoded as. A change applies to the
+/// next one: the device and the encoder are both opened when the camera starts.
+fn camera<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let prefs = rules::camera_prefs(&app.config, &main.settings.cameras);
+    let capabilities = vorcall_screen::camera_capabilities();
+
+    let resolution = pick_list(
+        CameraResolutionChoice::ALL.to_vec(),
+        Some(CameraResolutionChoice(prefs.resolution)),
+        |choice| Message::Camera(CameraMsg::SetResolution(choice.0)),
+    )
+    .text_size(TEXT_ROW)
+    .padding([6.0, 10.0])
+    .style(styles::pick_list(tokens))
+    .menu_style(styles::menu(tokens));
+
+    let fps = pick_list(
+        CameraFpsChoice::ALL.to_vec(),
+        Some(CameraFpsChoice(prefs.fps.hz())),
+        |choice| Message::Camera(CameraMsg::SetFps(choice.0)),
+    )
+    .text_size(TEXT_ROW)
+    .padding([6.0, 10.0])
+    .style(styles::pick_list(tokens))
+    .menu_style(styles::menu(tokens));
+
+    let mut rows = Vec::new();
+    // A backend that does not enumerate has nothing to pick between: the
+    // sentence at the bottom is what says the system chooses.
+    if capabilities.enumerates {
+        let options: Vec<CameraChoice> = std::iter::once(CameraChoice(None))
+            .chain(
+                main.settings
+                    .cameras
+                    .iter()
+                    .map(|camera| CameraChoice(Some(camera.clone()))),
+            )
+            .collect();
+        let selected = CameraChoice(prefs.device);
+        let device = pick_list(options, Some(selected), |choice| {
+            Message::Camera(CameraMsg::SetDevice(choice.0))
+        })
+        .text_size(TEXT_ROW)
+        .padding([6.0, 10.0])
+        .width(Length::Fill)
+        .style(styles::pick_list(tokens))
+        .menu_style(styles::menu(tokens));
+        rows.push(field("Camera", device, None, tokens));
+    }
+
+    rows.push(field("Resolution", resolution, None, tokens));
+    rows.push(field("Frame rate", fps, None, tokens));
+    rows.push(
+        text(rules::camera_sentence(&capabilities))
+            .size(TEXT_SECONDARY)
+            .color(tokens.text_muted)
+            .into(),
+    );
+
+    section("Camera", tokens, rows)
 }
 
 /// What a share this machine starts is encoded as. A change applies to the next
@@ -346,6 +412,51 @@ impl FpsChoice {
 }
 
 impl fmt::Display for FpsChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} fps", self.0)
+    }
+}
+
+/// A camera entry. `None` is the system's default device, which is also what a
+/// device that has been unplugged falls back to.
+#[derive(Clone, PartialEq, Eq)]
+struct CameraChoice(Option<CameraSource>);
+
+impl fmt::Display for CameraChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(camera) => f.write_str(&camera.name),
+            None => f.write_str(SYSTEM_DEFAULT),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CameraResolutionChoice(CameraResolution);
+
+impl CameraResolutionChoice {
+    const ALL: [Self; 2] = [Self(CameraResolution::P360), Self(CameraResolution::P720)];
+}
+
+impl fmt::Display for CameraResolutionChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A camera runs at the same three rates a share does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CameraFpsChoice(u32);
+
+impl CameraFpsChoice {
+    const ALL: [Self; SHARE_FRAME_RATES.len()] = [
+        Self(SHARE_FRAME_RATES[0]),
+        Self(SHARE_FRAME_RATES[1]),
+        Self(SHARE_FRAME_RATES[2]),
+    ];
+}
+
+impl fmt::Display for CameraFpsChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} fps", self.0)
     }

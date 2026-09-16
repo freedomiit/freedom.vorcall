@@ -5,12 +5,13 @@
 //! locally and against production. Nothing here touches an audio device: the
 //! source is a synthesized sine and the sink is a level meter.
 
+mod camera;
 mod capture;
 mod report;
 mod share;
 mod update_cmd;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,10 @@ use vorcall_voice::{
     STEREO_FRAME_SAMPLES,
 };
 
-use report::{PeerReport, Report, Rtt, ShareReport, SpeakingEvent, WatchReport};
+use report::{
+    CameraReport, CameraWatchReport, PeerReport, Report, Rtt, ShareReport, SpeakingEvent,
+    WatchReport,
+};
 
 /// Peaks at 0.3, so a clean frame measures ≈0.21 and silence or concealment
 /// stays far below the threshold below.
@@ -46,6 +50,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the sharer waits for the server to announce its own share.
 const SHARE_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same for the camera, which is announced on its own frame.
+const CAMERA_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a watcher waits for the sharer to appear and the server to confirm
 /// the watch, measured from the moment voice came up.
@@ -82,15 +89,35 @@ Options:
   --bitrate-kbps <n>     share bitrate (default: the preset table's value for
                          the size and frame rate)
   --watch <name>         watch that user's share and decode it
+  --camera-seconds <n>   seconds of synthetic camera video to send; needs
+                         <= --listen-seconds, and may run beside --share-seconds
+  --camera-size <WxH>    camera picture size, both even (default: 640x360)
+  --camera-fps <n>       camera frame rate: 15, 30 or 60 (default: 30)
+  --watch-camera <name>  watch that user's camera and decode it; repeatable,
+                         at most 4
   --capture-seconds <n>  capture this machine's screen for n seconds and print
                          what the backend produced; needs no server and no
                          --username, and excludes --share-seconds and --watch
   --capture-audio        ask the capture for this machine's audio as well
   --capture-fps <n>      capture frame rate: 15, 30 or 60 (default: 30)
+  --capture-camera-seconds <n>
+                         open this machine's camera for n seconds and print
+                         what the backend produced; needs no server and no
+                         --username, and reuses --camera-size and --camera-fps
+  --camera-device <id>   the camera to open, by an id from --list-cameras
+                         (default: the system's own choice)
+  --list-cameras         print this machine's cameras and what the camera
+                         backend can do, then exit; needs no server
   --expect-peer          exit 1 unless at least 1.00 s of tone was heard
   --expect-silence       exit 1 if any audio frame was sent
   --expect-video         exit 1 unless at least 5 pictures decoded
+  --expect-camera-video  exit 1 unless at least 5 pictures decoded from every
+                         --watch-camera
   --expect-share-audio   exit 1 unless at least 1.00 s of share tone was heard
+  --max-share-concealed-pct <p>
+                         exit 1 when more than p per cent of the watched
+                         share's audio frames were concealment rather than
+                         sound that arrived; only meaningful with --watch
   --help                 print this help
 
 Voice-activation oracle: `--vad --tone-amplitude 0 --expect-silence` must exit
@@ -106,10 +133,26 @@ Screen-share oracle, two terminals against the same voice channel:
   vorcall-probe --username bob --watch alice --expect-video \
                 --expect-share-audio --listen-seconds 14
 
+Camera oracle, two terminals against the same voice channel. A share and a
+camera together are the two-streams-at-once case: one session, one sequence
+counter, two independent video streams.
+
+  vorcall-probe --username alice --share-seconds 10 --camera-seconds 10 \
+                --listen-seconds 14
+  vorcall-probe --username bob --watch alice --watch-camera alice \
+                --expect-video --expect-camera-video --listen-seconds 14
+
 Capture oracle, no server and no account; on Linux the portal asks which
-screen to hand over, so someone has to answer the dialog:
+screen to hand over, so someone has to answer the dialog — every run, by
+design, because nothing about the choice is remembered:
 
   vorcall-probe --capture-seconds 5 --capture-audio
+
+Camera-capture oracle, also no server and no account. On Windows and macOS
+the first run raises the operating system's camera permission prompt:
+
+  vorcall-probe --list-cameras
+  vorcall-probe --capture-camera-seconds 5 --camera-size 1280x720
 
 The server URL and key come from VORCALL_SERVER_URL and VORCALL_SERVER_KEY,
 with the values baked in at build time as fallbacks.
@@ -117,9 +160,14 @@ with the values baked in at build time as fallbacks.
 Prints one JSON line on stdout; logs go to stderr.
 
 Exit codes: 0 ran, 1 --expect-silence sent audio, --expect-peer heard nothing,
---expect-video saw too few pictures, --expect-share-audio heard no share tone,
-the watch was never confirmed, or --capture-seconds produced fewer than 5
-frames; 2 usage, sign-in, connection, media or capture failure.
+--expect-video saw too few pictures, --expect-camera-video saw too few on one of
+the watched cameras, --expect-share-audio heard no share tone, the share's audio
+was concealed past --max-share-concealed-pct, a share or camera watch was never
+confirmed, --capture-seconds produced fewer than 5 frames, or
+--capture-camera-seconds saw no frame or no start; 2 usage, sign-in,
+connection, media or capture failure — which for --capture-camera-seconds
+covers no camera, a refused permission and a backend that is not there, each
+with a one-line reason on stderr.
 
 Update subcommands:
   vorcall-probe check-update --username U [--password P] --platform ID
@@ -159,10 +207,16 @@ struct Args {
     encode_threads: u16,
     bitrate_kbps: Option<u32>,
     watch: Option<String>,
+    camera_seconds: Option<u64>,
+    camera_size: (u32, u32),
+    camera_fps: FrameRate,
+    watch_cameras: Vec<String>,
     expect_peer: bool,
     expect_silence: bool,
     expect_video: bool,
+    expect_camera_video: bool,
     expect_share_audio: bool,
+    max_share_concealed_pct: Option<f64>,
 }
 
 #[tokio::main]
@@ -202,9 +256,14 @@ async fn main() {
         _ => {}
     }
 
-    // The capture oracle signs in to nothing and every backend brings its own
-    // runtime, so it never touches this one.
-    if argv.iter().any(|arg| arg == "--capture-seconds") {
+    // The capture oracles sign in to nothing and every backend brings its own
+    // runtime, so they never touch this one.
+    if argv.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--capture-seconds" | "--capture-camera-seconds" | "--list-cameras"
+        )
+    }) {
         std::process::exit(capture::run(argv));
     }
 
@@ -253,14 +312,17 @@ async fn probe(args: Args) -> i32 {
         event_tx,
     ));
 
-    let mut names: HashMap<u32, (i64, String)> = HashMap::new();
-    let share_flow = args.share_seconds.is_some() || args.watch.is_some();
+    let mut roster = Roster::default();
+    let video_flow = args.share_seconds.is_some()
+        || args.watch.is_some()
+        || args.camera_seconds.is_some()
+        || !args.watch_cameras.is_empty();
     let ready = match wait_for_voice(
         &mut commands,
         &mut events,
-        &mut names,
+        &mut roster,
         &args.channel,
-        share_flow,
+        video_flow,
     )
     .await
     {
@@ -314,7 +376,7 @@ async fn probe(args: Args) -> i32 {
         if let Err(reason) = start_share(
             &mut commands,
             &mut events,
-            &mut names,
+            &mut roster,
             ready.channel_id,
             self_id,
             args.share_audio,
@@ -341,22 +403,66 @@ async fn probe(args: Args) -> i32 {
         ));
     }
 
+    let mut filming = None;
+    if let Some(seconds) = args.camera_seconds {
+        if let Err(reason) = start_camera(
+            &mut commands,
+            &mut events,
+            &mut roster,
+            ready.channel_id,
+            self_id,
+        )
+        .await
+        {
+            eprintln!("vorcall-probe: {reason}");
+            return 2;
+        }
+        filming = Some(camera::start_camera(
+            engine.sender(),
+            camera::CameraPlan {
+                width: args.camera_size.0,
+                height: args.camera_size.1,
+                fps: args.camera_fps,
+                bitrate_kbps: share::default_bitrate_kbps(args.camera_size, args.camera_fps),
+                threads: args.encode_threads,
+                seconds,
+            },
+        ));
+    }
+
     let mut watching = args
         .watch
         .clone()
         .map(|user| share::WatchPlan::new(user, ready.channel_id, started + WATCH_TIMEOUT));
+    let mut watching_cameras = (!args.watch_cameras.is_empty()).then(|| {
+        camera::CameraWatchPlan::new(
+            args.watch_cameras.clone(),
+            ready.channel_id,
+            started + WATCH_TIMEOUT,
+        )
+    });
 
     let heard = listen(
         &engine,
         &mut commands,
         &mut events,
-        &mut names,
+        &mut roster,
         watching.as_mut(),
+        watching_cameras.as_mut(),
         started + Duration::from_secs(args.listen_seconds),
     )
     .await;
 
     let stats = engine.stats();
+    // The watched share's own jitter buffer, which is not one of the speakers
+    // `stats.peers` reports and so has to be read off the playout itself.
+    let share_audio = engine
+        .playout()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .share_stats()
+        .map(|(_, peer)| peer)
+        .unwrap_or_default();
 
     let share = sharing.map(|handles| {
         let outcome = handles.join();
@@ -381,6 +487,49 @@ async fn probe(args: Args) -> i32 {
             .await;
     }
 
+    let camera = filming.map(|handle| {
+        let outcome = handle.join().unwrap_or_default();
+        CameraReport {
+            frames: outcome.frames,
+            keyframes: outcome.keyframes,
+            send_failures: outcome.send_failures,
+        }
+    });
+    if args.camera_seconds.is_some() {
+        let _ = commands
+            .send(Command::StopCamera {
+                channel_id: ready.channel_id,
+            })
+            .await;
+    }
+
+    let mut cameras_confirmed = true;
+    let cameras: Vec<CameraWatchReport> = watching_cameras.map_or_else(Vec::new, |plan| {
+        cameras_confirmed = plan.confirmed();
+        plan.finish()
+            .into_iter()
+            .map(|result| CameraWatchReport {
+                user: result.user,
+                ssrc: result.ssrc,
+                pictures: result.decoded.pictures,
+                keyframes: result.decoded.keyframes,
+                dropped: stats
+                    .cameras
+                    .iter()
+                    .find(|(ssrc, _)| *ssrc == result.ssrc)
+                    .map_or(0, |(_, video)| video.dropped),
+            })
+            .collect()
+    });
+    if !args.watch_cameras.is_empty() {
+        let _ = commands
+            .send(Command::UnwatchCamera {
+                channel_id: ready.channel_id,
+                user_id: 0,
+            })
+            .await;
+    }
+
     let mut watch_confirmed = true;
     let watch = watching.map(|plan| {
         watch_confirmed = plan.confirmed();
@@ -399,6 +548,14 @@ async fn probe(args: Args) -> i32 {
             decode_fps: decoded.decode_fps(),
             keyframe_requests_sent: stats.video.keyframe_requests,
             share_tone_frames: heard.share_tone_frames,
+            // Every frame the buffer handed the decoder was either a packet or
+            // concealment, so what was really played is the difference.
+            audio_played: share_audio
+                .decoded_frames
+                .saturating_sub(share_audio.concealed),
+            audio_concealed: share_audio.concealed,
+            audio_lost: share_audio.lost,
+            audio_late: share_audio.late,
         }
     });
     if watch.is_some() {
@@ -471,7 +628,7 @@ async fn probe(args: Args) -> i32 {
             .peers
             .into_iter()
             .map(|(ssrc, peer)| {
-                let (user_id, username) = names.get(&ssrc).cloned().unwrap_or_default();
+                let (user_id, username) = roster.names.get(&ssrc).cloned().unwrap_or_default();
                 PeerReport {
                     user_id,
                     username,
@@ -487,6 +644,8 @@ async fn probe(args: Args) -> i32 {
         speaking_events: heard.speaking,
         share,
         watch,
+        camera,
+        cameras,
     };
 
     println!("{}", report.render());
@@ -525,10 +684,34 @@ async fn probe(args: Args) -> i32 {
         );
         return 1;
     }
+    if !cameras_confirmed {
+        eprintln!(
+            "vorcall-probe: not every --watch-camera was confirmed within {}s",
+            WATCH_TIMEOUT.as_secs()
+        );
+        return 1;
+    }
+    if args.expect_camera_video && report.min_camera_pictures() < MIN_PICTURES {
+        tracing::error!(
+            pictures = report.min_camera_pictures(),
+            "--expect-camera-video but a watched camera decoded almost nothing"
+        );
+        return 1;
+    }
     if args.expect_share_audio && report.share_tone_seconds() < 1.0 {
         tracing::error!(
             share_tone_seconds = report.share_tone_seconds(),
             "--expect-share-audio but no share tone was heard"
+        );
+        return 1;
+    }
+    if let Some(limit) = args.max_share_concealed_pct
+        && report.share_concealed_pct() > limit
+    {
+        tracing::error!(
+            concealed_pct = report.share_concealed_pct(),
+            limit,
+            "the watched share's audio stuttered past --max-share-concealed-pct"
         );
         return 1;
     }
@@ -540,7 +723,7 @@ async fn probe(args: Args) -> i32 {
 async fn start_share(
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
-    names: &mut HashMap<u32, (i64, String)>,
+    roster: &mut Roster,
     channel_id: i64,
     self_id: i64,
     audio: bool,
@@ -560,7 +743,7 @@ async fn start_share(
             Ok(Some(Event::ServerError { code, detail, .. })) if matches!(code, 15..=17) => {
                 return Err(format!("the server refused the share ({code}): {detail}"));
             }
-            Ok(Some(other)) => track_members(names, &other),
+            Ok(Some(other)) => roster.note(&other),
             Ok(None) => {
                 return Err("the connection loop stopped before the share started".to_owned());
             }
@@ -568,6 +751,44 @@ async fn start_share(
                 return Err(format!(
                     "no ShareStarted within {}s",
                     SHARE_START_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
+}
+
+/// Announces the local camera and waits for the server to echo it back, which
+/// is what makes the channel offer it to watchers.
+async fn start_camera(
+    commands: &mut mpsc::Sender<Command>,
+    events: &mut mpsc::Receiver<Event>,
+    roster: &mut Roster,
+    channel_id: i64,
+    self_id: i64,
+) -> Result<(), String> {
+    if commands
+        .send(Command::StartCamera { channel_id })
+        .await
+        .is_err()
+    {
+        return Err("the connection loop is gone".to_owned());
+    }
+
+    let deadline = tokio::time::Instant::now() + CAMERA_START_TIMEOUT;
+    loop {
+        match timeout_at(deadline, events.next()).await {
+            Ok(Some(Event::CameraStarted { user_id, .. })) if user_id == self_id => return Ok(()),
+            Ok(Some(Event::ServerError { code, detail, .. })) if matches!(code, 30..=33) => {
+                return Err(format!("the server refused the camera ({code}): {detail}"));
+            }
+            Ok(Some(other)) => roster.note(&other),
+            Ok(None) => {
+                return Err("the connection loop stopped before the camera started".to_owned());
+            }
+            Err(_) => {
+                return Err(format!(
+                    "no CameraStarted within {}s",
+                    CAMERA_START_TIMEOUT.as_secs()
                 ));
             }
         }
@@ -654,9 +875,9 @@ fn resolve_channel(
 async fn wait_for_voice(
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
-    names: &mut HashMap<u32, (i64, String)>,
+    roster: &mut Roster,
     select: &ChannelSelect,
-    share_flow: bool,
+    video_flow: bool,
 ) -> Result<VoiceReady, String> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     let mut resolved: Option<(i64, String)> = None;
@@ -701,10 +922,11 @@ async fn wait_for_voice(
                 }
                 tracing::warn!(%reason, ?retry_in, "disconnected before voice was ready");
             }
-            // 15..=17 are the share refusals, fatal only to a run that is
-            // about to share or watch.
+            // 15..=17 are the share refusals and 30..=33 the camera's, fatal
+            // only to a run that is about to send or watch one of them.
             Event::ServerError { code, detail, .. }
-                if matches!(code, 5 | 7 | 20) || (share_flow && matches!(code, 15..=17)) =>
+                if matches!(code, 5 | 7 | 20)
+                    || (video_flow && matches!(code, 15..=17 | 30..=33)) =>
             {
                 return Err(format!(
                     "the server refused the voice join ({code}): {detail}"
@@ -737,7 +959,7 @@ async fn wait_for_voice(
                     ssrc,
                 });
             }
-            other => track_members(names, &other),
+            other => roster.note(&other),
         }
     }
 }
@@ -756,14 +978,16 @@ struct Heard {
 
 /// Pulls a frame out of the playout every 20 ms — even while nobody speaks, so
 /// the jitter buffers keep draining — and follows the channel in parallel. Under
-/// `--watch` it also drives the watch: asks for the sharer's stream once they
-/// are known to be sharing, and starts decoding when the server confirms it.
+/// `--watch` and `--watch-camera` it also drives the watches: asks for a stream
+/// once its owner is known to be live, and starts decoding when the server
+/// confirms it.
 async fn listen(
     engine: &MediaEngine,
     commands: &mut mpsc::Sender<Command>,
     events: &mut mpsc::Receiver<Event>,
-    names: &mut HashMap<u32, (i64, String)>,
+    roster: &mut Roster,
     mut watch: Option<&mut share::WatchPlan>,
+    mut cameras: Option<&mut camera::CameraWatchPlan>,
     deadline: Instant,
 ) -> Heard {
     let playout = engine.playout();
@@ -777,12 +1001,17 @@ async fn listen(
     loop {
         // An unconfirmed watch is given its full timeout even when it outlasts
         // --listen-seconds: without it there is nothing to measure.
-        let until = match watch.as_deref() {
-            Some(plan) if !plan.confirmed() => {
-                deadline.max(tokio::time::Instant::from_std(plan.confirm_by))
-            }
-            _ => deadline,
-        };
+        let mut until = deadline;
+        if let Some(plan) = watch.as_deref()
+            && !plan.confirmed()
+        {
+            until = until.max(tokio::time::Instant::from_std(plan.confirm_by));
+        }
+        if let Some(plan) = cameras.as_deref()
+            && !plan.confirmed()
+        {
+            until = until.max(tokio::time::Instant::from_std(plan.confirm_by));
+        }
 
         tokio::select! {
             () = sleep_until(until) => break,
@@ -808,9 +1037,7 @@ async fn listen(
             }
             event = events.next() => {
                 let Some(event) = event else { break };
-                if let Some(plan) = watch.as_deref_mut() {
-                    plan.note(&event);
-                }
+                roster.note(&event);
                 match event {
                     Event::Speaking { user_id, speaking, .. } => {
                         heard.speaking.push(SpeakingEvent { user_id, speaking });
@@ -820,10 +1047,7 @@ async fn listen(
                     }
                     Event::WatchState { user_id: Some(user_id), .. } => {
                         if let Some(plan) = watch.as_deref_mut() {
-                            let ssrc = names
-                                .iter()
-                                .find(|(_, (id, _))| *id == user_id)
-                                .map(|(ssrc, _)| *ssrc);
+                            let ssrc = roster.ssrc_of(user_id);
                             if ssrc.is_none() {
                                 tracing::warn!(user_id, "watching someone with no known ssrc");
                             }
@@ -832,7 +1056,14 @@ async fn listen(
                             tracing::info!(user_id, ?ssrc, "the server confirmed the watch");
                         }
                     }
-                    Event::ServerError { code, detail, .. } if matches!(code, 15..=17 | 20) => {
+                    Event::CameraWatchState { user_ids, .. } => {
+                        if let Some(plan) = cameras.as_deref_mut() {
+                            plan.confirm(engine, &user_ids, roster);
+                        }
+                    }
+                    Event::ServerError { code, detail, .. }
+                        if matches!(code, 15..=17 | 20 | 30..=33) =>
+                    {
                         tracing::error!(code, %detail, "the server refused a command");
                     }
                     // A moderator moved or disconnected this session; either
@@ -858,11 +1089,11 @@ async fn listen(
                         heard.link_lost = true;
                         break;
                     }
-                    other => track_members(names, &other),
+                    _ => {}
                 }
 
                 if let Some(plan) = watch.as_deref_mut()
-                    && let Some(user_id) = plan.pending_request(names)
+                    && let Some(user_id) = plan.pending_request(roster)
                 {
                     let channel_id = plan.channel_id;
                     tracing::info!(user_id, user = %plan.user, "asking to watch a share");
@@ -873,6 +1104,19 @@ async fn listen(
                         })
                         .await;
                 }
+
+                if let Some(plan) = cameras.as_deref_mut() {
+                    let channel_id = plan.channel_id;
+                    for user_id in plan.pending_requests(roster) {
+                        tracing::info!(user_id, "asking to watch a camera");
+                        let _ = commands
+                            .send(Command::WatchCamera {
+                                channel_id,
+                                user_id,
+                            })
+                            .await;
+                    }
+                }
             }
         }
     }
@@ -880,20 +1124,79 @@ async fn listen(
     heard
 }
 
-fn track_members(names: &mut HashMap<u32, (i64, String)>, event: &Event) {
-    match event {
-        Event::VoiceState { members, .. } => {
-            for member in members {
-                names.insert(member.ssrc, (member.user_id, member.username.clone()));
+/// Who is in the channel's voice session and what each of them is transmitting.
+///
+/// It is fed every event from the first one, because the steps that wait for a
+/// frame of their own — the share and camera announcements — consume the events
+/// they pass over, and a `ShareStarted` or `CameraStarted` lost there would
+/// leave a watch waiting for a peer that is already live.
+#[derive(Default)]
+struct Roster {
+    /// One entry per live voice session: ssrc -> (user id, username).
+    names: HashMap<u32, (i64, String)>,
+    sharing: HashSet<i64>,
+    on_camera: HashSet<i64>,
+}
+
+impl Roster {
+    fn note(&mut self, event: &Event) {
+        match event {
+            Event::VoiceState { members, .. } => {
+                for member in members {
+                    self.add(member);
+                }
             }
+            Event::VoiceMemberJoined { member, .. } => self.add(member),
+            Event::VoiceMemberLeft { user_id, .. } => {
+                self.names.retain(|_, (id, _)| id != user_id);
+                self.sharing.remove(user_id);
+                self.on_camera.remove(user_id);
+            }
+            Event::ShareStarted { user_id, .. } => {
+                self.sharing.insert(*user_id);
+            }
+            Event::ShareStopped { user_id, .. } => {
+                self.sharing.remove(user_id);
+            }
+            Event::CameraStarted { user_id, .. } => {
+                self.on_camera.insert(*user_id);
+            }
+            Event::CameraStopped { user_id, .. } => {
+                self.on_camera.remove(user_id);
+            }
+            _ => {}
         }
-        Event::VoiceMemberJoined { member, .. } => {
-            names.insert(member.ssrc, (member.user_id, member.username.clone()));
-        }
-        Event::VoiceMemberLeft { user_id, .. } => {
-            names.retain(|_, (id, _)| id != user_id);
-        }
-        _ => {}
+    }
+
+    fn add(&mut self, member: &vorcall_core::VoiceMember) {
+        self.names
+            .insert(member.ssrc, (member.user_id, member.username.clone()));
+        toggle(&mut self.sharing, member.user_id, member.sharing);
+        toggle(&mut self.on_camera, member.user_id, member.camera);
+    }
+
+    /// The ssrc a user's media comes in on, if they are in voice here.
+    fn ssrc_of(&self, user_id: i64) -> Option<u32> {
+        self.names
+            .iter()
+            .find(|(_, (id, _))| *id == user_id)
+            .map(|(ssrc, _)| *ssrc)
+    }
+
+    /// The user id behind a username, if they are in voice here.
+    fn user_id_of(&self, username: &str) -> Option<i64> {
+        self.names
+            .values()
+            .find(|(_, name)| name.as_str() == username)
+            .map(|(id, _)| *id)
+    }
+}
+
+fn toggle(ids: &mut HashSet<i64>, user_id: i64, on: bool) {
+    if on {
+        ids.insert(user_id);
+    } else {
+        ids.remove(&user_id);
     }
 }
 
@@ -987,10 +1290,16 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
     let mut encode_threads = 1u16;
     let mut bitrate_kbps = None;
     let mut watch = None;
+    let mut camera_seconds = None;
+    let mut camera_size = (640u32, 360u32);
+    let mut camera_fps = FrameRate::F30;
+    let mut watch_cameras: Vec<String> = Vec::new();
     let mut expect_peer = false;
     let mut expect_silence = false;
     let mut expect_video = false;
+    let mut expect_camera_video = false;
     let mut expect_share_audio = false;
+    let mut max_share_concealed_pct = None;
 
     let mut args = args.peekable();
     while let Some(flag) = args.next() {
@@ -999,17 +1308,38 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
             "--expect-peer" => expect_peer = true,
             "--expect-silence" => expect_silence = true,
             "--expect-video" => expect_video = true,
+            "--expect-camera-video" => expect_camera_video = true,
             "--expect-share-audio" => expect_share_audio = true,
+            "--max-share-concealed-pct" => {
+                let raw = value(&flag, &mut args)?;
+                let pct: f64 = raw
+                    .parse()
+                    .map_err(|_| format!("{flag} wants a number, got {raw}"))?;
+                if !(0.0..=100.0).contains(&pct) {
+                    return Err(format!("{flag} wants 0..100, got {raw}"));
+                }
+                max_share_concealed_pct = Some(pct);
+            }
             "--share-audio" => share_audio = true,
             "--share-seconds" => share_seconds = Some(number(&flag, &mut args)?),
             "--watch" => watch = Some(value(&flag, &mut args)?),
-            "--share-size" => share_size = share::parse_size(&value(&flag, &mut args)?)?,
+            "--share-size" => share_size = share::parse_size(&flag, &value(&flag, &mut args)?)?,
             "--share-fps" => {
                 let raw = number(&flag, &mut args)?;
                 share_fps = u32::try_from(raw)
                     .ok()
                     .and_then(FrameRate::from_hz)
                     .ok_or_else(|| format!("--share-fps wants 15, 30 or 60, got {raw}"))?;
+            }
+            "--camera-seconds" => camera_seconds = Some(number(&flag, &mut args)?),
+            "--watch-camera" => watch_cameras.push(value(&flag, &mut args)?),
+            "--camera-size" => camera_size = share::parse_size(&flag, &value(&flag, &mut args)?)?,
+            "--camera-fps" => {
+                let raw = number(&flag, &mut args)?;
+                camera_fps = u32::try_from(raw)
+                    .ok()
+                    .and_then(FrameRate::from_hz)
+                    .ok_or_else(|| format!("--camera-fps wants 15, 30 or 60, got {raw}"))?;
             }
             "--encode-threads" => {
                 let raw = number(&flag, &mut args)?;
@@ -1091,6 +1421,26 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
     if watch.as_ref().is_some_and(String::is_empty) {
         return Err("--watch cannot be empty".to_owned());
     }
+    if camera_seconds.is_some_and(|seconds| seconds > listen_seconds) {
+        return Err("--listen-seconds cannot be shorter than --camera-seconds".to_owned());
+    }
+    if watch_cameras.iter().any(String::is_empty) {
+        return Err("--watch-camera cannot be empty".to_owned());
+    }
+    if watch_cameras.len() > camera::MAX_WATCHED {
+        return Err(format!(
+            "--watch-camera takes at most {} cameras",
+            camera::MAX_WATCHED
+        ));
+    }
+    // One camera per user, so a repeated name could never be confirmed twice.
+    if let Some(repeated) = watch_cameras
+        .iter()
+        .enumerate()
+        .find(|(index, user)| watch_cameras[..*index].contains(user))
+    {
+        return Err(format!("--watch-camera {} was given twice", repeated.1));
+    }
 
     Ok(Some(Args {
         username,
@@ -1109,10 +1459,16 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String
         encode_threads,
         bitrate_kbps,
         watch,
+        camera_seconds,
+        camera_size,
+        camera_fps,
+        watch_cameras,
         expect_peer,
         expect_silence,
         expect_video,
+        expect_camera_video,
         expect_share_audio,
+        max_share_concealed_pct,
     }))
 }
 

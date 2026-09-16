@@ -6,9 +6,9 @@
 //! Sequence numbers are shared with the engine's keepalive pings, so a hole in
 //! them is not by itself a lost frame: how much audio a hole really holds is
 //! read off the 48 kHz timestamps.
-//! The target walks between [`MIN_TARGET_MS`] and [`MAX_TARGET_MS`]: it grows
-//! when packets arrive after their deadline, and shrinks again at the end of a
-//! talk spurt once the line has been clean for a while.
+//! The target walks between the [`JitterConfig`]'s bounds: it grows when
+//! packets arrive after their deadline, and shrinks again at the end of a talk
+//! spurt once the line has been clean for a while.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -31,6 +31,44 @@ const LATE_SHRINK_WINDOW: Duration = Duration::from_secs(10);
 const MAX_CONSECUTIVE_LOST: u32 = 5;
 /// One 20 ms frame on the media clock.
 const TS_PER_FRAME: u32 = FRAME_SAMPLES as u32;
+/// Depth past which a buffer that trims one frame per pull cuts at once
+/// anyway: five seconds is a sender flooding the stream, not a burst, and one
+/// frame per pull would never catch up with it.
+const MAX_DEPTH_FRAMES: usize = 250;
+
+/// How a buffer trades delay against gaps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitterConfig {
+    pub min_target_ms: u32,
+    pub max_target_ms: u32,
+    /// Concealed frames in a row after which a spurt is given up on. `None`
+    /// waits for [`SPURT_GAP`] of silence on an empty buffer, and bounds a hole
+    /// at `max_target_ms` worth of frames.
+    pub max_consecutive_lost: Option<u32>,
+    /// Drops one oldest frame per pull while the buffer is too deep, instead of
+    /// cutting back to the target in one go.
+    pub trim_one_frame_per_pull: bool,
+}
+
+impl JitterConfig {
+    /// A voice: the shortest delay that survives the network.
+    pub const VOICE: JitterConfig = JitterConfig {
+        min_target_ms: MIN_TARGET_MS,
+        max_target_ms: MAX_TARGET_MS,
+        max_consecutive_lost: Some(MAX_CONSECUTIVE_LOST),
+        trim_one_frame_per_pull: false,
+    };
+
+    /// A screen share's audio. It arrives in bursts behind the video on the
+    /// same socket, and is programme material, where a dropout is heard far
+    /// more than a little extra delay.
+    pub const SHARE: JitterConfig = JitterConfig {
+        min_target_ms: 120,
+        max_target_ms: 300,
+        max_consecutive_lost: None,
+        trim_one_frame_per_pull: true,
+    };
+}
 
 #[derive(Clone, Debug)]
 pub struct Incoming {
@@ -60,6 +98,7 @@ pub struct JitterStats {
 }
 
 pub struct JitterBuffer {
+    config: JitterConfig,
     packets: BTreeMap<u64, Incoming>,
     next_expected: u64,
     /// No talk spurt in progress: the next packet starts one.
@@ -83,8 +122,14 @@ pub struct JitterBuffer {
 }
 
 impl JitterBuffer {
+    /// A buffer for a voice, [`JitterConfig::VOICE`].
     pub fn new() -> Self {
+        Self::with_config(JitterConfig::VOICE)
+    }
+
+    pub fn with_config(config: JitterConfig) -> Self {
         Self {
+            config,
             packets: BTreeMap::new(),
             next_expected: 0,
             idle: true,
@@ -94,8 +139,8 @@ impl JitterBuffer {
             last_ts: None,
             last_played_ts: None,
             gap_concealed: 0,
-            target_ms: MIN_TARGET_MS,
-            spurt_target_ms: MIN_TARGET_MS,
+            target_ms: config.min_target_ms,
+            spurt_target_ms: config.min_target_ms,
             late_events: VecDeque::new(),
             consecutive_lost: 0,
             stats: JitterStats::default(),
@@ -143,6 +188,11 @@ impl JitterBuffer {
         if !self.playing {
             return Frame::Idle;
         }
+        if self.config.trim_one_frame_per_pull
+            && u32::try_from(self.packets.len()).unwrap_or(u32::MAX) > self.depth_cap()
+        {
+            self.drop_oldest();
+        }
 
         if let Some(packet) = self.packets.remove(&self.next_expected) {
             self.next_expected = self.next_expected.wrapping_add(1);
@@ -164,8 +214,7 @@ impl JitterBuffer {
             // The second arm bounds a run of concealment the way the empty
             // buffer is bounded: a bogus timestamp far in the future must not
             // conceal forever while a playable packet waits.
-            if self.gap_concealed >= missing_audio || self.consecutive_lost >= MAX_CONSECUTIVE_LOST
-            {
+            if self.gap_concealed >= missing_audio || self.consecutive_lost >= self.max_hole_run() {
                 self.stats.lost += u64::from(missing_audio);
                 self.next_expected = first_seq.wrapping_add(1);
                 if let Some(packet) = self.packets.remove(&first_seq) {
@@ -179,7 +228,10 @@ impl JitterBuffer {
             .last_packet_at
             .map(|last| now.saturating_duration_since(last));
         if silent_for.is_none_or(|gap| gap > SPURT_GAP)
-            || self.consecutive_lost >= MAX_CONSECUTIVE_LOST
+            || self
+                .config
+                .max_consecutive_lost
+                .is_some_and(|max| self.consecutive_lost >= max)
         {
             self.end_spurt(now);
             return Frame::Idle;
@@ -238,7 +290,7 @@ impl JitterBuffer {
         self.gap_concealed = 0;
         self.spurt_started_at = None;
         self.prune_late(now);
-        if self.late_events.is_empty() && self.target_ms > MIN_TARGET_MS {
+        if self.late_events.is_empty() && self.target_ms > self.config.min_target_ms {
             self.target_ms -= STEP_MS;
         }
     }
@@ -259,7 +311,14 @@ impl JitterBuffer {
     /// Keeps the buffer from growing without bound when a sender runs fast or a
     /// burst arrives at once.
     fn enforce_depth(&mut self) {
-        let cap = (self.spurt_target_ms + 100) / FRAME_MS as u32;
+        if self.config.trim_one_frame_per_pull {
+            // The depth cap itself is enforced a frame at a time by `pull`.
+            while self.packets.len() > MAX_DEPTH_FRAMES {
+                self.drop_oldest();
+            }
+            return;
+        }
+        let cap = self.depth_cap();
         let keep = (self.spurt_target_ms / FRAME_MS as u32) as usize;
         if u32::try_from(self.packets.len()).unwrap_or(u32::MAX) <= cap {
             return;
@@ -279,6 +338,32 @@ impl JitterBuffer {
         }
     }
 
+    /// The deepest the buffer may get, in frames, before it is trimmed.
+    fn depth_cap(&self) -> u32 {
+        (self.spurt_target_ms + 100) / FRAME_MS as u32
+    }
+
+    /// Counted as late for the caller, and not fed to the adaptation, for the
+    /// same reason as in [`enforce_depth`](Self::enforce_depth).
+    fn drop_oldest(&mut self) {
+        let Some(&oldest) = self.packets.keys().next() else {
+            return;
+        };
+        self.packets.remove(&oldest);
+        self.stats.late += 1;
+        if let Some(&next) = self.packets.keys().next() {
+            self.next_expected = next;
+        }
+    }
+
+    /// The longest run of concealment a hole in the buffer may cost before the
+    /// next buffered packet is played anyway.
+    fn max_hole_run(&self) -> u32 {
+        self.config
+            .max_consecutive_lost
+            .unwrap_or(self.config.max_target_ms / FRAME_MS as u32)
+    }
+
     fn note_late(&mut self, now: Instant) {
         self.prune_late(now);
         // Judged on the events that were already there: one reordered packet is
@@ -288,8 +373,8 @@ impl JitterBuffer {
             .iter()
             .any(|at| now.saturating_duration_since(*at) <= LATE_GROW_WINDOW);
         self.late_events.push_back(now);
-        if jittering && self.target_ms < MAX_TARGET_MS {
-            self.target_ms = (self.target_ms + STEP_MS).min(MAX_TARGET_MS);
+        if jittering && self.target_ms < self.config.max_target_ms {
+            self.target_ms = (self.target_ms + STEP_MS).min(self.config.max_target_ms);
         }
     }
 
@@ -602,5 +687,129 @@ mod tests {
         assert_eq!(buffer.pull(at(t0, 20)), Frame::Packet(vec![7]));
         assert_eq!(buffer.pull(at(t0, 40)), Frame::Packet(vec![8]));
         assert_eq!(buffer.pull(at(t0, 60)), Frame::Packet(vec![9]));
+    }
+
+    #[test]
+    fn voice_config_matches_the_old_constants() {
+        let voice = JitterConfig::VOICE;
+        assert_eq!(voice.min_target_ms, 60);
+        assert_eq!(voice.max_target_ms, 100);
+        assert_eq!(voice.max_consecutive_lost, Some(5));
+        assert!(!voice.trim_one_frame_per_pull);
+    }
+
+    #[test]
+    fn share_audio_between_video_fragments_is_never_concealed() {
+        let t0 = Instant::now();
+        let mut buffer = JitterBuffer::with_config(JitterConfig::SHARE);
+        // Six video fragments between every two audio frames, 5 s of them.
+        let sent: Vec<Incoming> = (0..250u64)
+            .map(|index| frame(index * 7, index as u32 * 960, index == 0))
+            .collect();
+
+        let mut arrivals = sent.iter();
+        let mut played = Vec::new();
+        let mut first_played = None;
+        // Five pulls past the last arrival drain what the target still holds.
+        for tick in 0..255u64 {
+            let now = at(t0, tick * 20);
+            if let Some(packet) = arrivals.next() {
+                buffer.push(now, packet.clone());
+            }
+            match buffer.pull(now) {
+                Frame::Packet(payload) => {
+                    first_played.get_or_insert(tick);
+                    played.push(payload);
+                }
+                Frame::Lost => panic!("concealed at {} ms", tick * 20),
+                Frame::Idle => assert!(first_played.is_none(), "idle at {} ms", tick * 20),
+            }
+        }
+
+        let expected: Vec<Vec<u8>> = sent.iter().map(|packet| packet.payload.clone()).collect();
+        assert_eq!(played, expected, "every frame, in order");
+        let stats = buffer.stats();
+        assert_eq!(stats.concealed, 0);
+        assert_eq!(stats.lost, 0);
+        assert_eq!(stats.late, 0);
+    }
+
+    #[test]
+    fn share_audio_arriving_in_bursts_plays_without_chops() {
+        let t0 = Instant::now();
+        let mut buffer = JitterBuffer::with_config(JitterConfig::SHARE);
+        // Five consecutive frames every 100 ms, their sequence numbers spread
+        // by the video sent in between, 5 s of them.
+        let sent: Vec<Incoming> = (0..250u64)
+            .map(|index| frame(index * 9 + index / 5 * 40, index as u32 * 960, index == 0))
+            .collect();
+
+        let mut bursts = sent.chunks(5);
+        let mut played = Vec::new();
+        let mut first_played = None;
+        // Each burst lands just after that tick's pull, which is the worst
+        // moment: the buffer has to hold a whole burst's worth over the gap.
+        for tick in 0..256u64 {
+            let now = at(t0, tick * 20);
+            match buffer.pull(now) {
+                Frame::Packet(payload) => {
+                    first_played.get_or_insert(tick);
+                    played.push(payload);
+                }
+                Frame::Lost => panic!("concealed at {} ms", tick * 20),
+                Frame::Idle => assert!(first_played.is_none(), "idle at {} ms", tick * 20),
+            }
+            if tick.is_multiple_of(5)
+                && let Some(burst) = bursts.next()
+            {
+                for packet in burst {
+                    buffer.push(now, packet.clone());
+                }
+            }
+        }
+
+        let expected: Vec<Vec<u8>> = sent.iter().map(|packet| packet.payload.clone()).collect();
+        assert_eq!(played, expected, "every frame, in order");
+        let stats = buffer.stats();
+        assert_eq!(stats.received, 250);
+        assert_eq!(stats.concealed, 0);
+        assert_eq!(stats.lost, 0);
+        assert_eq!(stats.late, 0, "no frame was trimmed for depth");
+    }
+
+    #[test]
+    fn share_config_trims_one_frame_per_pull() {
+        let t0 = Instant::now();
+        let mut buffer = JitterBuffer::with_config(JitterConfig::SHARE);
+        for seq in 0..30 {
+            buffer.push(t0, packet(seq, seq == 0));
+        }
+        assert_eq!(buffer.stats().late, 0, "nothing is cut on arrival");
+
+        // A 120 ms target allows 220 ms, 11 frames: every pull that finds more
+        // drops the oldest before it plays the next one.
+        let mut played = Vec::new();
+        let mut late = 0;
+        for tick in 0..20u64 {
+            match buffer.pull(at(t0, tick * 20)) {
+                Frame::Packet(payload) => played.push(payload[0]),
+                other => panic!("pull {tick} gave {other:?}"),
+            }
+            let now_late = buffer.stats().late;
+            let dropped = now_late - late;
+            assert!(dropped <= 1, "pull {tick} dropped {dropped} frames");
+            late = now_late;
+        }
+
+        // A trimming pull takes two frames out of the buffer where a plain one
+        // takes one, so ten of them bring thirty frames inside the bound and
+        // the last ten play back to back.
+        let expected: Vec<u8> = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+            .into_iter()
+            .chain(20..30)
+            .collect();
+        assert_eq!(played, expected);
+        assert_eq!(buffer.stats().late, 10);
+        assert_eq!(buffer.stats().concealed, 0);
     }
 }

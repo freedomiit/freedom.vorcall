@@ -29,23 +29,26 @@ use iced::{Element, Size, Subscription, Task, Theme, keyboard, mouse, window};
 use vorcall_clipboard::Clipboard;
 use vorcall_core::connection::{self, Blob, Command};
 use vorcall_core::update::{PublicKey, Ready, Version};
-use vorcall_core::{Config, Endpoints, Event, Session, config, session};
+use vorcall_core::{Config, Endpoints, Event, Session, config, session, stickers};
 use vorcall_voice::Sfx;
 
 use crate::brand;
 use crate::theme::{self, ThemeTokens};
 use crate::view;
+use crate::workers::camera::{CameraCommand, CameraHandle};
 use crate::workers::images::ImageKey;
 use crate::workers::share::{ShareCommand, ShareHandle};
 use crate::workers::voice::{AudioCommand, AudioHandle};
-use crate::workers::{audio, images, notify, share, sounds, voice};
+use crate::workers::{audio, camera, images, notify, share, sounds, voice};
 
 pub use message::Message;
 use message::{ChatMsg, TickMsg, UiMsg, WindowMsg};
 use state::chat::{ChatState, ImageState};
+use state::rules;
 use state::server::ServerModel;
 use state::settings::{AdminState, SettingsState};
 use state::sound::SoundState;
+use state::sticker::StickerState;
 use state::ui::UiState;
 use state::update::UpdateState;
 use state::voice::VoiceUi;
@@ -213,6 +216,7 @@ impl ServerForm {
 pub struct Workers {
     pub audio: Option<AudioHandle>,
     pub share: Option<ShareHandle>,
+    pub camera: Option<CameraHandle>,
 }
 
 pub enum Screen {
@@ -254,6 +258,7 @@ pub struct MainState {
     pub chat: ChatState,
     pub voice: VoiceUi,
     pub sound: SoundState,
+    pub sticker: StickerState,
     pub settings: SettingsState,
     pub admin: AdminState,
     pub status: Status,
@@ -310,6 +315,7 @@ impl MainState {
             chat: ChatState::new(),
             voice: VoiceUi::default(),
             sound: SoundState::default(),
+            sticker: StickerState::default(),
             settings: SettingsState::default(),
             admin: AdminState::default(),
             status: Status::Connecting,
@@ -697,6 +703,25 @@ impl App {
         }
     }
 
+    /// The camera thread, started on the first camera and kept afterwards. It
+    /// lives beside the share's: the two run at once over one session.
+    pub fn ensure_camera(&mut self) -> Task<Message> {
+        if self.workers.camera.is_some() {
+            return Task::none();
+        }
+        let (handle, events) = camera::spawn_camera_thread();
+        self.workers.camera = Some(handle);
+        Task::run(events, |event| {
+            Message::Camera(message::CameraMsg::Event(event))
+        })
+    }
+
+    pub fn send_camera(&self, command: CameraCommand) {
+        if let Some(handle) = &self.workers.camera {
+            handle.send(command);
+        }
+    }
+
     /// Asks the main window which display it is drawing on, once a run. The
     /// answer is what tells a Wayland session from an X11 one, and the Wayland
     /// clipboard backend needs the connection itself.
@@ -778,12 +803,29 @@ impl App {
             });
         }
 
+        // A sticker has no fetch command of its own: its bytes are a plain REST
+        // read, the way a soundpad clip's are.
+        if let ImageKey::Sticker(id) = key {
+            let Some(session) = self.session.as_ref() else {
+                if let Some(main) = self.main_mut() {
+                    main.chat.images.insert(key, ImageState::Failed);
+                }
+                return Task::none();
+            };
+            return fetch_sticker(self.endpoints.clone(), session.access_token.clone(), id);
+        }
+
+        let Some(main) = self.main_mut() else {
+            return Task::none();
+        };
         let request_id = main.next_request_id();
-        main.pending_fetches.insert(request_id, key);
         let command = match key {
             ImageKey::Attachment(id) => Command::FetchAttachment { request_id, id },
             ImageKey::Image(id) => Command::FetchImage { request_id, id },
+            // Answered above, over REST rather than over the socket.
+            ImageKey::Sticker(_) => return Task::none(),
         };
+        main.pending_fetches.insert(request_id, key);
         if !main.send_command(command) {
             main.pending_fetches.remove(&request_id);
             main.chat.images.insert(key, ImageState::Failed);
@@ -810,10 +852,9 @@ impl App {
             self.chime();
         }
         if self.config.notifications {
-            Task::perform(notify::show(title, body), |()| Message::Noop)
-        } else {
-            Task::none()
+            notify::show(title, body);
         }
+        Task::none()
     }
 
     /// Opens the output device on the first chime that needs it. A device that
@@ -1068,6 +1109,35 @@ fn connect(input: &ConnectionInput) -> impl Stream<Item = Event> + use<> {
         }
         connection::run(endpoints, session, cmd_rx, output).await;
     })
+}
+
+/// One sticker's bytes, over REST and straight into the cache and the decoder.
+/// The connection loop has no fetch command for a sticker: every other picture
+/// travels over the socket because a message names it, and a sticker is named by
+/// the library instead.
+fn fetch_sticker(endpoints: Endpoints, token: String, id: i64) -> Task<Message> {
+    let key = ImageKey::Sticker(id);
+    Task::perform(
+        async move {
+            let bytes = stickers::download(&endpoints, &token, id)
+                .await
+                .map_err(|failure| rules::describe(&failure))?;
+            // Stored and decoded in the one hop, on a blocking task: the
+            // interface thread neither writes the file nor reads a pixel.
+            tokio::task::spawn_blocking(move || {
+                images::store(key, &bytes);
+                images::decode(&bytes, images::MAX_SIDE)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        move |decoded| {
+            Message::Chat(ChatMsg::ImageDecoded(
+                key,
+                decoded.map(|(width, height, pixels)| Handle::from_rgba(width, height, pixels)),
+            ))
+        },
+    )
 }
 
 /// Turns one image's bytes into pixels on a blocking thread: an 8 MiB image is

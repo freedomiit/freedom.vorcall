@@ -24,6 +24,8 @@ message ChatMessage {
   bool mention_everyone = 14;     // @everyone by a sender holding MENTION_EVERYONE
   bool mention_here = 15;         // @here, same rule; online members only
   repeated StreamedFile streamed_files = 16; // none on a tombstone, like attachments
+  int64 sticker_id = 17;          // 0 = not a sticker message, or its sticker was deleted
+  bool sticker = 18;              // the message is a sticker message; sticker_id is 0 once that sticker is deleted
 }
 
 // A snapshot of the message a reply points at, resolved when the reply is read.
@@ -107,9 +109,11 @@ enum Permission {                        // bit masks; server-scoped bits never 
   PERMISSION_CHANGE_NICKNAME  = 1048576; // 1<<20 server-scoped: own nickname
   PERMISSION_SOUNDPAD         = 2097152; // 1<<21 channel-scoped: trigger a soundpad clip
   PERMISSION_MANAGE_SOUNDS    = 4194304; // 1<<22 server-scoped: add, rename and delete clips
+  PERMISSION_VIDEO            = 8388608; // 1<<23 channel-scoped: turn on a camera in a voice or DM channel
+  PERMISSION_MANAGE_STICKERS  = 16777216; // 1<<24 server-scoped: add, rename and delete stickers
 }
-// ALL = 0x7FFFFF. SERVER_SCOPED = MANAGE_SERVER|MANAGE_ROLES|MANAGE_MEMBERS|MANAGE_INVITES|KICK|BAN|CHANGE_NICKNAME|MANAGE_SOUNDS.
-// EVERYONE_DEFAULT = VIEW|SEND|ATTACH|REACT|CONNECT|SPEAK|SHARE_SCREEN|CHANGE_NICKNAME|SOUNDPAD (= 3206912).
+// ALL = 0x1FFFFFF. SERVER_SCOPED = MANAGE_SERVER|MANAGE_ROLES|MANAGE_MEMBERS|MANAGE_INVITES|KICK|BAN|CHANGE_NICKNAME|MANAGE_SOUNDS|MANAGE_STICKERS.
+// EVERYONE_DEFAULT = VIEW|SEND|ATTACH|REACT|CONNECT|SPEAK|SHARE_SCREEN|CHANGE_NICKNAME|SOUNDPAD|VIDEO (= 11595520).
 
 // The one server's shared facts.
 message Server {
@@ -242,6 +246,12 @@ message ClientFrame {
     StopSound stop_sound = 42;
     UpdateSound update_sound = 43;
     DeleteSound delete_sound = 44;
+    StartCamera start_camera = 45;
+    StopCamera stop_camera = 46;
+    WatchCamera watch_camera = 47;
+    UnwatchCamera unwatch_camera = 48;
+    UpdateSticker update_sticker = 49;
+    DeleteSticker delete_sticker = 50;
   }
 }
 
@@ -254,11 +264,12 @@ message Hello {
 }
 
 message SendMessage {
-  string text = 1;                // trimmed, 1..2000 chars; may be empty only with attachments or streamed files
+  string text = 1;                // trimmed, 1..2000 chars; may be empty only with attachments or streamed files, and must be empty with a sticker
   int64 channel_id = 2;           // a text or DM channel; 0 is invalid
   int64 reply_to_id = 3;          // 0 = not a reply; otherwise a message of the same channel
   repeated int64 attachment_ids = 4; // at most 4, uploaded by the sender to this channel, not yet linked
   repeated int64 streamed_file_ids = 5; // at most 4, offered by the sender for this channel, not yet linked
+  int64 sticker_id = 6;           // 0 = none; otherwise text, attachment_ids and streamed_file_ids must be empty
 }
 
 message Ping {
@@ -466,6 +477,12 @@ message ServerFrame {
     SoundDeleted sound_deleted = 37;
     SoundPlayed sound_played = 38;
     SoundStopped sound_stopped = 39;
+    CameraStarted camera_started = 40;
+    CameraStopped camera_stopped = 41;
+    CameraWatchState camera_watch_state = 42;
+    CameraWatchers camera_watchers = 43;
+    StickerUpserted sticker_upserted = 44;
+    StickerDeleted sticker_deleted = 45;
   }
 }
 
@@ -488,6 +505,7 @@ message ServerSnapshot {
   repeated Profile members = 5;     // every member of the server
   repeated ReadState read_states = 6; // one per viewable text channel and DM
   repeated Sound sounds = 7;         // the whole shared soundpad library, which is server-wide
+  repeated Sticker stickers = 8;     // the whole server-wide sticker library
 }
 
 // Replaces what the client knows about the server's shared facts.
@@ -556,6 +574,7 @@ message VoiceMember {
   bool priority = 8;              // holds PRIORITY_SPEAKER in this channel
   bool self_muted = 9;            // the member's own switches, unlike the moderator-imposed pair above
   bool self_deafened = 10;
+  bool camera = 11;               // the user's camera is on in this channel
 }
 
 // Sent only to the joiner: where to send media and with which key.
@@ -690,6 +709,83 @@ message SoundStopped {
   int64 channel_id = 1;
 }
 
+// Turns the caller's camera on; requires VIDEO in that channel and a voice session there.
+// Idempotent: repeating it re-sends the frames.
+message StartCamera {
+  int64 channel_id = 1;
+}
+
+message StopCamera {
+  int64 channel_id = 1;
+}
+
+// Adds one camera of that channel to the watched set, which holds at most 4; never the caller.
+message WatchCamera {
+  int64 channel_id = 1;
+  int64 user_id = 2;
+}
+
+message UnwatchCamera {
+  int64 channel_id = 1;
+  int64 user_id = 2;              // 0 = unwatch every camera
+}
+
+// Sent to everyone who may view the channel, the camera's owner included.
+message CameraStarted {
+  int64 channel_id = 1;
+  int64 user_id = 2;
+}
+
+// Same audience as CameraStarted.
+message CameraStopped {
+  int64 channel_id = 1;
+  int64 user_id = 2;
+}
+
+// Sent to the viewer only: the full set of cameras it watches now.
+message CameraWatchState {
+  int64 channel_id = 1;
+  repeated int64 user_ids = 2;    // ascending
+}
+
+// Sent to the camera's owner only, on every change to its watcher count.
+message CameraWatchers {
+  int64 channel_id = 1;
+  uint32 count = 2;
+}
+
+// A sticker in the server's shared library.
+// REST: POST /api/stickers?name=<name> -> Sticker
+// REST: GET  /api/stickers/{id}        -> the bytes
+message Sticker {
+  int64  id           = 1;
+  string name         = 2;  // 1..32 scalars after trim, no control chars
+  int64  uploader_id  = 3;
+  string content_type = 4;  // image/png, image/jpeg, image/gif or image/webp
+  int64  size         = 5;  // bytes
+}
+
+// Requires MANAGE_STICKERS.
+message UpdateSticker {
+  int64 sticker_id = 1;
+  string name = 2;
+}
+
+// Requires MANAGE_STICKERS.
+message DeleteSticker {
+  int64 sticker_id = 1;
+}
+
+// Sent to everyone: the library is server-wide.
+message StickerUpserted {
+  Sticker sticker = 1;
+}
+
+// Same audience as StickerUpserted.
+message StickerDeleted {
+  int64 sticker_id = 1;
+}
+
 message MessageEdited {
   ChatMessage message = 1;
 }
@@ -738,6 +834,11 @@ enum ErrorCode {
   ERROR_CODE_RATE_LIMITED = 27;      // non-fatal: too many write frames from this account; retry after a moment
   ERROR_CODE_INVALID_STREAM = 28;    // non-fatal: streamed file unknown, foreign, wrong channel or already linked
   ERROR_CODE_UNKNOWN_SOUND = 29;     // non-fatal: soundpad clip id unknown
+  ERROR_CODE_CAMERA_UNAVAILABLE = 30; // non-fatal: camera video is disabled on this server
+  ERROR_CODE_CAMERA_LIMIT = 31;      // non-fatal: the channel already has the maximum number of cameras on
+  ERROR_CODE_CAMERA_WATCH_LIMIT = 32; // non-fatal: the caller already watches the maximum number of cameras
+  ERROR_CODE_NOT_ON_CAMERA = 33;     // non-fatal: StopCamera while the camera is off, or WatchCamera of someone whose camera is off (yourself included)
+  ERROR_CODE_UNKNOWN_STICKER = 34;   // non-fatal: sticker id unknown
 }
 
 message Error {

@@ -50,6 +50,12 @@ public static class MetricsEndpoints
         Declare(body, "vorcall_watchers", "gauge", "Voice slots currently watching a share.");
         Sample(body, "vorcall_watchers", registry.Watchers);
 
+        Declare(body, "vorcall_cameras", "gauge", "Voice slots with a camera on.");
+        Sample(body, "vorcall_cameras", registry.Cameras);
+
+        Declare(body, "vorcall_camera_watchers", "gauge", "Cameras being received, counted once per viewer and camera.");
+        Sample(body, "vorcall_camera_watchers", registry.CameraWatchers);
+
         Declare(body, "vorcall_uptime_seconds", "gauge", "Seconds since this process built its metrics.");
         body.Append("vorcall_uptime_seconds ")
             .Append((DateTime.UtcNow - metrics.StartedAt).TotalSeconds.ToString("0.000", CultureInfo.InvariantCulture))
@@ -61,10 +67,11 @@ public static class MetricsEndpoints
         Declare(body, "vorcall_messages_total", "counter", "Chat messages appended.");
         Sample(body, "vorcall_messages_total", metrics.MessagesTotal);
 
-        Declare(body, "vorcall_uploads_total", "counter", "Attachments, images and sounds stored.");
+        Declare(body, "vorcall_uploads_total", "counter", "Attachments, images, sounds and stickers stored.");
         Sample(body, "vorcall_uploads_total", "kind=\"attachment\"", metrics.UploadsTotal);
         Sample(body, "vorcall_uploads_total", "kind=\"image\"", metrics.ImageUploadsTotal);
         Sample(body, "vorcall_uploads_total", "kind=\"sound\"", metrics.SoundUploadsTotal);
+        Sample(body, "vorcall_uploads_total", "kind=\"sticker\"", metrics.StickerUploadsTotal);
 
         Declare(body, "vorcall_http_responses_total", "counter", "HTTP responses by status class.");
         Sample(body, "vorcall_http_responses_total", "class=\"2xx\"", metrics.Http2xx);
@@ -80,14 +87,18 @@ public static class MetricsEndpoints
         Sample(body, "vorcall_relay_packets_total", "direction=\"out\",kind=\"audio\"", relay.PacketsOut);
         Sample(body, "vorcall_relay_packets_total", "direction=\"in\",kind=\"share\"", relay.SharePacketsIn);
         Sample(body, "vorcall_relay_packets_total", "direction=\"out\",kind=\"share\"", relay.SharePacketsOut);
+        Sample(body, "vorcall_relay_packets_total", "direction=\"in\",kind=\"camera\"", relay.CameraPacketsIn);
+        Sample(body, "vorcall_relay_packets_total", "direction=\"out\",kind=\"camera\"", relay.CameraPacketsOut);
 
         Declare(body, "vorcall_relay_bytes_total", "counter", "Media bytes the relay took in and sent on.");
         Sample(body, "vorcall_relay_bytes_total", "direction=\"in\",kind=\"audio\"", relay.BytesIn);
         Sample(body, "vorcall_relay_bytes_total", "direction=\"out\",kind=\"audio\"", relay.BytesOut);
         Sample(body, "vorcall_relay_bytes_total", "direction=\"in\",kind=\"share\"", relay.ShareBytesIn);
         Sample(body, "vorcall_relay_bytes_total", "direction=\"out\",kind=\"share\"", relay.ShareBytesOut);
+        Sample(body, "vorcall_relay_bytes_total", "direction=\"in\",kind=\"camera\"", relay.CameraBytesIn);
+        Sample(body, "vorcall_relay_bytes_total", "direction=\"out\",kind=\"camera\"", relay.CameraBytesOut);
 
-        Declare(body, "vorcall_relay_keyframe_requests_total", "counter", "Keyframe requests forwarded to a sharer.");
+        Declare(body, "vorcall_relay_keyframe_requests_total", "counter", "Keyframe requests forwarded to a sharer or a camera.");
         Sample(body, "vorcall_relay_keyframe_requests_total", relay.KeyframeRequests);
 
         Declare(body, "vorcall_relay_drops_total", "counter", "Media datagrams the relay refused, by reason.");

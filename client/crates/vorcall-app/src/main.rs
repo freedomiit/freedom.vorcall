@@ -55,6 +55,15 @@ fn main() -> iced::Result {
         tracing::warn!(%error, "no log file");
     }
 
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--notify-test")) {
+        println!("sending a test notification");
+        workers::notify::show("Vorcall".into(), "Notifications are working.".into());
+        // The notifier thread delivers asynchronously, and on Linux the
+        // notification lives only as long as this process.
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        std::process::exit(0);
+    }
+
     // A broken preferences or session file is not worth refusing to start over:
     // the worst case is a first run that asks for a sign-in again. Loaded before
     // the endpoints because it is where a self-hosted server's address lives.

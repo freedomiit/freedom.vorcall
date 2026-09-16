@@ -18,6 +18,7 @@ public sealed record AppendOutcome(AppendOutcome.Kind Status, ChatMessage? Messa
         UnknownReply,
         InvalidAttachment,
         InvalidStream,
+        UnknownSticker,
     }
 
     public static AppendOutcome UnknownReply { get; } = new(Kind.UnknownReply, null);
@@ -25,6 +26,8 @@ public sealed record AppendOutcome(AppendOutcome.Kind Status, ChatMessage? Messa
     public static AppendOutcome InvalidAttachment { get; } = new(Kind.InvalidAttachment, null);
 
     public static AppendOutcome InvalidStream { get; } = new(Kind.InvalidStream, null);
+
+    public static AppendOutcome UnknownSticker { get; } = new(Kind.UnknownSticker, null);
 
     public static AppendOutcome Appended(ChatMessage message) => new(Kind.Appended, message);
 }
@@ -37,11 +40,16 @@ public sealed record EditOutcome(EditOutcome.Kind Status, long ChannelId, ChatMe
         Edited,
         Unknown,
         Forbidden,
+
+        // A sticker message has no text to edit.
+        StickerMessage,
     }
 
     public static EditOutcome Unknown { get; } = new(Kind.Unknown, 0, null);
 
     public static EditOutcome Forbidden(long channelId) => new(Kind.Forbidden, channelId, null);
+
+    public static EditOutcome StickerMessage(long channelId) => new(Kind.StickerMessage, channelId, null);
 
     public static EditOutcome Edited(long channelId, ChatMessage message) => new(Kind.Edited, channelId, message);
 }
@@ -94,6 +102,7 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         long replyToId,
         IReadOnlyList<long> attachmentIds,
         IReadOnlyList<long> streamedFileIds,
+        long stickerId,
         bool mayMentionEveryone)
     {
         // The handler checks both before it gets here; a service that trusts its caller is a
@@ -132,6 +141,13 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             }
         }
 
+        // The handler asked the mirror; this is the row the foreign key will point at, read inside
+        // the transaction so a sticker deleted in between is refused rather than a constraint error.
+        if (stickerId != 0 && !await db.Stickers.AnyAsync(s => s.Id == stickerId && s.Complete))
+        {
+            return AppendOutcome.UnknownSticker;
+        }
+
         var mentionEveryone = false;
         var mentionHere = false;
         if (mayMentionEveryone)
@@ -152,6 +168,8 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             MentionIds = await Mentions.ResolveAsync(db, text),
             MentionEveryone = mentionEveryone,
             MentionHere = mentionHere,
+            StickerId = stickerId == 0 ? null : stickerId,
+            IsSticker = stickerId != 0,
         };
 
         db.Messages.Add(message);
@@ -237,6 +255,11 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             return EditOutcome.Forbidden(message.ChannelId);
         }
 
+        if (message.IsSticker)
+        {
+            return EditOutcome.StickerMessage(message.ChannelId);
+        }
+
         var mentionEveryone = false;
         var mentionHere = false;
         if (mayMentionEveryone)
@@ -297,6 +320,8 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
         message.MentionIds = [];
         message.MentionEveryone = false;
         message.MentionHere = false;
+        message.StickerId = null;
+        message.IsSticker = false;
         await db.SaveChangesAsync();
         await db.Reactions.Where(r => r.MessageId == id).ExecuteDeleteAsync();
         await db.Attachments.Where(a => a.MessageId == id).ExecuteDeleteAsync();
@@ -542,6 +567,8 @@ public sealed class MessageService(IDbContextFactory<AppDbContext> contextFactor
             Deleted = message.DeletedAt is not null,
             MentionEveryone = message.MentionEveryone,
             MentionHere = message.MentionHere,
+            Sticker = message.IsSticker,
+            StickerId = message.StickerId ?? 0,
         };
 
         chatMessage.MentionIds.AddRange(message.MentionIds);

@@ -6,7 +6,11 @@
 //! keeps Vorcall's own voice out of a share. All of it needs the Screen
 //! Recording grant, which only takes effect after a relaunch and is lost on
 //! every update because the bundle is ad-hoc signed.
+//!
+//! The camera next door in [`camera`] is AVFoundation instead, and needs its
+//! own grant — but the two run side by side.
 
+pub(crate) mod camera;
 mod content;
 mod permission;
 mod stream;

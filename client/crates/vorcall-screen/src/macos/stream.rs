@@ -628,7 +628,7 @@ fn is_complete(sample: &CMSampleBuffer) -> bool {
 
 /// The frame's pixels, tightly packed. The configuration asks for 32BGRA, so
 /// anything else is dropped rather than misread.
-fn copy_bgra(image: &CVPixelBuffer, captured: Instant) -> Option<VideoFrame> {
+pub(super) fn copy_bgra(image: &CVPixelBuffer, captured: Instant) -> Option<VideoFrame> {
     if CVPixelBufferGetPixelFormatType(image) != kCVPixelFormatType_32BGRA
         || CVPixelBufferIsPlanar(image)
     {

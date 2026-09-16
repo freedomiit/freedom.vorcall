@@ -8,6 +8,7 @@
 //! size and the encoder is what fits them.
 
 mod audio;
+pub(crate) mod camera;
 mod cursor;
 mod d3d;
 mod duplication;

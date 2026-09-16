@@ -13,10 +13,11 @@ use vorcall_core::VoiceMember;
 use vorcall_core::config::PeerAudio;
 use vorcall_hotkey::{ActionId, Backend, Binding, Listener, Unavailable};
 use vorcall_screen::codec::Picture;
-use vorcall_screen::preset::Preset;
-use vorcall_screen::{AudioMode, CaptureRequest};
+use vorcall_screen::preset::{CameraPreset, CameraResolution, FrameRate, Preset};
+use vorcall_screen::{AudioMode, CameraRequest, CameraSource, CaptureRequest};
 use vorcall_voice::{FrameSender, MediaEngine, Playout, Stats, VideoStats};
 
+use crate::workers::camera::CameraStats;
 use crate::workers::share::{DecodeHandle, ShareStats};
 
 /// The media path of one voice session: the UDP engine, the mixer it feeds and
@@ -42,6 +43,10 @@ pub struct VoiceRoster {
     /// beside `members`, which only holds what the last frame about a member
     /// said and goes stale the moment somebody starts or stops sharing.
     pub sharing: BTreeMap<i64, bool>,
+    /// Whether each member's camera is on. Unlike `sharing`, whose entries exist
+    /// only for a live share, this holds one entry per member: the flag is a
+    /// plain yes or no and `CameraStarted`/`CameraStopped` only ever flip it.
+    pub camera: BTreeMap<i64, bool>,
 }
 
 impl VoiceRoster {
@@ -52,6 +57,10 @@ impl VoiceRoster {
             .filter(|member| member.sharing)
             .map(|member| (member.user_id, member.share_audio))
             .collect();
+        let camera = members
+            .iter()
+            .map(|member| (member.user_id, member.camera))
+            .collect();
         Self {
             members: members
                 .into_iter()
@@ -59,17 +68,20 @@ impl VoiceRoster {
                 .collect(),
             speaking: BTreeSet::new(),
             sharing,
+            camera,
         }
     }
 
     pub fn insert(&mut self, member: VoiceMember) {
         self.set_sharing(&member);
+        self.set_camera(member.user_id, member.camera);
         self.members.insert(member.user_id, member);
     }
 
     pub fn remove(&mut self, user_id: i64) {
         self.members.remove(&user_id);
         self.sharing.remove(&user_id);
+        self.camera.remove(&user_id);
         self.speaking.remove(&user_id);
     }
 
@@ -80,6 +92,17 @@ impl VoiceRoster {
         } else {
             self.sharing.remove(&member.user_id);
         }
+    }
+
+    /// One member's camera: what the frame that carried them said, or what a
+    /// `CameraStarted`/`CameraStopped` has since made of it.
+    pub fn set_camera(&mut self, user_id: i64, on: bool) {
+        self.camera.insert(user_id, on);
+    }
+
+    /// Whether `user_id` is on camera here.
+    pub fn on_camera(&self, user_id: i64) -> bool {
+        self.camera.get(&user_id).copied().unwrap_or(false)
     }
 
     /// What this channel's priority speakers mean for the mixer right now: every
@@ -147,6 +170,11 @@ pub struct VoiceUi {
     pub ducking: Ducking,
     pub share: ShareUi,
     pub watch: WatchUi,
+    /// This client's own camera, which runs beside a share rather than instead
+    /// of one.
+    pub camera: CameraUi,
+    /// The cameras being watched, one tile each.
+    pub cameras: CameraWatchUi,
     /// The system-wide listener. Dropping it stops it.
     pub hotkey: Option<Listener>,
     pub hotkey_status: HotkeyStatus,
@@ -185,6 +213,12 @@ impl VoiceUi {
     /// Whether `user_id` is sharing in the joined session, and with audio.
     pub fn sharing(&self, user_id: i64) -> Option<bool> {
         self.roster()?.sharing.get(&user_id).copied()
+    }
+
+    /// Whether `user_id` has a camera on in the joined session.
+    pub fn on_camera(&self, user_id: i64) -> bool {
+        self.roster()
+            .is_some_and(|roster| roster.on_camera(user_id))
     }
 
     /// Which channel's voice session `user_id` is in, the joined one first: a
@@ -330,23 +364,27 @@ impl VoiceUi {
         roster.speaking = kept;
     }
 
-    /// Joining another channel's voice session: the share and the watch belonged
-    /// to the one being left, so neither is asserted again.
+    /// Joining another channel's voice session: the share, the watch and both
+    /// camera intents belonged to the one being left, so none is asserted again.
     pub fn switch_to(&mut self, channel_id: i64) {
         self.intent = true;
         self.joining = true;
         self.channel_id = channel_id;
         self.share.intent = None;
         self.watch.intent = None;
+        self.camera.intent = None;
+        self.cameras.intent.clear();
     }
 
-    /// What leaving gives up: the voice session and both screen-share intents, so
-    /// none of them is asserted again on the next connection.
+    /// What leaving gives up: the voice session and every share and camera
+    /// intent, so none of them is asserted again on the next connection.
     pub fn give_up_intents(&mut self) {
         self.intent = false;
         self.joining = false;
         self.share.intent = None;
         self.watch.intent = None;
+        self.camera.intent = None;
+        self.cameras.intent.clear();
     }
 
     /// Whether there is a live media path.
@@ -388,6 +426,8 @@ impl VoiceUi {
         self.rosters.clear();
         self.share.stopped();
         self.watch.stopped();
+        self.camera.stopped();
+        self.cameras.stopped();
     }
 }
 
@@ -493,6 +533,128 @@ impl WatchUi {
 /// touches it.
 pub fn watch_intent_after_stop(intent: Option<i64>, stopped_user_id: i64) -> Option<i64> {
     intent.filter(|watched| *watched != stopped_user_id)
+}
+
+/// This client's own camera. `intent` is what makes a reconnect start it again;
+/// nothing else here survives one.
+#[derive(Default)]
+pub struct CameraUi {
+    pub intent: Option<CameraIntent>,
+    /// A device is being opened and the server has not answered for it yet.
+    pub starting: bool,
+    pub active: bool,
+    pub watchers: u32,
+    pub stats: Option<CameraStats>,
+    /// The local tile. Built on the camera thread and never sent anywhere: this
+    /// is the only picture of oneself anybody draws.
+    pub preview: Option<Arc<Picture>>,
+    pub preview_seq: u64,
+}
+
+impl CameraUi {
+    /// Everything about a camera that is over. The intent is the caller's: a
+    /// reconnect keeps it, a failure gives it up.
+    pub fn stopped(&mut self) {
+        self.starting = false;
+        self.active = false;
+        self.watchers = 0;
+        self.stats = None;
+        self.preview = None;
+        self.preview_seq = 0;
+    }
+}
+
+/// What a camera was started with, so a reconnect can start the same one again.
+pub struct CameraIntent {
+    pub request: CameraRequest,
+    pub preset: CameraPreset,
+}
+
+/// What a camera this client starts is opened and encoded as, read from
+/// `config.toml` by [`crate::app::state::rules::camera_prefs`] wherever it is
+/// needed — the stored preferences are the only copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraPrefs {
+    /// `None` is the system's default device, which is all a backend that does
+    /// not enumerate ever offers.
+    pub device: Option<CameraSource>,
+    pub resolution: CameraResolution,
+    pub fps: FrameRate,
+}
+
+/// Which picture the stage draws large when it is not the share's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CameraTileId {
+    /// This client's own preview.
+    Own,
+    Peer(i64),
+}
+
+/// The cameras being watched: the intent that survives a reconnect, and one tile
+/// per stream the server has put this client on.
+#[derive(Default)]
+pub struct CameraWatchUi {
+    /// Whom this client means to watch. A reconnect asks for them again.
+    pub intent: BTreeSet<i64>,
+    /// Whose cameras the server has actually put this client on. The server's
+    /// `CameraWatchState` is the authority: this map follows it.
+    pub tiles: BTreeMap<i64, CameraTile>,
+    /// The tile a click promoted to the large picture; `None` leaves the share
+    /// there, or lays the cameras out as a grid.
+    pub featured: Option<CameraTileId>,
+    /// Whether the next `VoiceState` for the joined channel decides the watches
+    /// a reconnect kept: they are only worth asking for again while those
+    /// cameras are still on.
+    pub resume_pending: bool,
+}
+
+impl CameraWatchUi {
+    /// What the watches that are over leave behind. The intent is the caller's,
+    /// exactly as for the share's watch.
+    pub fn stopped(&mut self) {
+        // Dropping the tiles stops their decode threads.
+        self.tiles.clear();
+        self.featured = None;
+        self.resume_pending = false;
+    }
+
+    /// Whose cameras have a tile right now.
+    pub fn watched(&self) -> BTreeSet<i64> {
+        self.tiles.keys().copied().collect()
+    }
+
+    /// The promoted tile, unless it is a peer whose tile has since gone.
+    pub fn featured(&self) -> Option<CameraTileId> {
+        match self.featured {
+            Some(CameraTileId::Peer(user_id)) if !self.tiles.contains_key(&user_id) => None,
+            other => other,
+        }
+    }
+}
+
+/// One watched camera: the stream, the thread decoding it and the newest picture
+/// out of it.
+pub struct CameraTile {
+    pub ssrc: u32,
+    /// Dropping it stops that camera's decode thread. One thread per stream: the
+    /// engine hands each camera's access units out separately.
+    pub decoder: DecodeHandle,
+    pub picture: Option<Arc<Picture>>,
+    pub seq: u64,
+    /// Decoded frames per second, pictures and errors, as its decode thread last
+    /// reported them.
+    pub stats: Option<(f32, u64, u64)>,
+}
+
+/// What one `CameraWatchState` means for the tiles on screen: whose stream to
+/// start decoding, and whose tile to drop. The server's set is the authority, so
+/// a set that has not changed moves nothing.
+pub fn tile_changes(current: &BTreeSet<i64>, watched: &[i64]) -> (Vec<i64>, Vec<i64>) {
+    let wanted: BTreeSet<i64> = watched.iter().copied().collect();
+    (
+        wanted.difference(current).copied().collect(),
+        current.difference(&wanted).copied().collect(),
+    )
 }
 
 /// Where push-to-talk edges come from. `Global` is a listener actually running;
@@ -635,6 +797,7 @@ mod tests {
             priority: false,
             self_muted: false,
             self_deafened: false,
+            camera: false,
         }
     }
 
@@ -688,6 +851,98 @@ mod tests {
         roster.remove(4);
         assert_eq!(roster.sharing.get(&4), None);
         assert!(!roster.members.is_empty());
+    }
+
+    #[test]
+    fn a_roster_reads_who_is_on_camera_off_the_members() {
+        let on_camera = |user_id| VoiceMember {
+            camera: true,
+            ..voice_member(user_id, false)
+        };
+        let mut roster = VoiceRoster::from_members(vec![voice_member(4, false), on_camera(9)]);
+
+        assert!(roster.on_camera(9));
+        assert!(!roster.on_camera(4));
+        // Nobody the roster has never heard of is on camera.
+        assert!(!roster.on_camera(11));
+
+        // A `CameraStarted` and a `CameraStopped` flip the same flag a frame
+        // describing the member would have set.
+        roster.set_camera(4, true);
+        assert!(roster.on_camera(4));
+        roster.set_camera(4, false);
+        assert!(!roster.on_camera(4));
+
+        roster.insert(on_camera(4));
+        assert!(roster.on_camera(4));
+        roster.remove(4);
+        assert!(!roster.on_camera(4));
+        assert!(roster.on_camera(9));
+    }
+
+    /// The server's set is the authority, and a set that has not changed must
+    /// not restart a decoder that is already running.
+    #[test]
+    fn a_watch_state_adds_and_drops_only_what_changed() {
+        let current: BTreeSet<i64> = [4, 9].into_iter().collect();
+
+        assert_eq!(tile_changes(&current, &[4, 9]), (vec![], vec![]));
+        assert_eq!(tile_changes(&current, &[4, 7, 9]), (vec![7], vec![]));
+        assert_eq!(tile_changes(&current, &[9]), (vec![], vec![4]));
+        assert_eq!(tile_changes(&current, &[]), (vec![], vec![4, 9]));
+        assert_eq!(tile_changes(&current, &[7]), (vec![7], vec![4, 9]));
+        assert_eq!(
+            tile_changes(&BTreeSet::new(), &[7, 4]),
+            (vec![4, 7], vec![])
+        );
+    }
+
+    /// Switching channels and leaving both give up the camera: the session it
+    /// was running in is the one being left.
+    #[test]
+    fn switching_and_leaving_give_up_the_camera_intents() {
+        let mut voice = joined(10, vec![voice_member(9, false)]);
+        let intent = || CameraIntent {
+            request: CameraRequest {
+                source: None,
+                size: (1280, 720),
+                fps: FrameRate::F30,
+            },
+            preset: CameraPreset {
+                resolution: CameraResolution::P720,
+                fps: FrameRate::F30,
+                bitrate_kbps: None,
+            },
+        };
+        voice.camera.intent = Some(intent());
+        voice.cameras.intent = [4, 9].into_iter().collect();
+
+        voice.switch_to(11);
+        assert!(voice.camera.intent.is_none());
+        assert!(voice.cameras.intent.is_empty());
+
+        voice.camera.intent = Some(intent());
+        voice.cameras.intent = [9].into_iter().collect();
+        voice.give_up_intents();
+        assert!(voice.camera.intent.is_none());
+        assert!(voice.cameras.intent.is_empty());
+    }
+
+    /// A promotion outlives one `CameraWatchState` but not the tile it named.
+    #[test]
+    fn a_promoted_tile_that_is_gone_stops_being_featured() {
+        let mut cameras = CameraWatchUi {
+            featured: Some(CameraTileId::Peer(9)),
+            ..CameraWatchUi::default()
+        };
+        assert_eq!(cameras.featured(), None);
+
+        cameras.featured = Some(CameraTileId::Own);
+        assert_eq!(cameras.featured(), Some(CameraTileId::Own));
+
+        cameras.stopped();
+        assert_eq!(cameras.featured(), None);
+        assert!(cameras.tiles.is_empty());
     }
 
     /// Two handlers can see the same message; the second must not get a listener

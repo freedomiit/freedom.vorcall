@@ -16,7 +16,7 @@ use vorcall_core::images::{self, ImagePurpose};
 use vorcall_core::{Endpoints, Image, Profile, attachments, config, diagnostics, report};
 
 use crate::app::message::{
-    AdminMsg, ChannelsMsg, CropMsg, Message, SettingsMsg, ToastKind, UiMsg, VoiceMsg,
+    AdminMsg, CameraMsg, ChannelsMsg, CropMsg, Message, SettingsMsg, ToastKind, UiMsg, VoiceMsg,
 };
 use crate::app::state::rules::{IMAGE_TOO_LARGE, NOT_AN_IMAGE, describe};
 use crate::app::state::settings::{
@@ -24,6 +24,7 @@ use crate::app::state::settings::{
     image_sentinel,
 };
 use crate::app::state::ui::{Dialog, Route};
+use crate::app::update::sticker;
 use crate::app::{App, MainState, Screen};
 use crate::theme::{self, ThemeTokens};
 use crate::workers::images::ImageKey;
@@ -62,6 +63,9 @@ pub fn update(app: &mut App, message: SettingsMsg) -> Task<Message> {
                 }
                 ServerTab::Invites => Task::done(Message::Admin(AdminMsg::InvitesRefresh)),
                 ServerTab::Bans => Task::done(Message::Admin(AdminMsg::BansRefresh)),
+                // The table draws every sticker, so the page is what asks for
+                // the pictures: nothing else on this client needs them all.
+                ServerTab::Stickers => sticker::ensure_thumbnails(app),
                 _ => Task::none(),
             }
         }
@@ -300,9 +304,16 @@ pub fn update(app: &mut App, message: SettingsMsg) -> Task<Message> {
 fn open_page(app: &mut App, tab: SettingsTab) -> Task<Message> {
     match tab {
         SettingsTab::Voice => {
-            Task::perform(tokio::task::spawn_blocking(voice::list_devices), |joined| {
+            let audio = Task::perform(tokio::task::spawn_blocking(voice::list_devices), |joined| {
                 Message::Voice(VoiceMsg::DevicesListed(joined.unwrap_or_default()))
-            })
+            });
+            // Listing cameras talks to the platform's device layer and blocks,
+            // though it never raises a permission dialog.
+            let cameras = Task::perform(
+                tokio::task::spawn_blocking(vorcall_screen::cameras),
+                |joined| Message::Camera(CameraMsg::DevicesListed(joined.unwrap_or_default())),
+            );
+            Task::batch([audio, cameras])
         }
         SettingsTab::Profile => {
             // A draft that has never been filled in is seeded from the server;

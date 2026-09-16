@@ -39,6 +39,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
     public DbSet<Sound> Sounds => Set<Sound>();
 
+    public DbSet<Sticker> Stickers => Set<Sticker>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         var message = modelBuilder.Entity<Message>();
@@ -55,6 +57,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         message.Property(m => m.ReplyToId).HasColumnName("reply_to_id");
         message.Property(m => m.MentionEveryone).HasColumnName("mention_everyone").IsRequired().HasDefaultValue(false);
         message.Property(m => m.MentionHere).HasColumnName("mention_here").IsRequired().HasDefaultValue(false);
+        message.Property(m => m.StickerId).HasColumnName("sticker_id");
+        message.Property(m => m.IsSticker).HasColumnName("sticker").IsRequired().HasDefaultValue(false);
 
         // Never null, so a mention query is a plain = ANY without a null branch; the default is
         // what backfills every message written before mentions existed.
@@ -71,6 +75,10 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 
         // Deleting a channel takes its messages with it.
         message.HasOne<Channel>().WithMany().HasForeignKey(m => m.ChannelId).OnDelete(DeleteBehavior.Cascade);
+
+        // Deleting a sticker leaves its messages in place, still flagged as sticker messages.
+        message.HasIndex(m => m.StickerId);
+        message.HasOne<Sticker>().WithMany().HasForeignKey(m => m.StickerId).OnDelete(DeleteBehavior.SetNull);
 
         var user = modelBuilder.Entity<User>();
         user.ToTable("users");
@@ -264,6 +272,21 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         // The sweeper reads by created_at.
         sound.HasIndex(s => s.CreatedAt);
         sound.HasOne<User>().WithMany().HasForeignKey(s => s.UploaderId).OnDelete(DeleteBehavior.SetNull);
+
+        var sticker = modelBuilder.Entity<Sticker>();
+        sticker.ToTable("stickers");
+        sticker.HasKey(s => s.Id);
+        sticker.Property(s => s.Id).HasColumnName("id").UseIdentityByDefaultColumn();
+        sticker.Property(s => s.Name).HasColumnName("name").HasMaxLength(32).IsRequired();
+        sticker.Property(s => s.UploaderId).HasColumnName("uploader_id");
+        sticker.Property(s => s.ContentType).HasColumnName("content_type").HasMaxLength(32).IsRequired();
+        sticker.Property(s => s.Size).HasColumnName("size").IsRequired();
+        sticker.Property(s => s.Complete).HasColumnName("complete").IsRequired();
+        sticker.Property(s => s.CreatedAt).HasColumnName("created_at").HasColumnType("timestamp with time zone").IsRequired();
+
+        // The sweeper reads by created_at.
+        sticker.HasIndex(s => s.CreatedAt);
+        sticker.HasOne<User>().WithMany().HasForeignKey(s => s.UploaderId).OnDelete(DeleteBehavior.SetNull);
 
         var reaction = modelBuilder.Entity<Reaction>();
         reaction.ToTable("reactions");

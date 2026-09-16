@@ -6,10 +6,15 @@
 //! access units ([`crate::video`]) and its audio as a stereo stream of its own.
 //! A client watches at most one sharer at a time, and every datagram type draws
 //! its sequence number from the one counter, so no nonce is ever reused.
+//!
+//! A camera is a second video stream over that same session, framed like the
+//! share's but on its own packet type, so one member can share a screen and be
+//! on camera at once. Cameras are many where the share is one: each watched
+//! ssrc gets its own reassembly, its own keyframe pacing and its own channel.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -59,6 +64,8 @@ const RETRY_PAUSE: Duration = Duration::from_millis(1);
 const SOCKET_BUFFER_BYTES: usize = 4 << 20;
 /// `Shared::watched` holding no ssrc at all.
 const NOT_WATCHING: i64 = -1;
+/// One 20 ms frame on the 48 kHz media clock.
+const TS_PER_FRAME: u32 = crate::FRAME_SAMPLES as u32;
 
 pub struct MediaConfig {
     pub host: String,
@@ -86,6 +93,8 @@ pub struct Stats {
     pub rejected: u64,
     /// Video and share audio from a sharer this client is not watching.
     pub ignored: u64,
+    /// Camera video from an ssrc whose camera this client does not watch.
+    pub camera_ignored: u64,
     /// Datagrams the socket refused for good, usually a full send buffer;
     /// a video fragment is only counted here once its retries ran out.
     pub send_failures: u64,
@@ -97,8 +106,13 @@ pub struct Stats {
     pub link: Link,
     pub peers: Vec<(u32, PeerStats)>,
     pub video: VideoStats,
+    /// One entry per watched camera, by ssrc ascending; the share's numbers
+    /// stay in [`video`](Self::video).
+    pub cameras: Vec<(u32, VideoStats)>,
     /// Keyframe requests other clients sent this one, as the sharer.
     pub keyframe_requests_received: u64,
+    /// The same, for this client's camera.
+    pub camera_keyframe_requests_received: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -132,15 +146,25 @@ struct Shared {
     bytes_received: AtomicU64,
     rejected: AtomicU64,
     ignored: AtomicU64,
+    camera_ignored: AtomicU64,
     send_failures: AtomicU64,
     keyframe_requests_received: AtomicU64,
+    camera_keyframe_requests_received: AtomicU64,
     /// Raised by an incoming keyframe request, lowered by the sharer reading
     /// it: requests arriving between reads coalesce into one keyframe.
     keyframe_request: AtomicBool,
+    /// The camera's own flag: the two streams are encoded separately, so a
+    /// request for one must never cost the other a keyframe.
+    camera_keyframe_request: AtomicBool,
     /// The sharer whose video and share audio are accepted, or [`NOT_WATCHING`].
     watched: AtomicI64,
     /// Every datagram type draws from one counter so a nonce is never reused.
     seq: AtomicU64,
+    /// The share audio's own media clock, one frame per frame sent. Taken from
+    /// the wall clock instead, it would turn the sender's scheduling into holes
+    /// on the watcher's side: a share's audio goes out beside the video rather
+    /// than on a tick of its own.
+    share_audio_ts: AtomicU32,
     started: Instant,
     pending_pings: Mutex<VecDeque<u64>>,
     rtt: Mutex<Rtt>,
@@ -191,16 +215,38 @@ impl FrameSender {
         send(&self.socket, &self.shared, &self.cipher.seal(&header, opus))
     }
 
-    /// One 20 ms stereo frame of the screen share's own audio.
+    /// One 20 ms stereo frame of the screen share's own audio, stamped one
+    /// frame past the last one sent whenever it actually goes out.
     pub fn send_share_audio(&self, opus: &[u8], marker: bool) -> Result<(), EngineError> {
         let header = Header {
             kind: PacketType::ShareAudio,
             marker,
             ssrc: self.ssrc,
             seq: self.shared.seq.fetch_add(1, Ordering::Relaxed),
-            ts: self.shared.ts(),
+            ts: self
+                .shared
+                .share_audio_ts
+                .fetch_add(TS_PER_FRAME, Ordering::Relaxed),
         };
         send(&self.socket, &self.shared, &self.cipher.seal(&header, opus))
+    }
+
+    /// Starts the share audio's clock over, as a share starts or its audio
+    /// resumes. The marker on the first frame after it is what tells a watcher
+    /// the stream begins again.
+    pub fn reset_share_audio_clock(&self) {
+        self.shared
+            .share_audio_ts
+            .store(self.shared.ts(), Ordering::Relaxed);
+    }
+
+    /// Moves the share audio's clock past `frames` frames that were never
+    /// captured, so the silence reaches the watcher as the gap it was rather
+    /// than as audio cut short.
+    pub fn skip_share_audio(&self, frames: u32) {
+        self.shared
+            .share_audio_ts
+            .fetch_add(frames.wrapping_mul(TS_PER_FRAME), Ordering::Relaxed);
     }
 
     /// Cuts one encoded access unit into fragments and sends them under one
@@ -216,6 +262,28 @@ impl FrameSender {
     /// one of them went out.
     pub fn send_video(
         &self,
+        frame_id: u32,
+        keyframe: bool,
+        data: &[u8],
+    ) -> Result<usize, EngineError> {
+        self.send_video_stream(PacketType::Video, frame_id, keyframe, data)
+    }
+
+    /// The camera's access units, on the camera's own packet type. Pacing,
+    /// retries and [`Stats::send_failures`] work exactly as for
+    /// [`send_video`](Self::send_video), and it blocks for the same reason.
+    pub fn send_camera_video(
+        &self,
+        frame_id: u32,
+        keyframe: bool,
+        data: &[u8],
+    ) -> Result<usize, EngineError> {
+        self.send_video_stream(PacketType::CameraVideo, frame_id, keyframe, data)
+    }
+
+    fn send_video_stream(
+        &self,
+        kind: PacketType,
         frame_id: u32,
         keyframe: bool,
         data: &[u8],
@@ -236,7 +304,7 @@ impl FrameSender {
             plaintext.extend_from_slice(chunk);
 
             let header = Header {
-                kind: PacketType::Video,
+                kind,
                 marker: false,
                 ssrc: self.ssrc,
                 seq: self.shared.seq.fetch_add(1, Ordering::Relaxed),
@@ -266,12 +334,25 @@ impl FrameSender {
         }
     }
 
-    /// Asks `target_ssrc` for a keyframe, as a viewer.
+    /// Asks `target_ssrc` for a keyframe of its screen share, as a viewer.
     pub fn request_keyframe(&self, target_ssrc: u32) -> Result<(), EngineError> {
         send_keyframe_request(
             &self.socket,
             &self.cipher,
             &self.shared,
+            PacketType::KeyframeRequest,
+            self.ssrc,
+            target_ssrc,
+        )
+    }
+
+    /// The same for `target_ssrc`'s camera, which is asked separately.
+    pub fn request_camera_keyframe(&self, target_ssrc: u32) -> Result<(), EngineError> {
+        send_keyframe_request(
+            &self.socket,
+            &self.cipher,
+            &self.shared,
+            PacketType::CameraKeyframeRequest,
             self.ssrc,
             target_ssrc,
         )
@@ -281,6 +362,13 @@ impl FrameSender {
     /// sharer. Requests arriving between two calls coalesce into one.
     pub fn take_keyframe_request(&self) -> bool {
         self.shared.keyframe_request.swap(false, Ordering::Relaxed)
+    }
+
+    /// The same for this client's camera; the two flags are independent.
+    pub fn take_camera_keyframe_request(&self) -> bool {
+        self.shared
+            .camera_keyframe_request
+            .swap(false, Ordering::Relaxed)
     }
 
     /// [`Stats::send_failures`] without the rest of the report, for a sender
@@ -295,11 +383,12 @@ fn send_keyframe_request(
     socket: &UdpSocket,
     cipher: &MediaCipher,
     shared: &Shared,
+    kind: PacketType,
     ssrc: u32,
     target_ssrc: u32,
 ) -> Result<(), EngineError> {
     let header = Header {
-        kind: PacketType::KeyframeRequest,
+        kind,
         marker: false,
         ssrc,
         seq: shared.seq.fetch_add(1, Ordering::Relaxed),
@@ -431,11 +520,32 @@ impl VideoState {
     }
 }
 
+/// One watched camera. Everything the share keeps in [`VideoState`], plus the
+/// channel that stream's decoder reads, held per ssrc so two cameras never gate
+/// each other's frames or share a keyframe request.
+struct CameraRx {
+    depacketizer: Depacketizer,
+    units: UnboundedSender<AccessUnit>,
+    keyframe_requests: u64,
+    last_request_at: Option<Instant>,
+}
+
+type Cameras = HashMap<u32, CameraRx>;
+
+/// The video the receive loop reassembles: the one screen share this client
+/// watches, and the cameras, of which there may be several.
+struct Streams {
+    video: Arc<Mutex<VideoState>>,
+    access_units: UnboundedSender<AccessUnit>,
+    cameras: Arc<Mutex<Cameras>>,
+}
+
 pub struct MediaEngine {
     sender: FrameSender,
     playout: Arc<Mutex<Playout>>,
     shared: Arc<Shared>,
     video: Arc<Mutex<VideoState>>,
+    cameras: Arc<Mutex<Cameras>>,
     /// Handed out once, to whoever decodes the watched share's video.
     access_units: Mutex<Option<UnboundedReceiver<AccessUnit>>>,
     receive_task: JoinHandle<()>,
@@ -461,17 +571,22 @@ impl MediaEngine {
             bytes_received: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             ignored: AtomicU64::new(0),
+            camera_ignored: AtomicU64::new(0),
             send_failures: AtomicU64::new(0),
             keyframe_requests_received: AtomicU64::new(0),
+            camera_keyframe_requests_received: AtomicU64::new(0),
             keyframe_request: AtomicBool::new(false),
+            camera_keyframe_request: AtomicBool::new(false),
             watched: AtomicI64::new(NOT_WATCHING),
             seq: AtomicU64::new(0),
+            share_audio_ts: AtomicU32::new(0),
             started: Instant::now(),
             pending_pings: Mutex::new(VecDeque::new()),
             rtt: Mutex::new(Rtt::default()),
         });
         let playout = Arc::new(Mutex::new(Playout::new()));
         let video = Arc::new(Mutex::new(VideoState::new()));
+        let cameras = Arc::new(Mutex::new(Cameras::new()));
         let (access_units, incoming_units) = unbounded_channel();
 
         tracing::debug!(
@@ -487,8 +602,11 @@ impl MediaEngine {
             Arc::clone(&cipher),
             Arc::clone(&shared),
             Arc::clone(&playout),
-            Arc::clone(&video),
-            access_units,
+            Streams {
+                video: Arc::clone(&video),
+                access_units,
+                cameras: Arc::clone(&cameras),
+            },
             config.ssrc,
         ));
         let ping_task = tokio::spawn(ping_loop(
@@ -508,6 +626,7 @@ impl MediaEngine {
             playout,
             shared,
             video,
+            cameras,
             access_units: Mutex::new(Some(incoming_units)),
             receive_task,
             ping_task,
@@ -546,6 +665,53 @@ impl MediaEngine {
         lock(&self.access_units).take()
     }
 
+    /// Starts watching one camera and hands back that stream's access units.
+    ///
+    /// Idempotent per ssrc: watching one again replaces the channel, starts its
+    /// reassembly over and asks for a keyframe, exactly as the first call did.
+    /// Neither the other cameras nor the screen share are touched.
+    pub fn watch_camera(&self, ssrc: u32) -> UnboundedReceiver<AccessUnit> {
+        let (units, incoming) = unbounded_channel();
+        lock(&self.cameras).insert(
+            ssrc,
+            CameraRx {
+                depacketizer: Depacketizer::new(),
+                units,
+                // The request below, counted whether or not the socket took it,
+                // like the share's.
+                keyframe_requests: 1,
+                last_request_at: Some(Instant::now()),
+            },
+        );
+        if let Err(error) = self.sender.request_camera_keyframe(ssrc) {
+            tracing::debug!(%error, "camera keyframe request not sent");
+        }
+        incoming
+    }
+
+    /// Stops watching one camera; an ssrc nobody watches is a no-op.
+    pub fn unwatch_camera(&self, ssrc: u32) {
+        lock(&self.cameras).remove(&ssrc);
+    }
+
+    pub fn unwatch_all_cameras(&self) {
+        lock(&self.cameras).clear();
+    }
+
+    /// Each watched camera's own reassembly counters, by ssrc ascending.
+    pub fn camera_stats(&self) -> Vec<(u32, VideoStats)> {
+        let mut stats: Vec<(u32, VideoStats)> = lock(&self.cameras)
+            .iter()
+            .map(|(ssrc, camera)| {
+                let mut stats = camera.depacketizer.stats();
+                stats.keyframe_requests = camera.keyframe_requests;
+                (*ssrc, stats)
+            })
+            .collect();
+        stats.sort_by_key(|(ssrc, _)| *ssrc);
+        stats
+    }
+
     /// The watched stream's reassembly counters, which start over whenever
     /// [`watch`](Self::watch) points somewhere else.
     pub fn video_stats(&self) -> VideoStats {
@@ -565,6 +731,7 @@ impl MediaEngine {
 
     pub fn stats(&self) -> Stats {
         let video = self.video_stats();
+        let cameras = self.camera_stats();
         let rtt = lock(&self.shared.rtt);
         let link = match rtt.last_pong_at {
             None => Link::Connecting,
@@ -578,6 +745,7 @@ impl MediaEngine {
             bytes_received: self.shared.bytes_received.load(Ordering::Relaxed),
             rejected: self.shared.rejected.load(Ordering::Relaxed),
             ignored: self.shared.ignored.load(Ordering::Relaxed),
+            camera_ignored: self.shared.camera_ignored.load(Ordering::Relaxed),
             send_failures: self.shared.send_failures.load(Ordering::Relaxed),
             rtt_last_ms: rtt.last_ms,
             rtt_min_ms: rtt.min_ms,
@@ -587,9 +755,14 @@ impl MediaEngine {
             link,
             peers: lock(&self.playout).stats(),
             video,
+            cameras,
             keyframe_requests_received: self
                 .shared
                 .keyframe_requests_received
+                .load(Ordering::Relaxed),
+            camera_keyframe_requests_received: self
+                .shared
+                .camera_keyframe_requests_received
                 .load(Ordering::Relaxed),
         }
     }
@@ -633,10 +806,14 @@ async fn receive_loop(
     cipher: Arc<MediaCipher>,
     shared: Arc<Shared>,
     playout: Arc<Mutex<Playout>>,
-    video: Arc<Mutex<VideoState>>,
-    access_units: UnboundedSender<AccessUnit>,
+    streams: Streams,
     ssrc: u32,
 ) {
+    let Streams {
+        video,
+        access_units,
+        cameras,
+    } = streams;
     let mut buffer = [0u8; RECV_BUFFER];
     loop {
         let read = match socket.recv(&mut buffer).await {
@@ -714,10 +891,47 @@ async fn receive_loop(
                     let _ = access_units.send(unit);
                 }
                 if ask
-                    && let Err(error) =
-                        send_keyframe_request(&socket, &cipher, &shared, ssrc, header.ssrc)
+                    && let Err(error) = send_keyframe_request(
+                        &socket,
+                        &cipher,
+                        &shared,
+                        PacketType::KeyframeRequest,
+                        ssrc,
+                        header.ssrc,
+                    )
                 {
                     tracing::debug!(%error, "keyframe request not sent");
+                }
+            }
+            PacketType::CameraVideo => {
+                // A camera nobody watches costs one lookup and nothing else:
+                // there are several of them, so this is not worth a log line.
+                if !lock(&cameras).contains_key(&header.ssrc) {
+                    shared.camera_ignored.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let (fragment, data) = match FragmentHeader::decode(&payload) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        tracing::debug!(%error, "rejected a camera fragment");
+                        shared.rejected.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                let now = Instant::now();
+                let ask = push_camera(&cameras, header.ssrc, now, header.ts, fragment, data);
+                if ask
+                    && let Err(error) = send_keyframe_request(
+                        &socket,
+                        &cipher,
+                        &shared,
+                        PacketType::CameraKeyframeRequest,
+                        ssrc,
+                        header.ssrc,
+                    )
+                {
+                    tracing::debug!(%error, "camera keyframe request not sent");
                 }
             }
             PacketType::ShareAudio => {
@@ -747,10 +961,61 @@ async fn receive_loop(
                     .keyframe_requests_received
                     .fetch_add(1, Ordering::Relaxed);
             }
+            PacketType::CameraKeyframeRequest => {
+                if payload.len() < 4 {
+                    tracing::debug!("camera keyframe request without a target ssrc");
+                    continue;
+                }
+                shared
+                    .camera_keyframe_request
+                    .store(true, Ordering::Relaxed);
+                shared
+                    .camera_keyframe_requests_received
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             PacketType::Pong => record_pong(&shared, &header, &payload),
             PacketType::Ping => {}
         }
     }
+}
+
+/// Feeds one fragment to the camera it belongs to and delivers whatever unit it
+/// completes, returning whether that camera's owner should be asked for a
+/// keyframe.
+///
+/// A stream whose decoder has dropped its receiver is forgotten here, so a
+/// watcher that simply went away costs the loop one delivery and nothing more.
+fn push_camera(
+    cameras: &Mutex<Cameras>,
+    ssrc: u32,
+    now: Instant,
+    ts: u32,
+    fragment: FragmentHeader,
+    data: &[u8],
+) -> bool {
+    let mut cameras = lock(cameras);
+    let Some(camera) = cameras.get_mut(&ssrc) else {
+        return false;
+    };
+
+    let unit = camera.depacketizer.push(now, ts, fragment, data);
+    let ask = camera.depacketizer.needs_keyframe()
+        && camera
+            .last_request_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_REQUEST_INTERVAL);
+    if ask {
+        camera.keyframe_requests += 1;
+        camera.last_request_at = Some(now);
+    }
+    let closed = match unit {
+        Some(unit) => camera.units.send(unit).is_err(),
+        None => false,
+    };
+    if closed {
+        cameras.remove(&ssrc);
+        return false;
+    }
+    ask
 }
 
 fn record_pong(shared: &Shared, header: &Header, payload: &[u8]) {
@@ -909,11 +1174,37 @@ mod tests {
             fragment: FragmentHeader,
             data: &[u8],
         ) {
+            self.send_stream_fragment(PacketType::Video, ssrc, seq, ts, fragment, data)
+                .await;
+        }
+
+        /// The same on the camera's own packet type.
+        async fn send_camera_fragment(
+            &self,
+            ssrc: u32,
+            seq: u64,
+            ts: u32,
+            fragment: FragmentHeader,
+            data: &[u8],
+        ) {
+            self.send_stream_fragment(PacketType::CameraVideo, ssrc, seq, ts, fragment, data)
+                .await;
+        }
+
+        async fn send_stream_fragment(
+            &self,
+            kind: PacketType,
+            ssrc: u32,
+            seq: u64,
+            ts: u32,
+            fragment: FragmentHeader,
+            data: &[u8],
+        ) {
             let mut plaintext = fragment.encode().to_vec();
             plaintext.extend_from_slice(data);
             self.send(
                 &Header {
-                    kind: PacketType::Video,
+                    kind,
                     marker: false,
                     ssrc,
                     seq,
@@ -1414,6 +1705,415 @@ mod tests {
         // Watching someone else drops it.
         engine.watch(None);
         assert!(lock(&playout).share_stats().is_none());
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn share_audio_timestamps_count_frames_and_not_wall_clock() {
+        let (relay, engine) = Relay::start(11).await;
+        let sender = engine.sender();
+        sender.reset_share_audio_clock();
+
+        let mut stamps = Vec::new();
+        for index in 0..3 {
+            // Three times what the frames are worth: the share sends its audio
+            // beside the video, so the wall clock says nothing about how much
+            // audio went out.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            sender
+                .send_share_audio(b"share", index == 0)
+                .expect("sends a share frame");
+            let (header, _) = relay
+                .recv(PacketType::ShareAudio, Duration::from_secs(2))
+                .await
+                .expect("the relay receives the frame");
+            stamps.push(header.ts);
+        }
+
+        let frame = FRAME_SAMPLES as u32;
+        assert_eq!(stamps[1].wrapping_sub(stamps[0]), frame);
+        assert_eq!(stamps[2].wrapping_sub(stamps[1]), frame);
+
+        // A real silence is the one thing that moves the clock further.
+        sender.skip_share_audio(10);
+        sender
+            .send_share_audio(b"share", true)
+            .expect("sends a share frame");
+        let (header, _) = relay
+            .recv(PacketType::ShareAudio, Duration::from_secs(2))
+            .await
+            .expect("the relay receives the frame");
+        assert_eq!(header.ts.wrapping_sub(stamps[2]), 11 * frame);
+
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_camera_unit_goes_out_on_its_own_type_beside_the_share() {
+        let (relay, engine) = Relay::start(11).await;
+        let sender = engine.sender();
+        let unit: Vec<u8> = (0..2_000u32).map(|index| index as u8).collect();
+
+        assert_eq!(
+            sender.send_video(1, true, &unit).expect("the share sends"),
+            2
+        );
+        assert_eq!(
+            sender
+                .send_camera_video(1, true, &unit)
+                .expect("the camera sends"),
+            2
+        );
+
+        let mut share_seqs = Vec::new();
+        for index in 0..2u16 {
+            let (header, payload) = relay
+                .recv(PacketType::Video, Duration::from_secs(1))
+                .await
+                .expect("a share fragment arrives");
+            let (fragment, _) = FragmentHeader::decode(&payload).expect("a fragment header");
+            assert_eq!(fragment.index, index);
+            share_seqs.push(header.seq);
+        }
+
+        let mut camera_seqs = Vec::new();
+        let mut rejoined = Vec::new();
+        for index in 0..2u16 {
+            let (header, payload) = relay
+                .recv(PacketType::CameraVideo, Duration::from_secs(1))
+                .await
+                .expect("a camera fragment arrives");
+            assert_eq!(header.ssrc, 11);
+            assert!(!header.marker);
+            let (fragment, data) = FragmentHeader::decode(&payload).expect("a fragment header");
+            assert_eq!(fragment.frame_id, 1);
+            assert_eq!(fragment.index, index);
+            assert_eq!(fragment.count, 2);
+            assert!(fragment.keyframe);
+            camera_seqs.push(header.seq);
+            rejoined.extend_from_slice(data);
+        }
+        assert_eq!(rejoined, unit);
+
+        // One counter for the session: the camera's numbers follow the share's
+        // rather than starting a second sequence and reusing its nonces.
+        assert!(share_seqs[1] > share_seqs[0], "{share_seqs:?}");
+        assert!(
+            camera_seqs[0] > share_seqs[1],
+            "{camera_seqs:?} does not follow {share_seqs:?}"
+        );
+        assert!(camera_seqs[1] > camera_seqs[0], "{camera_seqs:?}");
+
+        assert!(
+            matches!(
+                sender.send_camera_video(2, false, &[]),
+                Err(EngineError::Packet(PacketError::TooShort))
+            ),
+            "an empty unit is not a frame"
+        );
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn watching_a_camera_asks_its_owner_for_a_keyframe() {
+        let (relay, engine) = Relay::start(11).await;
+        let _units = engine.watch_camera(77);
+
+        let (header, payload) = relay
+            .recv(
+                PacketType::CameraKeyframeRequest,
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("a camera keyframe request arrives");
+        assert_eq!(header.ssrc, 11);
+        assert_eq!(payload, 77u32.to_be_bytes());
+        assert_eq!(
+            engine.camera_stats(),
+            vec![(
+                77,
+                VideoStats {
+                    keyframe_requests: 1,
+                    ..VideoStats::default()
+                }
+            )]
+        );
+        // The share's stream is a different thing entirely.
+        assert_eq!(engine.video_stats(), VideoStats::default());
+
+        engine.unwatch_camera(77);
+        assert!(engine.camera_stats().is_empty());
+        // An ssrc nobody watches is a no-op, both ways.
+        engine.unwatch_camera(77);
+        engine.unwatch_all_cameras();
+        assert!(engine.camera_stats().is_empty());
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn two_cameras_are_reassembled_independently() {
+        let (relay, engine) = Relay::start(11).await;
+        let mut first = engine.watch_camera(77);
+        let mut second = engine.watch_camera(88);
+
+        let one: Vec<u8> = (0..2_000u32).map(|index| index as u8).collect();
+        let two: Vec<u8> = (0..2_000u32).map(|index| (index as u8) ^ 0xFF).collect();
+        let cut_one: Vec<(FragmentHeader, &[u8])> = video::fragments(1, true, &one)
+            .expect("fragments")
+            .collect();
+        let cut_two: Vec<(FragmentHeader, &[u8])> = video::fragments(1, true, &two)
+            .expect("fragments")
+            .collect();
+        assert_eq!(cut_one.len(), 2);
+        assert_eq!(cut_two.len(), 2);
+
+        // Interleaved, and each frame only completes on its own halves.
+        relay
+            .send_camera_fragment(77, 10, 960, cut_one[0].0, cut_one[0].1)
+            .await;
+        relay
+            .send_camera_fragment(88, 11, 960, cut_two[0].0, cut_two[0].1)
+            .await;
+        relay
+            .send_camera_fragment(88, 12, 960, cut_two[1].0, cut_two[1].1)
+            .await;
+        relay
+            .send_camera_fragment(77, 13, 960, cut_one[1].0, cut_one[1].1)
+            .await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), second.recv())
+            .await
+            .expect("88's unit arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, two);
+        let delivered = tokio::time::timeout(Duration::from_secs(2), first.recv())
+            .await
+            .expect("77's unit arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, one);
+
+        let stats = engine.stats();
+        assert_eq!(stats.cameras.len(), 2);
+        assert_eq!(stats.cameras[0].0, 77);
+        assert_eq!(stats.cameras[0].1.frames, 1);
+        assert_eq!(stats.cameras[0].1.fragments, 2);
+        assert_eq!(stats.cameras[0].1.dropped, 0);
+        assert_eq!(stats.cameras[1].0, 88);
+        assert_eq!(stats.cameras[1].1.frames, 1);
+        assert_eq!(stats.cameras[1].1.fragments, 2);
+        assert_eq!(stats.cameras[1].1.dropped, 0);
+        // None of it went anywhere near the screen share.
+        assert_eq!(stats.video, VideoStats::default());
+        assert_eq!(stats.camera_ignored, 0);
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn camera_video_from_an_unwatched_ssrc_is_dropped() {
+        let (relay, engine) = Relay::start(11).await;
+        let mut units = engine.watch_camera(77);
+
+        relay
+            .send_camera_fragment(99, 1, 960, fragment(1, 0, 1, true), b"nobody watches this")
+            .await;
+        wait_for(|| engine.stats().camera_ignored >= 1).await;
+
+        relay
+            .send_camera_fragment(77, 2, 1_920, fragment(1, 0, 1, true), b"watched")
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), units.recv())
+            .await
+            .expect("the watched camera's unit arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, b"watched");
+
+        let stats = engine.stats();
+        assert_eq!(stats.camera_ignored, 1);
+        assert_eq!(stats.rejected, 0);
+        // The share's counter is for the share's own strays.
+        assert_eq!(stats.ignored, 0);
+        assert_eq!(stats.cameras.len(), 1);
+        assert_eq!(stats.cameras[0].1.fragments, 1);
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn watching_a_camera_again_resets_only_that_stream() {
+        let (relay, engine) = Relay::start(11).await;
+        let mut first = engine.watch_camera(77);
+        let mut kept = engine.watch_camera(88);
+
+        relay
+            .send_camera_fragment(77, 1, 960, fragment(1, 0, 1, true), b"before")
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), first.recv())
+            .await
+            .expect("77's unit arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, b"before");
+
+        relay
+            .send_camera_fragment(88, 2, 960, fragment(1, 0, 1, true), b"other")
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), kept.recv())
+            .await
+            .expect("88's unit arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, b"other");
+
+        let mut again = engine.watch_camera(77);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), first.recv())
+                .await
+                .expect("the replaced channel was left open")
+                .is_none(),
+            "the replaced channel still delivered"
+        );
+
+        let stats = engine.camera_stats();
+        assert_eq!(
+            stats[0],
+            (
+                77,
+                VideoStats {
+                    keyframe_requests: 1,
+                    ..VideoStats::default()
+                }
+            ),
+            "77's history survived the second watch"
+        );
+        assert_eq!(stats[1].0, 88);
+        assert_eq!(stats[1].1.frames, 1, "88's history was reset too");
+        assert_eq!(stats[1].1.fragments, 1);
+
+        // Frame 1 again: the fresh depacketizer has no last decision to judge
+        // it a straggler against.
+        relay
+            .send_camera_fragment(77, 3, 1_920, fragment(1, 0, 1, true), b"after")
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), again.recv())
+            .await
+            .expect("the restarted stream delivers")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, b"after");
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_keyframe_request_only_ever_raises_its_own_streams_flag() {
+        let (relay, engine) = Relay::start(11).await;
+        let sender = engine.sender();
+        assert!(!sender.take_keyframe_request());
+        assert!(!sender.take_camera_keyframe_request());
+
+        relay
+            .send(
+                &Header {
+                    kind: PacketType::CameraKeyframeRequest,
+                    marker: false,
+                    ssrc: 77,
+                    seq: 1,
+                    ts: 0,
+                },
+                &11u32.to_be_bytes(),
+            )
+            .await;
+        wait_for(|| engine.stats().camera_keyframe_requests_received >= 1).await;
+        assert!(
+            !sender.take_keyframe_request(),
+            "a camera request cost the share a keyframe"
+        );
+        assert!(
+            sender.take_camera_keyframe_request(),
+            "the camera request was lost"
+        );
+        assert!(
+            !sender.take_camera_keyframe_request(),
+            "one request, one keyframe"
+        );
+
+        relay
+            .send(
+                &Header {
+                    kind: PacketType::KeyframeRequest,
+                    marker: false,
+                    ssrc: 77,
+                    seq: 2,
+                    ts: 0,
+                },
+                &11u32.to_be_bytes(),
+            )
+            .await;
+        wait_for(|| engine.stats().keyframe_requests_received >= 1).await;
+        assert!(
+            !sender.take_camera_keyframe_request(),
+            "a share request cost the camera a keyframe"
+        );
+        assert!(sender.take_keyframe_request(), "the share request was lost");
+
+        let stats = engine.stats();
+        assert_eq!(stats.keyframe_requests_received, 1);
+        assert_eq!(stats.camera_keyframe_requests_received, 1);
+        assert_eq!(stats.rejected, 0);
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn camera_media_never_reaches_the_playout() {
+        let (relay, engine) = Relay::start(11).await;
+        let mut units = engine.watch_camera(77);
+
+        relay
+            .send_camera_fragment(
+                77,
+                1,
+                960,
+                fragment(1, 0, 1, true),
+                b"a picture, not a voice",
+            )
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), units.recv())
+            .await
+            .expect("a unit arrives")
+            .expect("the channel is open");
+        assert!(delivered.keyframe);
+
+        // A camera is neither a speaker nor a share.
+        assert!(engine.stats().peers.is_empty());
+        let playout = engine.playout();
+        assert!(lock(&playout).stats().is_empty());
+        assert!(lock(&playout).share_stats().is_none());
+        engine.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_camera_whose_decoder_went_away_is_forgotten() {
+        let (relay, engine) = Relay::start(11).await;
+        let units = engine.watch_camera(77);
+        let mut kept = engine.watch_camera(88);
+        drop(units);
+
+        relay
+            .send_camera_fragment(
+                77,
+                1,
+                960,
+                fragment(1, 0, 1, true),
+                b"nobody left to decode",
+            )
+            .await;
+        wait_for(|| engine.camera_stats().len() == 1).await;
+        assert_eq!(engine.camera_stats()[0].0, 88);
+
+        // The loop carried on: the camera still being watched arrives.
+        relay
+            .send_camera_fragment(88, 2, 960, fragment(1, 0, 1, true), b"still watched")
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), kept.recv())
+            .await
+            .expect("88 still arrives")
+            .expect("the channel is open");
+        assert_eq!(delivered.data, b"still watched");
         engine.close().await;
     }
 

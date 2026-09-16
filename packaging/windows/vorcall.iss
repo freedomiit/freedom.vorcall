@@ -61,8 +61,16 @@ Source: "{#SourceDir}\vorcall-windows-x86_64.exe"; DestDir: "{app}"; DestName: "
 Source: "{#IconFile}"; DestDir: "{app}"; DestName: "vorcall.ico"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\Vorcall"; Filename: "{app}\vorcall.exe"; IconFilename: "{app}\vorcall.ico"
-Name: "{autodesktop}\Vorcall"; Filename: "{app}\vorcall.exe"; IconFilename: "{app}\vorcall.ico"; Tasks: desktopicon
+Name: "{autoprograms}\Vorcall"; Filename: "{app}\vorcall.exe"; IconFilename: "{app}\vorcall.ico"; AppUserModelID: "br.com.freedomit.vorcall"
+Name: "{autodesktop}\Vorcall"; Filename: "{app}\vorcall.exe"; IconFilename: "{app}\vorcall.ico"; Tasks: desktopicon; AppUserModelID: "br.com.freedomit.vorcall"
+
+[Registry]
+; An unpackaged app's toasts are attributed to whatever AppUserModelID it names;
+; this registers the one the client passes (and the shortcuts carry) with a name
+; and an icon, instead of letting them fall back to PowerShell.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\br.com.freedomit.vorcall"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\br.com.freedomit.vorcall"; ValueType: string; ValueName: "DisplayName"; ValueData: "Vorcall"
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\br.com.freedomit.vorcall"; ValueType: string; ValueName: "IconUri"; ValueData: "{app}\vorcall.ico"
 
 [Run]
 Filename: "{app}\vorcall.exe"; Description: "{cm:LaunchProgram,Vorcall}"; Flags: nowait postinstall skipifsilent

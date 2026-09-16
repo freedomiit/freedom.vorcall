@@ -6,6 +6,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod camera;
 pub mod channels;
 pub mod chat;
 pub mod crop;
@@ -15,6 +16,7 @@ pub mod keys;
 pub mod settings;
 pub mod share;
 pub mod sound;
+pub mod sticker;
 pub mod ui;
 pub mod voice;
 
@@ -37,10 +39,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Channels(message) => channels::update(app, message),
         Message::Voice(message) => voice::update(app, message),
         Message::Share(message) => share::update(app, message),
+        Message::Camera(message) => camera::update(app, message),
         Message::Settings(message) => settings::update(app, message),
         Message::Admin(message) => admin::update(app, message),
         Message::Crop(message) => crop::update(app, message),
         Message::Sound(message) => sound::update(app, message),
+        Message::Sticker(message) => sticker::update(app, message),
         Message::Ui(message) => ui::update(app, message),
         Message::Keys(message) => keys::update(app, message),
         Message::Update(message) => updates(app, message),

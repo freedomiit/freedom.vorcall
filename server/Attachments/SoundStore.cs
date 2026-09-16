@@ -73,14 +73,15 @@ public sealed class SoundStore(
     }
 
     // The quota is the attachments' (Vorcall:AttachmentsMaxBytes) and shared with them, so all
-    // three tables count here, in ImageStore and in AttachmentStore alike.
+    // four tables count here, in ImageStore, AttachmentStore and StickerStore alike.
     public async Task<long> TotalBytesAsync(CancellationToken ct)
     {
         await using var db = await contexts.CreateDbContextAsync(ct);
         var sounds = await db.Sounds.SumAsync(s => (long?)s.Size, ct) ?? 0;
         var images = await db.Images.SumAsync(i => (long?)i.Size, ct) ?? 0;
         var attachments = await db.Attachments.SumAsync(a => (long?)a.Size, ct) ?? 0;
-        return sounds + images + attachments;
+        var stickers = await db.Stickers.SumAsync(s => (long?)s.Size, ct) ?? 0;
+        return sounds + images + attachments + stickers;
     }
 
     public async Task<SoundSaveOutcome> SaveAsync(

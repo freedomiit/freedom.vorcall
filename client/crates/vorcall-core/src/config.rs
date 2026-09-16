@@ -22,7 +22,14 @@ pub const SHARE_DEFAULT_RESOLUTION: &str = "720p";
 pub const SHARE_FRAME_RATES: [u32; 3] = [15, 30, 60];
 pub const SHARE_DEFAULT_FPS: u32 = 30;
 pub const SHARE_MIN_BITRATE_KBPS: u32 = 1_000;
-pub const SHARE_MAX_BITRATE_KBPS: u32 = 30_000;
+pub const SHARE_MAX_BITRATE_KBPS: u32 = 24_000;
+
+/// What the settings screen offers for a camera. There is no bitrate: a camera
+/// is a face beside the conversation, and the table decides for it.
+pub const CAMERA_RESOLUTIONS: [&str; 2] = ["360p", "720p"];
+pub const CAMERA_DEFAULT_RESOLUTION: &str = "720p";
+pub const CAMERA_FRAME_RATES: [u32; 3] = [15, 30, 60];
+pub const CAMERA_DEFAULT_FPS: u32 = 30;
 
 /// The built-in dark preset; a custom theme is `custom:<slug>` and names a file
 /// under the config directory.
@@ -194,6 +201,18 @@ pub struct Config {
     /// Playback volume for a watched share, 0.0..=2.0.
     #[serde(default = "default_volume")]
     pub share_volume: f32,
+    /// The `CameraSource` id last picked; `None` is the system's default camera,
+    /// which is also all a backend that does not enumerate ever offers. An id
+    /// that names no camera any more is the system default too.
+    #[serde(default)]
+    pub camera_device: Option<String>,
+    /// One of [`CAMERA_RESOLUTIONS`]; anything else falls back to the default on
+    /// load.
+    #[serde(default = "default_camera_resolution")]
+    pub camera_resolution: String,
+    /// One of [`CAMERA_FRAME_RATES`].
+    #[serde(default = "default_camera_fps")]
+    pub camera_fps: u32,
     /// Somebody joining or leaving the voice channel this client is in.
     #[serde(default = "default_true")]
     pub voice_sounds: bool,
@@ -276,6 +295,9 @@ impl Default for Config {
             share_bitrate_kbps: None,
             share_audio: true,
             share_volume: 1.0,
+            camera_device: None,
+            camera_resolution: CAMERA_DEFAULT_RESOLUTION.to_owned(),
+            camera_fps: CAMERA_DEFAULT_FPS,
             voice_sounds: true,
             self_sounds: true,
             sound_volume: 1.0,
@@ -445,6 +467,14 @@ fn default_share_fps() -> u32 {
     SHARE_DEFAULT_FPS
 }
 
+fn default_camera_resolution() -> String {
+    CAMERA_DEFAULT_RESOLUTION.to_owned()
+}
+
+fn default_camera_fps() -> u32 {
+    CAMERA_DEFAULT_FPS
+}
+
 fn default_theme() -> String {
     DEFAULT_THEME.to_owned()
 }
@@ -496,6 +526,17 @@ fn normalize(config: &mut Config) {
     config.share_bitrate_kbps = config
         .share_bitrate_kbps
         .map(|kbps| kbps.clamp(SHARE_MIN_BITRATE_KBPS, SHARE_MAX_BITRATE_KBPS));
+
+    let camera_resolution = config.camera_resolution.to_ascii_lowercase();
+    config.camera_resolution = CAMERA_RESOLUTIONS
+        .iter()
+        .find(|known| **known == camera_resolution)
+        .map(|known| (*known).to_owned())
+        .unwrap_or_else(default_camera_resolution);
+
+    if !CAMERA_FRAME_RATES.contains(&config.camera_fps) {
+        config.camera_fps = CAMERA_DEFAULT_FPS;
+    }
 
     config.share_volume = if config.share_volume.is_nan() {
         1.0
@@ -712,6 +753,40 @@ mod tests {
         assert_eq!(config.share_bitrate_kbps, None);
         assert!(config.share_audio);
         assert_eq!(config.share_volume, 1.0);
+    }
+
+    #[test]
+    fn a_config_without_the_camera_keys_still_loads() {
+        let raw = r#"
+            username = "x"
+            ptt_key = "F8"
+        "#;
+        let mut config: Config = toml::from_str(raw).expect("parses a config missing camera keys");
+        normalize(&mut config);
+
+        assert_eq!(config.camera_device, None);
+        assert_eq!(config.camera_resolution, "720p");
+        assert_eq!(config.camera_fps, 30);
+    }
+
+    #[test]
+    fn camera_settings_are_normalised() {
+        let mut config = Config {
+            camera_resolution: "360P".to_owned(),
+            camera_fps: 25,
+            ..Config::default()
+        };
+        normalize(&mut config);
+
+        assert_eq!(config.camera_resolution, "360p");
+        assert_eq!(config.camera_fps, CAMERA_DEFAULT_FPS);
+
+        config.camera_resolution = "1080p".to_owned();
+        config.camera_fps = 0;
+        normalize(&mut config);
+
+        assert_eq!(config.camera_resolution, CAMERA_DEFAULT_RESOLUTION);
+        assert_eq!(config.camera_fps, CAMERA_DEFAULT_FPS);
     }
 
     #[test]

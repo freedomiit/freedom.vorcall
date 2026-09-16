@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::FRAME_SAMPLES;
 use crate::codec::{Decoder, STEREO_FRAME_SAMPLES, StereoDecoder};
-use crate::jitter::{Frame, Incoming, JitterBuffer};
+use crate::jitter::{Frame, Incoming, JitterBuffer, JitterConfig};
 
 /// A speaker heard from this long ago is gone; its decoder is dropped so stale
 /// ssrcs do not accumulate over a long call. The share stream is exempt: see
@@ -308,7 +308,9 @@ impl Playout {
                 Ok(decoder) => {
                     self.share = Some(Share {
                         ssrc,
-                        jitter: JitterBuffer::new(),
+                        // Not a voice: it arrives in bursts behind the video
+                        // and would rather be late than chopped.
+                        jitter: JitterBuffer::with_config(JitterConfig::SHARE),
                         decoder,
                         decoded_frames: 0,
                     });

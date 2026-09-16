@@ -25,6 +25,11 @@ public readonly record struct MediaHeader(byte Type, byte Flags, uint Ssrc, ulon
     public const byte TypeShareAudio = 5;
     public const byte TypeKeyframeRequest = 6;
 
+    // A camera is a second video stream beside a screen share, with the same payload as type 4 and
+    // the same request payload as type 6, so the two can run at once from one session.
+    public const byte TypeCameraVideo = 7;
+    public const byte TypeCameraKeyframeRequest = 8;
+
     // Bit 0 means a talk spurt started on audio, and the first packet of a share-audio run.
     public const byte FlagTalkSpurt = 0x01;
 
@@ -33,7 +38,8 @@ public readonly record struct MediaHeader(byte Type, byte Flags, uint Ssrc, ulon
 
     private const byte Version = 1;
 
-    // Inbound only: a client sends audio, pings, share media and keyframe requests, never pongs.
+    // Inbound only: a client sends audio, pings, share media, camera video and keyframe requests,
+    // never pongs.
     public static bool TryParse(ReadOnlySpan<byte> datagram, out MediaHeader header)
     {
         header = default;
@@ -44,7 +50,8 @@ public readonly record struct MediaHeader(byte Type, byte Flags, uint Ssrc, ulon
 
         var type = datagram[1];
         var flags = datagram[2];
-        if (type is not (TypeAudio or TypePing or TypeVideo or TypeShareAudio or TypeKeyframeRequest)
+        if (type is not (TypeAudio or TypePing or TypeVideo or TypeShareAudio or TypeKeyframeRequest
+            or TypeCameraVideo or TypeCameraKeyframeRequest)
             || (flags & ~FlagTalkSpurt) != 0)
         {
             return false;

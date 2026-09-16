@@ -78,6 +78,7 @@ public static class ServiceSetup
         builder.Services.AddSingleton<AttachmentStore>();
         builder.Services.AddSingleton<ImageStore>();
         builder.Services.AddSingleton<SoundStore>();
+        builder.Services.AddSingleton<StickerStore>();
         builder.Services.AddHostedService<AttachmentSweeper>();
 
         // The proxy's rendezvous is in memory and the registry tells it when an owner goes; the

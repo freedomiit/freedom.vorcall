@@ -9,7 +9,8 @@
 //! ```text
 //! [0]      version = 1
 //! [1]      type (1 audio, 2 ping, 3 pong, 4 video, 5 share audio,
-//!                6 keyframe request)
+//!                6 keyframe request, 7 camera video,
+//!                8 camera keyframe request)
 //! [2]      flags (bit 0 = marker)
 //! [3..7]   ssrc  u32
 //! [7..15]  seq   u64
@@ -38,6 +39,13 @@ pub enum PacketType {
     ShareAudio = 5,
     /// A viewer asking the sharer for a keyframe; payload is the target ssrc.
     KeyframeRequest = 6,
+    /// One fragment of a camera access unit, framed exactly like [`Video`]. A
+    /// camera is a stream of its own so one session can carry a screen share
+    /// and a camera at the same time.
+    CameraVideo = 7,
+    /// A viewer asking a camera's owner for a keyframe; payload is the target
+    /// ssrc, exactly like [`KeyframeRequest`](Self::KeyframeRequest).
+    CameraKeyframeRequest = 8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +101,8 @@ impl Header {
             4 => PacketType::Video,
             5 => PacketType::ShareAudio,
             6 => PacketType::KeyframeRequest,
+            7 => PacketType::CameraVideo,
+            8 => PacketType::CameraKeyframeRequest,
             other => return Err(PacketError::BadType(other)),
         };
         let flags = bytes[2];
@@ -142,6 +152,8 @@ mod tests {
             PacketType::Video,
             PacketType::ShareAudio,
             PacketType::KeyframeRequest,
+            PacketType::CameraVideo,
+            PacketType::CameraKeyframeRequest,
         ] {
             for marker in [false, true] {
                 let header = sample(kind, marker);
@@ -182,10 +194,10 @@ mod tests {
         ));
 
         let mut bytes = sample(PacketType::Audio, false).encode();
-        bytes[1] = 7;
+        bytes[1] = 9;
         assert!(matches!(
             Header::decode(&bytes),
-            Err(PacketError::BadType(7))
+            Err(PacketError::BadType(9))
         ));
         bytes[1] = 0;
         assert!(matches!(
@@ -199,6 +211,18 @@ mod tests {
             Header::decode(&bytes),
             Err(PacketError::BadFlags(0b0000_0010))
         ));
+    }
+
+    #[test]
+    fn the_camera_types_are_as_strict_about_flags_as_the_rest() {
+        for kind in [PacketType::CameraVideo, PacketType::CameraKeyframeRequest] {
+            let mut bytes = sample(kind, false).encode();
+            bytes[2] = MARKER_FLAG | 0b0000_0100;
+            assert!(matches!(
+                Header::decode(&bytes),
+                Err(PacketError::BadFlags(0b0000_0101))
+            ));
+        }
     }
 
     #[test]
@@ -231,6 +255,8 @@ mod tests {
             (4, PacketType::Video),
             (5, PacketType::ShareAudio),
             (6, PacketType::KeyframeRequest),
+            (7, PacketType::CameraVideo),
+            (8, PacketType::CameraKeyframeRequest),
         ] {
             let mut bytes = sample(PacketType::Audio, false).encode();
             bytes[1] = number;

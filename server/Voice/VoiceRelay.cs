@@ -23,15 +23,19 @@ public readonly record struct RelaySnapshot(
     long SharePacketsOut,
     long ShareBytesIn,
     long ShareBytesOut,
+    long CameraPacketsIn,
+    long CameraPacketsOut,
+    long CameraBytesIn,
+    long CameraBytesOut,
     long KeyframeRequests,
     IReadOnlyDictionary<string, long> Drops);
 
 // The media path: one UDP socket, one receive loop, one key per voice session. Every datagram
 // is authenticated before anything is forwarded, and the relay only ever sends to an address
 // that a session's own key has already been proved from, so the socket cannot be used to
-// bounce traffic at a third party. Screen share rides the same socket and the same key: its
-// fan-out leaves the receive loop through a per-session queue so a sharer's watchers never cost
-// the channel's audio a millisecond.
+// bounce traffic at a third party. A screen share and a camera ride the same socket and the same
+// key: each leaves the receive loop through a per-session queue of its own, so neither a sharer's
+// nor a camera's watchers cost the channel's audio a millisecond.
 public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger) : BackgroundService
 {
     private const int ReceiveBufferBytes = 8 * 1024 * 1024;
@@ -75,9 +79,19 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
     // Whether a share may be started at all: the kill switch plus a relay that actually came up.
     public bool ShareEnabled => options.ShareEnabled && IsAvailable;
 
+    // The same for cameras, which have a kill switch of their own: either stream may be off with
+    // the other running.
+    public bool CameraEnabled => options.CameraEnabled && IsAvailable;
+
     // How many sharers a channel may hold at once. The relay does not enforce it; the signalling
     // side does, and reads the ceiling from here.
     public int MaxSharersPerRoom => options.MaxSharersPerRoom;
+
+    public int MaxCamerasPerRoom => options.MaxCamerasPerRoom;
+
+    // How many cameras one viewer may watch at once, enforced by the signalling side like the two
+    // ceilings above.
+    public int MaxWatchedCameras => options.MaxWatchedCameras;
 
     public string AdvertisedHost => options.Host;
 
@@ -101,7 +115,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
             while (ssrc == 0 || _sessions.ContainsKey(ssrc));
 
-            session = new VoiceSession(ssrc, userId, channelId, key, options.ShareMaxKbps)
+            session = new VoiceSession(ssrc, userId, channelId, key, options)
             {
                 Muted = muted,
                 Deafened = deafened,
@@ -141,14 +155,18 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 }
             }
 
-            // Both directions of the share graph go with the session: whatever it was watching
+            // Both directions of both watch graphs go with the session: whatever it was watching
             // loses a watcher, and its own watchers are left watching nothing, which is what
             // makes their next keyframe request a drop rather than a message to a stranger.
             StopWatching(session);
             DetachWatchers(session);
+            StopWatchingCameras(session);
+            DetachCameraWatchers(session);
             session.Sharing = false;
             session.ShareAudio = false;
+            session.Camera = false;
             session.CompleteShareQueue();
+            session.CompleteCameraQueue();
         }
 
         if (session.StopSpeaking())
@@ -198,7 +216,81 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
         if (started is { } queue && session is { } sharer)
         {
-            _ = Task.Run(() => ShareWorkerAsync(sharer, queue));
+            _ = Task.Run(() => MediaWorkerAsync(sharer, queue, camera: false));
+        }
+    }
+
+    // The same for a camera, and independent of the share: turning one off leaves the other
+    // running. Starting is idempotent; ending detaches every watcher and stops the sender worker.
+    public void SetCamera(uint ssrc, bool on)
+    {
+        ChannelReader<VoiceSession.Outbound>? started = null;
+        VoiceSession? session;
+
+        lock (_gate)
+        {
+            if (!_sessions.TryGetValue(ssrc, out session))
+            {
+                return;
+            }
+
+            if (on)
+            {
+                if (!session.Camera)
+                {
+                    // The queue comes first, as in SetSharing: a datagram may reach the receive
+                    // loop the moment the flag is up.
+                    started = session.RestartCameraQueue();
+                    session.Camera = true;
+                }
+            }
+            else
+            {
+                session.Camera = false;
+                DetachCameraWatchers(session);
+                session.CompleteCameraQueue();
+            }
+        }
+
+        if (started is { } queue && session is { } owner)
+        {
+            _ = Task.Run(() => MediaWorkerAsync(owner, queue, camera: true));
+        }
+    }
+
+    // Adds one camera to a viewer's watched set, or takes it out. A target that is unknown, has no
+    // camera on, or is the viewer itself is not added; taking one out that was never in is a no-op.
+    // The signalling side holds the ceiling, so nothing is refused here.
+    public void WatchCamera(uint viewerSsrc, uint ownerSsrc, bool watch)
+    {
+        lock (_gate)
+        {
+            if (!_sessions.TryGetValue(viewerSsrc, out var viewer))
+            {
+                return;
+            }
+
+            if (!_sessions.TryGetValue(ownerSsrc, out var owner))
+            {
+                // The camera went away; the viewer's own set still has to lose it.
+                viewer.WatchingCameras = viewer.WatchingCameras.Remove(ownerSsrc);
+                return;
+            }
+
+            if (watch)
+            {
+                if (ownerSsrc == viewerSsrc || !owner.Camera || viewer.WatchingCameras.Contains(ownerSsrc))
+                {
+                    return;
+                }
+
+                owner.CameraWatchers = owner.CameraWatchers.Add(viewer);
+                viewer.WatchingCameras = viewer.WatchingCameras.Add(ownerSsrc);
+                return;
+            }
+
+            owner.CameraWatchers = owner.CameraWatchers.Remove(viewer);
+            viewer.WatchingCameras = viewer.WatchingCameras.Remove(ownerSsrc);
         }
     }
 
@@ -285,6 +377,8 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             ["no_address"] = Interlocked.Read(ref _totals.DropNoAddress),
             ["share_rate"] = Interlocked.Read(ref _totals.DropShareRate),
             ["not_sharing"] = Interlocked.Read(ref _totals.DropNotSharing),
+            ["camera_rate"] = Interlocked.Read(ref _totals.DropCameraRate),
+            ["not_camera"] = Interlocked.Read(ref _totals.DropNotCamera),
             ["muted"] = Interlocked.Read(ref _totals.DropMuted),
             ["not_watching"] = Interlocked.Read(ref _totals.DropNotWatching),
             ["queue_full"] = queueDrops,
@@ -303,6 +397,10 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             Interlocked.Read(ref _totals.SharePacketsOut),
             Interlocked.Read(ref _totals.ShareBytesIn),
             Interlocked.Read(ref _totals.ShareBytesOut),
+            Interlocked.Read(ref _totals.CameraPacketsIn),
+            Interlocked.Read(ref _totals.CameraPacketsOut),
+            Interlocked.Read(ref _totals.CameraBytesIn),
+            Interlocked.Read(ref _totals.CameraBytesOut),
             Interlocked.Read(ref _totals.KeyframeRequests),
             drops);
     }
@@ -419,6 +517,30 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         sharer.Watchers = [];
     }
 
+    // The camera half of the same two, and both callers hold _gate as well.
+    private void StopWatchingCameras(VoiceSession viewer)
+    {
+        foreach (var ownerSsrc in viewer.WatchingCameras)
+        {
+            if (_sessions.TryGetValue(ownerSsrc, out var owner))
+            {
+                owner.CameraWatchers = owner.CameraWatchers.Remove(viewer);
+            }
+        }
+
+        viewer.WatchingCameras = [];
+    }
+
+    private static void DetachCameraWatchers(VoiceSession owner)
+    {
+        foreach (var watcher in owner.CameraWatchers)
+        {
+            watcher.WatchingCameras = watcher.WatchingCameras.Remove(owner.Ssrc);
+        }
+
+        owner.CameraWatchers = [];
+    }
+
     private async Task ReceiveLoopAsync(Socket socket, CancellationToken stoppingToken)
     {
         var buffer = new byte[DatagramBufferBytes];
@@ -509,11 +631,19 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
             case MediaHeader.TypeVideo:
             case MediaHeader.TypeShareAudio:
-                EnqueueShare(inbound, buffer, plaintext);
+                EnqueueMedia(inbound, buffer, plaintext, camera: false);
+                break;
+
+            case MediaHeader.TypeCameraVideo:
+                EnqueueMedia(inbound, buffer, plaintext, camera: true);
                 break;
 
             case MediaHeader.TypeKeyframeRequest:
                 await RequestKeyframeAsync(socket, inbound, scratch, plaintext, stoppingToken);
+                break;
+
+            case MediaHeader.TypeCameraKeyframeRequest:
+                await RequestCameraKeyframeAsync(socket, inbound, scratch, plaintext, stoppingToken);
                 break;
 
             default:
@@ -556,10 +686,10 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
 
         var counters = _counters.GetOrAdd(session.ChannelId, static _ => new ChannelCounters());
 
-        // Share media is a hundred packets a second on its own: it answers to a byte budget of
-        // its own further down instead of the packet bucket audio and pings share.
-        var share = header.Type is MediaHeader.TypeVideo or MediaHeader.TypeShareAudio;
-        if (!share && !session.Bucket.TryTake(Stopwatch.GetTimestamp()))
+        // Share and camera media are a hundred packets a second each: they answer to byte budgets
+        // of their own further down instead of the packet bucket audio and pings share.
+        var media = header.Type is MediaHeader.TypeVideo or MediaHeader.TypeShareAudio or MediaHeader.TypeCameraVideo;
+        if (!media && !session.Bucket.TryTake(Stopwatch.GetTimestamp()))
         {
             Bump(ref counters.DropRate, ref _totals.DropRate);
             return false;
@@ -587,25 +717,16 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
 
         // Charged after the AEAD for the same reason the window moves after it: a forgery must
-        // not be able to spend somebody else's budget.
-        if (share)
+        // not be able to spend somebody else's budget. Share video, share audio and camera video
+        // each spend their own, so no one of the three can starve the other two.
+        if (media && !Admit(session, header.Type, length, counters))
         {
-            if (!session.ShareBucket.TryTake(Stopwatch.GetTimestamp(), length))
-            {
-                Bump(ref counters.DropShareRate, ref _totals.DropShareRate);
-                return false;
-            }
-
-            if (!session.Sharing || (header.Type == MediaHeader.TypeShareAudio && !session.ShareAudio))
-            {
-                Bump(ref counters.DropNotSharing, ref _totals.DropNotSharing);
-                return false;
-            }
+            return false;
         }
 
         // Server mute, refused where the share flags are and for the same reason: a forgery must
         // not be able to probe the flag, and a muted sender must not mark itself speaking either.
-        // Only audio is silenced — its pings, keyframe requests and share media carry on.
+        // Only audio is silenced — its pings, keyframe requests, share and camera media carry on.
         if (header.Type == MediaHeader.TypeAudio && session.Muted)
         {
             Bump(ref counters.DropMuted, ref _totals.DropMuted);
@@ -621,6 +742,44 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
 
         inbound = new Inbound(session, counters, header, plaintextLength);
+        return true;
+    }
+
+    // One media datagram's byte budget and the flag that says its stream is actually running.
+    // False means the datagram has been counted as a drop and goes no further.
+    private bool Admit(VoiceSession session, byte type, int length, ChannelCounters counters)
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (type == MediaHeader.TypeCameraVideo)
+        {
+            if (!session.CameraBucket.TryTake(now, length))
+            {
+                Bump(ref counters.DropCameraRate, ref _totals.DropCameraRate);
+                return false;
+            }
+
+            if (!session.Camera)
+            {
+                Bump(ref counters.DropNotCamera, ref _totals.DropNotCamera);
+                return false;
+            }
+
+            return true;
+        }
+
+        var budget = type == MediaHeader.TypeShareAudio ? session.ShareAudioBucket : session.ShareBucket;
+        if (!budget.TryTake(now, length))
+        {
+            Bump(ref counters.DropShareRate, ref _totals.DropShareRate);
+            return false;
+        }
+
+        if (!session.Sharing || (type == MediaHeader.TypeShareAudio && !session.ShareAudio))
+        {
+            Bump(ref counters.DropNotSharing, ref _totals.DropNotSharing);
+            return false;
+        }
+
         return true;
     }
 
@@ -665,9 +824,10 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
     }
 
-    // The receive loop's whole part in a share: one pooled copy of the header and its plaintext,
-    // handed to the session's own worker. Everything after this happens off this thread.
-    private void EnqueueShare(Inbound inbound, byte[] buffer, byte[] plaintext)
+    // The receive loop's whole part in a share or a camera: one pooled copy of the header and its
+    // plaintext, handed to the session's own worker for that stream. Everything after this happens
+    // off this thread.
+    private void EnqueueMedia(Inbound inbound, byte[] buffer, byte[] plaintext, bool camera)
     {
         var counters = inbound.Counters;
         var length = MediaHeader.Length + inbound.PlaintextLength;
@@ -676,21 +836,26 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         plaintext.AsSpan(0, inbound.PlaintextLength).CopyTo(rented.AsSpan(MediaHeader.Length));
 
         // A full queue evicts its oldest frame instead, which the session counts itself; a
-        // refusal here means the share ended while this datagram was in flight.
-        if (!inbound.Session.ShareWriter.TryWrite(new VoiceSession.Outbound(rented, inbound.PlaintextLength)))
+        // refusal here means the stream ended while this datagram was in flight.
+        var writer = camera ? inbound.Session.CameraWriter : inbound.Session.ShareWriter;
+        if (!writer.TryWrite(new VoiceSession.Outbound(rented, inbound.PlaintextLength)))
         {
             ArrayPool<byte>.Shared.Return(rented);
             Bump(ref counters.DropQueueFull, ref _totals.DropQueueFull);
             return;
         }
 
-        Bump(ref counters.SharePacketsIn, ref _totals.SharePacketsIn);
-        BumpBy(ref counters.ShareBytesIn, ref _totals.ShareBytesIn, length + MediaHeader.TagLength);
+        ref var packetsIn = ref (camera ? ref counters.CameraPacketsIn : ref counters.SharePacketsIn);
+        ref var totalPacketsIn = ref (camera ? ref _totals.CameraPacketsIn : ref _totals.SharePacketsIn);
+        ref var bytesIn = ref (camera ? ref counters.CameraBytesIn : ref counters.ShareBytesIn);
+        ref var totalBytesIn = ref (camera ? ref _totals.CameraBytesIn : ref _totals.ShareBytesIn);
+        Bump(ref packetsIn, ref totalPacketsIn);
+        BumpBy(ref bytesIn, ref totalBytesIn, length + MediaHeader.TagLength);
     }
 
-    // One sharer's fan-out, on its own task: the sends are synchronous because a share is a
-    // burst of datagrams and nothing else waits on this thread.
-    private async Task ShareWorkerAsync(VoiceSession session, ChannelReader<VoiceSession.Outbound> queue)
+    // One sharer's or one camera's fan-out, on its own task: the sends are synchronous because
+    // either is a burst of datagrams and nothing else waits on this thread.
+    private async Task MediaWorkerAsync(VoiceSession session, ChannelReader<VoiceSession.Outbound> queue, bool camera)
     {
         var scratch = new byte[MediaHeader.MaxDatagram];
         var counters = _counters.GetOrAdd(session.ChannelId, static _ => new ChannelCounters());
@@ -701,7 +866,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             {
                 try
                 {
-                    if (!FanOut(session, item, scratch, counters))
+                    if (!FanOut(session, item, scratch, counters, camera))
                     {
                         return;
                     }
@@ -714,12 +879,17 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Voice share worker for user {UserId} in channel {ChannelId} stopped", session.UserId, session.ChannelId);
+            logger.LogError(
+                ex,
+                "Voice {Stream} worker for user {UserId} in channel {ChannelId} stopped",
+                camera ? "camera" : "share",
+                session.UserId,
+                session.ChannelId);
         }
     }
 
     // False once the socket is gone, which is the worker's cue to leave.
-    private bool FanOut(VoiceSession session, VoiceSession.Outbound item, byte[] scratch, ChannelCounters counters)
+    private bool FanOut(VoiceSession session, VoiceSession.Outbound item, byte[] scratch, ChannelCounters counters, bool camera)
     {
         var socket = _socket;
         if (socket is null)
@@ -727,7 +897,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             return false;
         }
 
-        var watchers = session.Watchers;
+        var watchers = camera ? session.CameraWatchers : session.Watchers;
         if (watchers.IsEmpty)
         {
             return true;
@@ -737,9 +907,16 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         var plaintext = item.Buffer.AsSpan(MediaHeader.Length, item.PlaintextLength);
         var length = MediaHeader.Length + item.PlaintextLength + MediaHeader.TagLength;
 
+        ref var packetsOut = ref (camera ? ref counters.CameraPacketsOut : ref counters.SharePacketsOut);
+        ref var totalPacketsOut = ref (camera ? ref _totals.CameraPacketsOut : ref _totals.SharePacketsOut);
+        ref var bytesOut = ref (camera ? ref counters.CameraBytesOut : ref counters.ShareBytesOut);
+        ref var totalBytesOut = ref (camera ? ref _totals.CameraBytesOut : ref _totals.ShareBytesOut);
+
         foreach (var watcher in watchers)
         {
-            if (watcher.Ssrc == session.Ssrc || watcher.Deafened)
+            // A share's queue carries its audio too, so a deafened watcher is skipped; a camera
+            // carries video alone, and deafening is about audio.
+            if (watcher.Ssrc == session.Ssrc || (!camera && watcher.Deafened))
             {
                 continue;
             }
@@ -749,7 +926,8 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             if (watcher.ChannelId != session.ChannelId)
             {
                 logger.LogDebug(
-                    "Voice share of user {UserId} in channel {ChannelId} had a watcher from channel {WatcherChannelId}",
+                    "Voice {Stream} of user {UserId} in channel {ChannelId} had a watcher from channel {WatcherChannelId}",
+                    camera ? "camera" : "share",
                     session.UserId,
                     session.ChannelId,
                     watcher.ChannelId);
@@ -772,13 +950,13 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             try
             {
                 var sent = socket.SendTo(scratch, 0, length, SocketFlags.None, destination);
-                Bump(ref counters.SharePacketsOut, ref _totals.SharePacketsOut);
-                BumpBy(ref counters.ShareBytesOut, ref _totals.ShareBytesOut, sent);
+                Bump(ref packetsOut, ref totalPacketsOut);
+                BumpBy(ref bytesOut, ref totalBytesOut, sent);
             }
             catch (SocketException ex)
             {
                 Bump(ref counters.DropSendError, ref _totals.DropSendError);
-                logger.LogDebug(ex, "Voice share send failed with {SocketError}", ex.SocketErrorCode);
+                logger.LogDebug(ex, "Voice media send failed with {SocketError}", ex.SocketErrorCode);
             }
             catch (ObjectDisposedException)
             {
@@ -803,6 +981,39 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             return;
         }
 
+        await ForwardKeyframeAsync(socket, inbound, target, scratch, plaintext, stoppingToken);
+    }
+
+    // The same for a camera, against the set of cameras this viewer watches rather than the one
+    // share it does.
+    private async Task RequestCameraKeyframeAsync(Socket socket, Inbound inbound, byte[] scratch, byte[] plaintext, CancellationToken stoppingToken)
+    {
+        var counters = inbound.Counters;
+        if (inbound.PlaintextLength < KeyframeRequestBytes)
+        {
+            Bump(ref counters.DropNotWatching, ref _totals.DropNotWatching);
+            return;
+        }
+
+        var targetSsrc = BinaryPrimitives.ReadUInt32BigEndian(plaintext);
+        if (!inbound.Session.WatchingCameras.Contains(targetSsrc) || !_sessions.TryGetValue(targetSsrc, out var target))
+        {
+            Bump(ref counters.DropNotWatching, ref _totals.DropNotWatching);
+            return;
+        }
+
+        await ForwardKeyframeAsync(socket, inbound, target, scratch, plaintext, stoppingToken);
+    }
+
+    private async Task ForwardKeyframeAsync(
+        Socket socket,
+        Inbound inbound,
+        VoiceSession target,
+        byte[] scratch,
+        byte[] plaintext,
+        CancellationToken stoppingToken)
+    {
+        var counters = inbound.Counters;
         if (target.Address is not { } destination)
         {
             Bump(ref counters.DropNoAddress, ref _totals.DropNoAddress);
@@ -929,7 +1140,7 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
             }
 
             logger.LogInformation(
-                "Voice channel {ChannelId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; share: {SharePacketsIn} packets in, {SharePacketsOut} out, {ShareBytesIn} bytes in, {ShareBytesOut} out, {KeyframeRequests} keyframe requests; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address, {DropShareRate} share rate, {DropNotSharing} not sharing, {DropMuted} muted, {DropNotWatching} not watching, {DropQueueFull} queue full, {DropSendError} send error, {DropChannelGone} channel gone, {DropSealFailed} seal failed",
+                "Voice channel {ChannelId}: {Sessions} sessions, {PacketsIn} packets in, {PacketsOut} out, {BytesIn} bytes in, {BytesOut} out; share: {SharePacketsIn} packets in, {SharePacketsOut} out, {ShareBytesIn} bytes in, {ShareBytesOut} out; camera: {CameraPacketsIn} packets in, {CameraPacketsOut} out, {CameraBytesIn} bytes in, {CameraBytesOut} out; {KeyframeRequests} keyframe requests; drops: {DropSize} size, {DropHeader} header, {DropUnknownSsrc} unknown ssrc, {DropRate} rate, {DropBadTag} bad tag, {DropReplay} replay, {DropNoAddress} no address, {DropShareRate} share rate, {DropNotSharing} not sharing, {DropCameraRate} camera rate, {DropNotCamera} not camera, {DropMuted} muted, {DropNotWatching} not watching, {DropQueueFull} queue full, {DropSendError} send error, {DropChannelGone} channel gone, {DropSealFailed} seal failed",
                 channelId,
                 members.Length,
                 Interlocked.Read(ref counters.PacketsIn),
@@ -940,6 +1151,10 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 Interlocked.Read(ref counters.SharePacketsOut),
                 Interlocked.Read(ref counters.ShareBytesIn),
                 Interlocked.Read(ref counters.ShareBytesOut),
+                Interlocked.Read(ref counters.CameraPacketsIn),
+                Interlocked.Read(ref counters.CameraPacketsOut),
+                Interlocked.Read(ref counters.CameraBytesIn),
+                Interlocked.Read(ref counters.CameraBytesOut),
                 Interlocked.Read(ref counters.KeyframeRequests),
                 dropSize,
                 dropHeader,
@@ -950,6 +1165,8 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
                 Interlocked.Read(ref counters.DropNoAddress),
                 Interlocked.Read(ref counters.DropShareRate),
                 Interlocked.Read(ref counters.DropNotSharing),
+                Interlocked.Read(ref counters.DropCameraRate),
+                Interlocked.Read(ref counters.DropNotCamera),
                 Interlocked.Read(ref counters.DropMuted),
                 Interlocked.Read(ref counters.DropNotWatching),
                 queueDrops,
@@ -990,6 +1207,10 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         public long SharePacketsOut;
         public long ShareBytesIn;
         public long ShareBytesOut;
+        public long CameraPacketsIn;
+        public long CameraPacketsOut;
+        public long CameraBytesIn;
+        public long CameraBytesOut;
         public long KeyframeRequests;
         public long DropRate;
         public long DropBadTag;
@@ -997,6 +1218,8 @@ public sealed class VoiceRelay(VoiceOptions options, ILogger<VoiceRelay> logger)
         public long DropNoAddress;
         public long DropShareRate;
         public long DropNotSharing;
+        public long DropCameraRate;
+        public long DropNotCamera;
         public long DropMuted;
         public long DropNotWatching;
         public long DropQueueFull;

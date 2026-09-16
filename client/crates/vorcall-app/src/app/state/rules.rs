@@ -13,12 +13,12 @@ use vorcall_core::config::{self, Config, TransmitMode};
 use vorcall_core::mentions::{self, Segment};
 use vorcall_core::{ApiFailure, Channel, ChannelKind, ChatMessage};
 use vorcall_hotkey::{ActionId, Backend, Binding, Key, MouseButton, Trigger};
-use vorcall_screen::Capabilities;
-use vorcall_screen::preset::{self, FrameRate, Preset, Resolution};
+use vorcall_screen::preset::{self, CameraPreset, CameraResolution, FrameRate, Preset, Resolution};
+use vorcall_screen::{CameraCapabilities, CameraRequest, CameraSource, Capabilities};
 
 use crate::app::state::chat::MESSAGE_LIMIT;
 use crate::app::state::server::{ServerModel, channel_kind};
-use crate::app::state::voice::{HotkeyStatus, VoiceUi};
+use crate::app::state::voice::{CameraPrefs, CameraTileId, HotkeyStatus, VoiceRoster, VoiceUi};
 
 /// Push to talk keeps action 0: `vorcall-hotkey` describes that one to a Wayland
 /// compositor as push to talk, and the ids are what every edge is tagged with.
@@ -351,6 +351,196 @@ pub fn auto_bitrate_kbps(config: &Config) -> u32 {
         ..share_preset(config)
     };
     preset.bitrate_kbps(capture_box(preset.resolution).unwrap_or(preset::MAX_SOURCE))
+}
+
+/// Whether the stage has anything to draw at all: a share being watched, a
+/// camera being watched, or this client's own preview.
+pub fn on_stage(voice: &VoiceUi) -> bool {
+    voice.watch.state.is_some() || !voice.cameras.tiles.is_empty() || voice.camera.active
+}
+
+/// How many cameras one member may watch at once. `PROTOCOL.md` § Camera: the
+/// server refuses the fifth, so the interface never asks for it.
+pub const MAX_WATCHED_CAMERAS: usize = 4;
+
+/// What the local tile is labelled: a name would be this account's own, which
+/// nobody needs pointing out to them.
+pub const OWN_CAMERA_LABEL: &str = "You";
+
+/// Turning a camera on takes a live voice session, the right to, a backend that
+/// can open a device at all, and nothing of ours already on the wire.
+pub fn camera_rule(live: bool, has_video: bool, available: bool, busy: bool) -> bool {
+    live && has_video && available && !busy
+}
+
+/// Whether a camera can be turned on from here. `has_video` is `VIDEO` resolved
+/// for the joined channel, which the server checks again anyway.
+pub fn can_camera(voice: &VoiceUi, has_video: bool, capabilities: &CameraCapabilities) -> bool {
+    camera_rule(
+        voice.is_live(),
+        has_video,
+        capabilities.available,
+        voice.camera.active || voice.camera.starting,
+    )
+}
+
+/// Watching a camera takes a live voice session in the channel whose roster is on
+/// screen, a peer with a camera on, somebody other than oneself, and room under
+/// the cap.
+pub fn camera_watch_rule(
+    in_this_voice_channel: bool,
+    on_camera: bool,
+    is_me: bool,
+    watched: usize,
+) -> bool {
+    in_this_voice_channel && on_camera && !is_me && watched < MAX_WATCHED_CAMERAS
+}
+
+/// Whether `user_id`'s camera can be watched from the channel `channel_id` names.
+/// A camera already watched answers `false`: the second press stops it rather
+/// than asking again.
+pub fn can_watch_camera(voice: &VoiceUi, me: i64, channel_id: i64, user_id: i64) -> bool {
+    !voice.cameras.tiles.contains_key(&user_id)
+        && camera_watch_rule(
+            voice.is_live() && voice.channel_id == channel_id,
+            voice.on_camera(user_id),
+            user_id == me,
+            voice.cameras.tiles.len(),
+        )
+}
+
+/// The tiles the stage draws, in the order it draws them: this client's own
+/// preview first, then every watched camera by name.
+pub fn camera_tile_list(
+    own: bool,
+    watched: &BTreeSet<i64>,
+    roster: Option<&VoiceRoster>,
+) -> Vec<(CameraTileId, String)> {
+    let mut tiles = Vec::new();
+    if own {
+        tiles.push((CameraTileId::Own, OWN_CAMERA_LABEL.to_owned()));
+    }
+
+    let mut peers: Vec<(String, i64)> = watched
+        .iter()
+        .map(|user_id| {
+            let name = roster
+                .and_then(|roster| roster.members.get(user_id))
+                .map_or_else(
+                    || UNKNOWN_SHARER.to_owned(),
+                    |member| member.username.clone(),
+                );
+            (name, *user_id)
+        })
+        .collect();
+    // By name, and by id where two members answer to the same one, so the tiles
+    // do not swap places between two frames.
+    peers.sort();
+    tiles.extend(
+        peers
+            .into_iter()
+            .map(|(name, user_id)| (CameraTileId::Peer(user_id), name)),
+    );
+    tiles
+}
+
+/// What this machine can do with a camera, in the sentence under the settings.
+pub fn camera_sentence(capabilities: &CameraCapabilities) -> String {
+    if !capabilities.available {
+        return "This system cannot use a camera.".to_owned();
+    }
+
+    let mut parts = vec![format!("Camera: {}", capabilities.backend)];
+    parts.push(if capabilities.enumerates {
+        "pick the device below".to_owned()
+    } else {
+        "the system picks the device".to_owned()
+    });
+    #[cfg(target_os = "macos")]
+    parts.push("Camera permission is required, and re-granted after every update".to_owned());
+    parts.join(" · ")
+}
+
+/// The camera preferences a configuration carries, resolved against the cameras
+/// this machine enumerated. Anything the configuration cannot name is the
+/// default rather than a refusal to open a camera.
+pub fn camera_prefs(config: &Config, cameras: &[CameraSource]) -> CameraPrefs {
+    // Until the device list has been read, a saved id is taken at its word: a
+    // backend opens a camera by id and the name is only ever a label. Once the
+    // list is in, an id naming none of them is the system default.
+    let device = config.camera_device.as_ref().and_then(|id| {
+        if cameras.is_empty() {
+            Some(CameraSource {
+                id: id.clone(),
+                name: id.clone(),
+            })
+        } else {
+            cameras.iter().find(|camera| &camera.id == id).cloned()
+        }
+    });
+    CameraPrefs {
+        device,
+        resolution: config
+            .camera_resolution
+            .parse()
+            .unwrap_or(CameraResolution::P720),
+        fps: FrameRate::from_hz(config.camera_fps).unwrap_or(FrameRate::F30),
+    }
+}
+
+/// The preset a camera starts with. Bitrate is always the table's: a camera is a
+/// face beside the conversation, and there is no slider for it.
+pub fn camera_preset(prefs: &CameraPrefs) -> CameraPreset {
+    CameraPreset {
+        resolution: prefs.resolution,
+        fps: prefs.fps,
+        bitrate_kbps: None,
+    }
+}
+
+/// What the device is asked for: the preset's own box, which is what fitting a
+/// frame far larger than it comes to. A webcam answers with one of the handful
+/// of sizes it was built for whatever this says.
+pub fn camera_request(prefs: &CameraPrefs) -> CameraRequest {
+    CameraRequest {
+        source: prefs.device.clone(),
+        size: camera_preset(prefs).output_size(preset::MAX_SOURCE),
+        fps: prefs.fps,
+    }
+}
+
+/// What a fresh media session does about the camera watches a reconnect kept.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CameraResume {
+    /// No roster for this session yet, so nothing can be judged.
+    Pending,
+    /// The cameras still on, ascending: the intent is trimmed to these and each
+    /// of them is asked for again.
+    Request(Vec<i64>),
+}
+
+/// A reconnect keeps the camera watches; which of them are worth asking for
+/// again is the fresh roster's word, and without one the answer has to wait for
+/// it.
+pub fn camera_watch_resume(
+    intent: &BTreeSet<i64>,
+    camera: &BTreeMap<i64, bool>,
+    roster_seen: bool,
+) -> CameraResume {
+    if intent.is_empty() {
+        return CameraResume::Request(Vec::new());
+    }
+    if !roster_seen {
+        return CameraResume::Pending;
+    }
+    CameraResume::Request(
+        intent
+            .iter()
+            .copied()
+            .filter(|user_id| camera.get(user_id).copied().unwrap_or(false))
+            .take(MAX_WATCHED_CAMERAS)
+            .collect(),
+    )
 }
 
 /// The `@…` being typed, as byte offsets into `text`: the run of non-whitespace
@@ -778,7 +968,6 @@ mod tests {
     use vorcall_core::VoiceMember;
 
     use super::*;
-    use crate::app::state::voice::VoiceRoster;
 
     fn named(key: Named) -> keyboard::Key {
         keyboard::Key::Named(key)
@@ -800,6 +989,7 @@ mod tests {
             priority: false,
             self_muted: false,
             self_deafened: false,
+            camera: false,
         }
     }
 
@@ -900,6 +1090,135 @@ mod tests {
         // Without a roster there is nobody to list.
         voice.channel_id = 0;
         assert!(sharer_list(&voice, 7).is_empty());
+    }
+
+    fn on_camera(user_id: i64, username: &str) -> VoiceMember {
+        VoiceMember {
+            camera: true,
+            ..voice_member(user_id, username, false)
+        }
+    }
+
+    fn camera_capabilities(available: bool, enumerates: bool) -> CameraCapabilities {
+        CameraCapabilities {
+            backend: "v4l2",
+            available,
+            enumerates,
+        }
+    }
+
+    /// A live session and the permission, both of them; and never a second
+    /// camera over the one already on the wire.
+    #[test]
+    fn a_camera_needs_the_permission_and_a_backend() {
+        assert!(camera_rule(true, true, true, false));
+
+        // Without VIDEO the answer is no whatever the backend can do.
+        assert!(!camera_rule(true, false, true, false));
+        // And a system with no camera path at all refuses with the permission.
+        assert!(!camera_rule(true, true, false, false));
+        assert!(!camera_rule(false, true, true, false));
+        assert!(!camera_rule(true, true, true, true));
+
+        // The state-reading form says the same about a client with no media
+        // path: there is nothing to send a camera over.
+        let voice = VoiceUi::default();
+        assert!(!can_camera(&voice, true, &camera_capabilities(true, true)));
+    }
+
+    /// `PROTOCOL.md` § Camera: four at once, and never oneself.
+    #[test]
+    fn the_fifth_camera_is_refused() {
+        for watched in 0..MAX_WATCHED_CAMERAS {
+            assert!(
+                camera_watch_rule(true, true, false, watched),
+                "{watched} already watched"
+            );
+        }
+        assert!(!camera_watch_rule(true, true, false, MAX_WATCHED_CAMERAS));
+        assert!(!camera_watch_rule(
+            true,
+            true,
+            false,
+            MAX_WATCHED_CAMERAS + 1
+        ));
+
+        // The other three reasons, each on its own.
+        assert!(!camera_watch_rule(false, true, false, 0));
+        assert!(!camera_watch_rule(true, false, false, 0));
+        assert!(!camera_watch_rule(true, true, true, 0));
+    }
+
+    #[test]
+    fn the_stage_puts_the_own_preview_first_and_the_rest_by_name() {
+        let roster = VoiceRoster::from_members(vec![
+            on_camera(7, "me"),
+            on_camera(9, "bea"),
+            on_camera(4, "ana"),
+        ]);
+        let watched: BTreeSet<i64> = [9, 4].into_iter().collect();
+
+        assert_eq!(
+            camera_tile_list(true, &watched, Some(&roster)),
+            vec![
+                (CameraTileId::Own, "You".to_owned()),
+                (CameraTileId::Peer(4), "ana".to_owned()),
+                (CameraTileId::Peer(9), "bea".to_owned()),
+            ]
+        );
+        // Without a camera of one's own the preview is not among them.
+        assert_eq!(
+            camera_tile_list(false, &watched, Some(&roster)),
+            vec![
+                (CameraTileId::Peer(4), "ana".to_owned()),
+                (CameraTileId::Peer(9), "bea".to_owned()),
+            ]
+        );
+        // A tile for somebody the roster does not name still draws.
+        let stranger: BTreeSet<i64> = [11].into_iter().collect();
+        assert_eq!(
+            camera_tile_list(false, &stranger, Some(&roster)),
+            vec![(CameraTileId::Peer(11), UNKNOWN_SHARER.to_owned())]
+        );
+        assert!(camera_tile_list(false, &BTreeSet::new(), None).is_empty());
+    }
+
+    #[test]
+    fn the_camera_sentence_names_the_backend_and_who_picks_the_device() {
+        let listed = camera_sentence(&camera_capabilities(true, true));
+        assert!(listed.starts_with("Camera: v4l2"), "{listed}");
+        assert!(listed.contains("pick the device below"), "{listed}");
+
+        let picked = camera_sentence(&camera_capabilities(true, false));
+        assert!(picked.contains("the system picks the device"), "{picked}");
+
+        assert_eq!(
+            camera_sentence(&camera_capabilities(false, false)),
+            "This system cannot use a camera."
+        );
+    }
+
+    /// A reconnect asks again only for the cameras still on, and waits for a
+    /// roster before it judges any of them.
+    #[test]
+    fn a_reconnect_re_watches_the_cameras_that_are_still_on() {
+        let intent: BTreeSet<i64> = [4, 9].into_iter().collect();
+        let camera: BTreeMap<i64, bool> = [(4, true), (9, false)].into_iter().collect();
+
+        assert_eq!(
+            camera_watch_resume(&intent, &camera, true),
+            CameraResume::Request(vec![4])
+        );
+        assert_eq!(
+            camera_watch_resume(&intent, &BTreeMap::new(), false),
+            CameraResume::Pending
+        );
+        // Nothing was being watched, so there is nothing to wait for a roster
+        // for either.
+        assert_eq!(
+            camera_watch_resume(&BTreeSet::new(), &BTreeMap::new(), false),
+            CameraResume::Request(Vec::new())
+        );
     }
 
     /// The mirror of what the server counts in `ReadState.mentions`, so a live
@@ -1602,6 +1921,70 @@ mod tests {
         assert_eq!(capture_box(Resolution::Source), None);
         // The table's 720p at 30 fps.
         assert_eq!(auto_bitrate_kbps(&config), 2_500);
+    }
+
+    #[test]
+    fn the_camera_preferences_come_from_the_configuration() {
+        let cameras = [
+            CameraSource {
+                id: "dev-0".to_owned(),
+                name: "Built-in".to_owned(),
+            },
+            CameraSource {
+                id: "dev-1".to_owned(),
+                name: "USB webcam".to_owned(),
+            },
+        ];
+        let config = Config {
+            camera_device: Some("dev-1".to_owned()),
+            camera_resolution: "360p".to_owned(),
+            camera_fps: 15,
+            ..Config::default()
+        };
+
+        let prefs = camera_prefs(&config, &cameras);
+        assert_eq!(prefs.device, Some(cameras[1].clone()));
+        assert_eq!(prefs.resolution, CameraResolution::P360);
+        assert_eq!(prefs.fps, FrameRate::F15);
+        assert_eq!(camera_preset(&prefs).resolution, CameraResolution::P360);
+        assert_eq!(camera_request(&prefs).fps, FrameRate::F15);
+    }
+
+    /// Nothing has been enumerated yet on the first camera of a session, and the
+    /// saved id is what the backend opens.
+    #[test]
+    fn a_saved_camera_survives_an_unread_device_list() {
+        let config = Config {
+            camera_device: Some("dev-1".to_owned()),
+            ..Config::default()
+        };
+
+        let prefs = camera_prefs(&config, &[]);
+        assert_eq!(
+            prefs.device.map(|device| device.id),
+            Some("dev-1".to_owned())
+        );
+    }
+
+    /// A camera that has been unplugged, or a device from another machine, is the
+    /// system default rather than a failure to open anything.
+    #[test]
+    fn an_unknown_camera_device_falls_back_to_the_system_default() {
+        let cameras = [CameraSource {
+            id: "dev-0".to_owned(),
+            name: "Built-in".to_owned(),
+        }];
+        let config = Config {
+            camera_device: Some("gone".to_owned()),
+            camera_resolution: "nonsense".to_owned(),
+            camera_fps: 7,
+            ..Config::default()
+        };
+
+        let prefs = camera_prefs(&config, &cameras);
+        assert_eq!(prefs.device, None);
+        assert_eq!(prefs.resolution, CameraResolution::P720);
+        assert_eq!(prefs.fps, FrameRate::F30);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use vorcall_core::{Attachment, ChatMessage, Reaction, ReplyRef, StreamedFile, pe
 use crate::app::message::{ChatMsg, MenuTarget, Message, UiMsg};
 use crate::app::state::chat::{ImageState, is_inline_preview};
 use crate::app::state::rules::{SENDER_OFFLINE, format_bytes, plain_text};
+use crate::app::state::sticker::is_removed;
 use crate::app::state::ui::TransferSource;
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
@@ -39,6 +40,9 @@ const GUTTER_GAP: f32 = 14.0;
 /// of it. A placeholder keeps the design's box until the pixels arrive.
 const ATTACHMENT_WIDTH: f32 = 400.0;
 const ATTACHMENT_HEIGHT: f32 = 300.0;
+/// The box a sticker is drawn in. A sticker is a picture of its own, never a
+/// file: no name, no size and nothing to open.
+const STICKER_SIZE: f32 = 160.0;
 const PLACEHOLDER_WIDTH: f32 = 320.0;
 const PLACEHOLDER_HEIGHT: f32 = 180.0;
 const PLACEHOLDER_ICON: f32 = 28.0;
@@ -83,6 +87,9 @@ pub fn view<'a>(app: &'a App, main: &'a MainState, chat: &ChatMessage) -> Elemen
     }
     // A tombstone carries neither, and the server strips both; the guard says so
     // here rather than trusting the frame.
+    if !chat.deleted && chat.sticker {
+        body = body.push(sticker_view(app, main, chat, metrics));
+    }
     if !chat.deleted {
         for attachment in &chat.attachments {
             body = body.push(attachment_view(app, main, attachment, metrics));
@@ -414,6 +421,44 @@ fn attachment_view<'a>(
         Some(ImageState::Failed) => placeholder(app, Icon::Warning, "Image unavailable", metrics),
         Some(ImageState::Loading) | None => {
             placeholder(app, Icon::Image, "Loading the image…", metrics)
+        }
+    }
+}
+
+/// One sticker, at most [`STICKER_SIZE`] on a side. A sticker message says
+/// nothing else — the server refuses one carrying text, attachments or streamed
+/// files — so there is no file name, no size line and nothing to open.
+fn sticker_view<'a>(
+    app: &'a App,
+    main: &'a MainState,
+    chat: &ChatMessage,
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    // The message outlives the library: the row stays, and says so.
+    if is_removed(chat.sticker, chat.sticker_id) {
+        return text("Sticker removed")
+            .size(metrics.text(TEXT_SECONDARY))
+            .color(tokens.text_muted)
+            .into();
+    }
+
+    let key = ImageKey::Sticker(chat.sticker_id);
+    match main.chat.images.get(&key) {
+        Some(ImageState::Ready(handle)) => {
+            container(image(handle.clone()).content_fit(ContentFit::Contain))
+                .max_width(STICKER_SIZE)
+                .max_height(STICKER_SIZE)
+                .into()
+        }
+        Some(ImageState::Failed) => text("Sticker unavailable")
+            .size(metrics.text(TEXT_SECONDARY))
+            .color(tokens.text_muted)
+            .into(),
+        // The box is held while the bytes are on their way, so the row does not
+        // jump once they land.
+        Some(ImageState::Loading) | None => {
+            Space::new().width(STICKER_SIZE).height(STICKER_SIZE).into()
         }
     }
 }

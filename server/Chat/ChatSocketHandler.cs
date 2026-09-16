@@ -48,6 +48,9 @@ public sealed class ChatSocketHandler(
     private const string InvalidTextDetail = "text must be 1..2000 characters after trimming";
     private const string InvalidAttachmentDetail = "attachment is unknown, not yours, not in this channel or already used";
     private const string InvalidStreamDetail = "streamed file is unknown, not yours, not in this channel or already used";
+    private const string StickerAloneDetail = "a sticker message carries no text, attachments or streamed files";
+    private const string UnknownStickerDetail = "unknown sticker";
+    private const string StickerEditDetail = "a sticker message cannot be edited";
     private const string UnknownMessageDetail = "unknown or deleted message";
     private const string InvalidNameDetail = "name must be 1..32 characters without control characters";
     private const string NotInVoiceDetail = "join the voice channel first";
@@ -394,6 +397,18 @@ public sealed class ChatSocketHandler(
             case ClientFrame.PayloadOneofCase.UnwatchShare:
                 return Flow(HandleUnwatchShare(connection, frame.UnwatchShare));
 
+            case ClientFrame.PayloadOneofCase.StartCamera:
+                return Flow(HandleStartCamera(connection, frame.StartCamera));
+
+            case ClientFrame.PayloadOneofCase.StopCamera:
+                return Flow(HandleStopCamera(connection, frame.StopCamera));
+
+            case ClientFrame.PayloadOneofCase.WatchCamera:
+                return Flow(HandleWatchCamera(connection, frame.WatchCamera));
+
+            case ClientFrame.PayloadOneofCase.UnwatchCamera:
+                return Flow(HandleUnwatchCamera(connection, frame.UnwatchCamera));
+
             case ClientFrame.PayloadOneofCase.CreateChannel:
                 return Flow(await HandleCreateChannelAsync(connection, userId, frame.CreateChannel));
 
@@ -486,6 +501,12 @@ public sealed class ChatSocketHandler(
             case ClientFrame.PayloadOneofCase.DeleteSound:
                 return Flow(Answer(connection, await registry.DeleteSoundAsync(connection, frame.DeleteSound.SoundId, Persist)));
 
+            case ClientFrame.PayloadOneofCase.UpdateSticker:
+                return Flow(await HandleUpdateStickerAsync(connection, frame.UpdateSticker));
+
+            case ClientFrame.PayloadOneofCase.DeleteSticker:
+                return Flow(Answer(connection, await registry.DeleteStickerAsync(connection, frame.DeleteSticker.StickerId, Persist)));
+
             default:
                 return Dispatch.EmptyPayload;
         }
@@ -508,11 +529,18 @@ public sealed class ChatSocketHandler(
         var attachmentIds = send.AttachmentIds.ToList();
         var streamedFileIds = send.StreamedFileIds.ToList();
         var carriesFiles = attachmentIds.Count > 0 || streamedFileIds.Count > 0;
+        var carriesSticker = send.StickerId != 0;
 
-        // Text may be empty, and only then, when the message carries an attachment or a streamed
-        // file instead.
+        // A sticker is a message of its own: no text, no files beside it.
+        if (carriesSticker && (carriesFiles || !string.IsNullOrWhiteSpace(send.Text)))
+        {
+            return NonFatal(connection, ErrorCode.InvalidMessage, StickerAloneDetail);
+        }
+
+        // Text may be empty, and only then, when the message carries an attachment, a streamed
+        // file or a sticker instead.
         if (!Validation.TryNormalizeText(send.Text, out var text)
-            && !(carriesFiles && string.IsNullOrWhiteSpace(send.Text)))
+            && !((carriesFiles || carriesSticker) && string.IsNullOrWhiteSpace(send.Text)))
         {
             return NonFatal(connection, ErrorCode.InvalidMessage, InvalidTextDetail);
         }
@@ -520,6 +548,11 @@ public sealed class ChatSocketHandler(
         if (!registry.Has(userId, channelId, Perm.SendMessages))
         {
             return Denied(connection, Perm.SendMessages);
+        }
+
+        if (carriesSticker && !registry.HasSticker(send.StickerId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownSticker, UnknownStickerDetail);
         }
 
         // A streamed file is attached like any other; the same bit covers both.
@@ -552,6 +585,7 @@ public sealed class ChatSocketHandler(
             send.ReplyToId,
             attachmentIds,
             streamedFileIds,
+            send.StickerId,
             registry.Has(userId, channelId, Perm.MentionEveryone));
         switch (outcome.Status)
         {
@@ -563,6 +597,9 @@ public sealed class ChatSocketHandler(
 
             case AppendOutcome.Kind.InvalidStream:
                 return NonFatal(connection, ErrorCode.InvalidStream, InvalidStreamDetail);
+
+            case AppendOutcome.Kind.UnknownSticker:
+                return NonFatal(connection, ErrorCode.UnknownSticker, UnknownStickerDetail);
         }
 
         registry.BroadcastToChannel(channelId, new ServerFrame { Message = outcome.Message! });
@@ -597,6 +634,9 @@ public sealed class ChatSocketHandler(
             // MANAGE_MESSAGES does not grant editing someone else's text.
             case EditOutcome.Kind.Forbidden:
                 return NonFatal(connection, ErrorCode.Forbidden, "only the author can edit a message");
+
+            case EditOutcome.Kind.StickerMessage:
+                return NonFatal(connection, ErrorCode.InvalidMessage, StickerEditDetail);
         }
 
         registry.BroadcastToChannel(
@@ -885,6 +925,122 @@ public sealed class ChatSocketHandler(
         }
     }
 
+    private bool HandleStartCamera(ClientConnection connection, StartCamera start)
+    {
+        if (!Validation.TryParseChannelId(start.ChannelId, out var channelId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+        }
+
+        switch (registry.StartCamera(connection, channelId))
+        {
+            case StartCameraOutcome.UnknownChannel:
+                return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+
+            case StartCameraOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case StartCameraOutcome.PermissionDenied:
+                return Denied(connection, Perm.Video);
+
+            case StartCameraOutcome.Unavailable:
+                return NonFatal(connection, ErrorCode.CameraUnavailable, "camera video is disabled on this server");
+
+            case StartCameraOutcome.Limit:
+                return NonFatal(connection, ErrorCode.CameraLimit, "this channel already has the maximum number of cameras on");
+
+            case StartCameraOutcome.NotLive:
+                return Dropped(connection, "started a camera");
+
+            // Started: the registry has already queued CameraStarted and CameraWatchers.
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleStopCamera(ClientConnection connection, StopCamera stop)
+    {
+        if (!Validation.TryParseChannelId(stop.ChannelId, out var channelId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+        }
+
+        switch (registry.StopCamera(connection, channelId))
+        {
+            case StopCameraOutcome.UnknownChannel:
+                return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+
+            case StopCameraOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case StopCameraOutcome.NotOnCamera:
+                return NonFatal(connection, ErrorCode.NotOnCamera, "not on camera");
+
+            case StopCameraOutcome.NotLive:
+                return Dropped(connection, "stopped a camera");
+
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleWatchCamera(ClientConnection connection, WatchCamera watch)
+    {
+        if (!Validation.TryParseChannelId(watch.ChannelId, out var channelId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+        }
+
+        switch (registry.WatchCamera(connection, channelId, watch.UserId))
+        {
+            case WatchCameraOutcome.UnknownChannel:
+                return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+
+            case WatchCameraOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case WatchCameraOutcome.NotOnCamera:
+                return NonFatal(connection, ErrorCode.NotOnCamera, "that user is not on camera");
+
+            case WatchCameraOutcome.Forbidden:
+                return NonFatal(connection, ErrorCode.Forbidden, "a camera of your own is never watched over the relay");
+
+            case WatchCameraOutcome.Limit:
+                return NonFatal(connection, ErrorCode.CameraWatchLimit, "you already watch the maximum number of cameras");
+
+            case WatchCameraOutcome.NotLive:
+                return Dropped(connection, "watched a camera");
+
+            // Watching: the registry has already queued CameraWatchState and the owner's
+            // CameraWatchers.
+            default:
+                return true;
+        }
+    }
+
+    private bool HandleUnwatchCamera(ClientConnection connection, UnwatchCamera unwatch)
+    {
+        if (!Validation.TryParseChannelId(unwatch.ChannelId, out var channelId))
+        {
+            return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+        }
+
+        switch (registry.UnwatchCamera(connection, channelId, unwatch.UserId))
+        {
+            case UnwatchCameraOutcome.UnknownChannel:
+                return NonFatal(connection, ErrorCode.UnknownChannel, UnknownChannelDetail);
+
+            case UnwatchCameraOutcome.NotInVoice:
+                return NonFatal(connection, ErrorCode.NotInVoice, NotInVoiceDetail);
+
+            case UnwatchCameraOutcome.NotLive:
+                return Dropped(connection, "unwatched a camera");
+
+            default:
+                return true;
+        }
+    }
+
     private bool HandlePlaySound(ClientConnection connection, PlaySound play)
     {
         if (!Validation.TryParseChannelId(play.ChannelId, out var channelId))
@@ -913,6 +1069,16 @@ public sealed class ChatSocketHandler(
         }
 
         return Answer(connection, await registry.UpdateSoundAsync(connection, update.SoundId, name, Persist));
+    }
+
+    private async Task<bool> HandleUpdateStickerAsync(ClientConnection connection, UpdateSticker update)
+    {
+        if (!Names.TryNormalize(update.Name, out var name))
+        {
+            return NonFatal(connection, ErrorCode.InvalidArgument, "name");
+        }
+
+        return Answer(connection, await registry.UpdateStickerAsync(connection, update.StickerId, name, Persist));
     }
 
     private async Task<bool> HandleCreateChannelAsync(ClientConnection connection, long userId, CreateChannel create)
@@ -1182,6 +1348,7 @@ public sealed class ChatSocketHandler(
         OpStatus.UnknownUser => ErrorCode.UnknownUser,
         OpStatus.UnknownImage => ErrorCode.UnknownImage,
         OpStatus.UnknownSound => ErrorCode.UnknownSound,
+        OpStatus.UnknownSticker => ErrorCode.UnknownSticker,
         OpStatus.NotInVoice => ErrorCode.NotInVoice,
         _ => throw new ArgumentOutOfRangeException(nameof(status), status, "this verdict is answered before it is mapped"),
     };
@@ -1194,7 +1361,7 @@ public sealed class ChatSocketHandler(
     // Every frame that persists a row, which is every frame the registry or MessageService writes
     // for. MarkRead is left out although it moves a cursor: the client debounces it to one call a
     // second per channel, and charging navigation is what the limiter is meant to avoid. Hello,
-    // Ping, the voice and share signalling frames write nothing at all.
+    // Ping and the voice, share and camera signalling frames write nothing at all.
     private static bool IsWrite(ClientFrame.PayloadOneofCase payloadCase) => payloadCase is
         ClientFrame.PayloadOneofCase.Send
         or ClientFrame.PayloadOneofCase.EditMessage
@@ -1226,7 +1393,9 @@ public sealed class ChatSocketHandler(
         or ClientFrame.PayloadOneofCase.PlaySound
         or ClientFrame.PayloadOneofCase.StopSound
         or ClientFrame.PayloadOneofCase.UpdateSound
-        or ClientFrame.PayloadOneofCase.DeleteSound;
+        or ClientFrame.PayloadOneofCase.DeleteSound
+        or ClientFrame.PayloadOneofCase.UpdateSticker
+        or ClientFrame.PayloadOneofCase.DeleteSticker;
 
     // Every frame an unprivileged account can send at will, so they are what a flood would
     // actually come from; the write limiter charges only them. Most management and moderation
@@ -1234,7 +1403,8 @@ public sealed class ChatSocketHandler(
     // BAN_MEMBERS, ...) that only a trusted member holds, and a settings page legitimately fires
     // many of them in one burst — e.g. one SetOverride per switch while editing a role's
     // permissions. The four soundpad frames are charged whatever bit they sit behind: this bucket
-    // is the only spam control the soundpad has, SOUNDPAD being an @everyone default.
+    // is the only spam control the soundpad has, SOUNDPAD being an @everyone default. The two
+    // sticker management frames are charged alongside them, like the soundpad's own.
     private static bool IsRateLimited(ClientFrame.PayloadOneofCase payloadCase) => payloadCase is
         ClientFrame.PayloadOneofCase.Send
         or ClientFrame.PayloadOneofCase.EditMessage
@@ -1244,7 +1414,9 @@ public sealed class ChatSocketHandler(
         or ClientFrame.PayloadOneofCase.PlaySound
         or ClientFrame.PayloadOneofCase.StopSound
         or ClientFrame.PayloadOneofCase.UpdateSound
-        or ClientFrame.PayloadOneofCase.DeleteSound;
+        or ClientFrame.PayloadOneofCase.DeleteSound
+        or ClientFrame.PayloadOneofCase.UpdateSticker
+        or ClientFrame.PayloadOneofCase.DeleteSticker;
 
     // Non-fatal errors ride the same outbox as everything else, so a refusal means the sender
     // itself has fallen behind and the caller closes it as a slow consumer.

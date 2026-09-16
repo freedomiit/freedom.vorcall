@@ -365,6 +365,7 @@ fn compose(main: &mut MainState) -> Result<(), Option<String>> {
                 .iter()
                 .map(|file| file.id)
                 .collect(),
+            sticker_id: None,
         },
     };
 

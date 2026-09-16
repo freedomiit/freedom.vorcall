@@ -4,16 +4,17 @@
 use iced::alignment::Vertical;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
-    Id, Space, button, column, container, image, keyed, progress_bar, row, text, text_editor,
-    tooltip,
+    Id, Space, button, column, container, image, keyed, progress_bar, row, scrollable, text,
+    text_editor, tooltip,
 };
 use iced::{Element, Length, Padding, keyboard};
 use vorcall_core::mentions::{self, PALETTE};
 use vorcall_core::{Attachment, attachments, permissions};
 
-use crate::app::message::{ChatMsg, MenuTarget, Message, UiMsg};
+use crate::app::message::{ChatMsg, MenuTarget, Message, StickerMsg, UiMsg};
 use crate::app::state::chat::{
-    COMPOSER_PALETTE, MESSAGE_MAX_CHARS, Mention, PendingStream, PendingTransfer, TransferKind,
+    COMPOSER_PALETTE, ImageState, MESSAGE_MAX_CHARS, Mention, PendingStream, PendingTransfer,
+    TransferKind,
 };
 use crate::app::state::rules::{
     MentionCandidate, format_bytes, mention_candidates, plain_text, progress_fraction,
@@ -38,6 +39,11 @@ const EXCERPT_MAX: usize = 60;
 const THUMB: f32 = 40.0;
 /// How wide the route chevron is: no text of its own, only the handle.
 const ROUTES_WIDTH: f32 = 22.0;
+/// The sticker picker's grid: how many to a row, how large each one is drawn,
+/// and how tall the whole of it grows before it scrolls.
+const PICKER_COLUMNS: usize = 6;
+const PICKER_THUMB: f32 = 56.0;
+const PICKER_HEIGHT: f32 = 220.0;
 /// The bar on a chip whose file is still going up.
 const CHIP_BAR_LENGTH: f32 = 72.0;
 const CHIP_BAR_GIRTH: f32 = 4.0;
@@ -58,6 +64,7 @@ enum Slot {
     Warning,
     Strip,
     Palette,
+    Stickers,
     Input,
     Footer,
 }
@@ -83,6 +90,9 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let attachment_strip = (composer.slots_used() > 0).then(|| strip(app, main, metrics));
     let palette =
         (main.chat.reacting == Some(COMPOSER_PALETTE)).then(|| emoji_palette(app, metrics));
+    // Gated on the same permission the send path is: a channel this account may
+    // not write in offers no stickers either.
+    let stickers = (can_send && main.sticker.picker_open).then(|| sticker_picker(app, main));
 
     let panel = keyed::Column::new()
         .spacing(6)
@@ -96,6 +106,7 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
         )
         .push_maybe(Slot::Strip, attachment_strip)
         .push_maybe(Slot::Palette, palette)
+        .push_maybe(Slot::Stickers, stickers)
         .push(
             Slot::Input,
             input(app, main, can_send, can_attach, mention_open, metrics),
@@ -177,6 +188,14 @@ fn input<'a>(
         tokens,
     );
 
+    let picker_open = main.sticker.picker_open;
+    let stickers = widgets::icon_button(
+        Icon::Star,
+        if picker_open { "Close" } else { "Stickers" },
+        can_send.then_some(Message::Sticker(StickerMsg::TogglePicker)),
+        tokens,
+    );
+
     let mut box_row = row![widgets::icon_button(
         Icon::Paperclip,
         attach_tip,
@@ -193,7 +212,8 @@ fn input<'a>(
     let box_row = box_row
         .push(editor)
         .push(counter(app, main, metrics))
-        .push(emoji);
+        .push(emoji)
+        .push(stickers);
 
     container(box_row)
         .width(Length::Fill)
@@ -285,6 +305,81 @@ fn emoji_palette<'a>(app: &'a App, metrics: Metrics) -> Element<'a, Message> {
         .padding(6)
         .style(styles::container::popover(tokens))
         .into()
+}
+
+/// The library as a grid of thumbnails, each one a message of its own. It stays
+/// open until it is closed or one is sent, like the emoji palette beside it.
+///
+/// The pictures come from the window's own image cache, asked for when the
+/// picker was opened; a thumbnail still on its way leaves its cell blank rather
+/// than moving the grid once it lands.
+fn sticker_picker<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let stickers = main.sticker.ordered();
+
+    let mut grid = column![].spacing(6).width(Length::Fill);
+    if stickers.is_empty() {
+        grid = grid.push(
+            text("No stickers yet")
+                .size(TEXT_SECONDARY)
+                .color(tokens.text_muted),
+        );
+    }
+    for chunk in stickers.chunks(PICKER_COLUMNS) {
+        let mut line = row![].spacing(6).align_y(Vertical::Center);
+        for sticker in chunk {
+            let key = ImageKey::Sticker(sticker.id);
+            let face: Element<'_, Message> = match main.chat.images.get(&key) {
+                Some(ImageState::Ready(handle)) => image(handle.clone())
+                    .content_fit(iced::ContentFit::Contain)
+                    .width(PICKER_THUMB)
+                    .height(PICKER_THUMB)
+                    .into(),
+                _ => Space::new().width(PICKER_THUMB).height(PICKER_THUMB).into(),
+            };
+            line = line.push(widgets::tooltip_of(
+                button(face)
+                    .padding(4.0)
+                    .style(styles::button::icon(tokens))
+                    .on_press(Message::Sticker(StickerMsg::Send(sticker.id))),
+                &sticker.name,
+                tooltip::Position::Top,
+                tokens,
+            ));
+        }
+        grid = grid.push(line);
+    }
+
+    let head = row![
+        text("Stickers")
+            .size(TEXT_SECONDARY)
+            .color(tokens.text_secondary),
+        Space::new().width(Length::Fill),
+        widgets::icon_button_in(
+            Icon::Close,
+            "Close",
+            Some(Message::Sticker(StickerMsg::ClosePicker)),
+            tokens.text_secondary,
+            widgets::ICON_MARK,
+            tokens,
+        ),
+    ]
+    .align_y(Vertical::Center);
+
+    container(
+        column![
+            head,
+            scrollable(grid)
+                .height(Length::Shrink)
+                .style(styles::scrollable(tokens)),
+        ]
+        .spacing(6),
+    )
+    .width(Length::Fill)
+    .max_height(PICKER_HEIGHT)
+    .padding(6)
+    .style(styles::container::popover(tokens))
+    .into()
 }
 
 /// Enter sends; Shift+Enter breaks the line; Escape unwinds a reply or an edit;

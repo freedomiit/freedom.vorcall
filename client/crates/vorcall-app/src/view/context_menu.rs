@@ -17,7 +17,7 @@ use vorcall_core::permissions;
 use vorcall_core::{ChannelKind, ChatMessage, VoiceMember};
 
 use crate::app::message::{
-    ChannelsMsg, ChatMsg, MenuTarget, Message, SettingsMsg, ShareMsg, UiMsg, VoiceMsg,
+    CameraMsg, ChannelsMsg, ChatMsg, MenuTarget, Message, SettingsMsg, ShareMsg, UiMsg, VoiceMsg,
 };
 use crate::app::state::rules::SENDER_OFFLINE;
 use crate::app::state::server::{ServerModel, channel_kind};
@@ -573,6 +573,34 @@ fn voice_items(main: &MainState, channel_id: i64, user_id: i64, reachable: bool)
                     ShareMsg::StopWatching
                 } else {
                     ShareMsg::Watch(user_id)
+                })),
+            )
+            .needs(joined, NOT_IN_CHANNEL),
+        ));
+    }
+
+    // The same for their camera, which runs beside a share rather than instead
+    // of one, so both entries can stand together.
+    let on_camera = main
+        .voice
+        .rosters
+        .get(&channel_id)
+        .is_some_and(|roster| roster.on_camera(user_id));
+    if on_camera && user_id != main.member_id {
+        let watching = main.voice.cameras.tiles.contains_key(&user_id);
+        let joined = main.voice.is_live() && main.voice.channel_id == channel_id;
+        entries.push(Entry::item(
+            Item::new(
+                if watching {
+                    "Stop watching camera"
+                } else {
+                    "Watch camera"
+                },
+                Icon::Image,
+                perform(Message::Camera(if watching {
+                    CameraMsg::StopWatching(user_id)
+                } else {
+                    CameraMsg::Watch(user_id)
                 })),
             )
             .needs(joined, NOT_IN_CHANNEL),

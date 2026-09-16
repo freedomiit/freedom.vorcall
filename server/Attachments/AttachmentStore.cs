@@ -80,15 +80,16 @@ public sealed class AttachmentStore(
     // a row is exactly what says which of the two a file could be under.
     public string PathFor(long id, string contentType) => ExistingPathFor(id, contentType);
 
-    // Images and soundpad clips share this quota (Vorcall:AttachmentsMaxBytes), so all three
-    // tables count towards it.
+    // Images, soundpad clips and stickers share this quota (Vorcall:AttachmentsMaxBytes), so all
+    // four tables count towards it.
     public async Task<long> TotalBytesAsync()
     {
         await using var db = await contexts.CreateDbContextAsync();
         var attachments = await db.Attachments.SumAsync(a => (long?)a.Size) ?? 0;
         var images = await db.Images.SumAsync(i => (long?)i.Size) ?? 0;
         var sounds = await db.Sounds.SumAsync(s => (long?)s.Size) ?? 0;
-        return attachments + images + sounds;
+        var stickers = await db.Stickers.SumAsync(s => (long?)s.Size) ?? 0;
+        return attachments + images + sounds + stickers;
     }
 
     public async Task<StoreOutcome> StoreAsync(

@@ -400,20 +400,26 @@ impl ChatState {
         true
     }
 
-    /// Every attachment of one channel that is drawn inline, which is what
-    /// opening it fetches. Gated by [`is_inline_preview`]: the rest are file
-    /// cards and cost nothing until they are asked for.
+    /// Every picture of one channel that is drawn inline, which is what opening
+    /// it fetches: the attachments [`is_inline_preview`] admits — the rest are
+    /// file cards and cost nothing until they are asked for — and the sticker of
+    /// every sticker message, which is a megabyte at most and is always drawn.
     pub fn image_keys(&self, channel_id: i64) -> Vec<ImageKey> {
         let Some(channel) = self.channels.get(&channel_id) else {
             return Vec::new();
         };
-        channel
+        let attachments = channel
             .messages
             .values()
             .flat_map(|message| message.attachments.iter())
             .filter(|attachment| is_inline_preview(attachment))
-            .map(|attachment| ImageKey::Attachment(attachment.id))
-            .collect()
+            .map(|attachment| ImageKey::Attachment(attachment.id));
+        let stickers = channel
+            .messages
+            .values()
+            .filter(|message| message.sticker && message.sticker_id != 0)
+            .map(|message| ImageKey::Sticker(message.sticker_id));
+        attachments.chain(stickers).collect()
     }
 
     /// Whether this account already reacted to one message with that emoji,

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Vorcall.Server.Voice;
 
 namespace Vorcall.Server.Tests;
@@ -84,7 +85,17 @@ public class VoiceSessionTests
     }
 
     private static VoiceSession NewSession()
-        => new(ssrc: 7, userId: 11, channelId: 13, key: new byte[VoiceSession.KeyBytes], shareMaxKbps: 2000);
+        => new(ssrc: 7, userId: 11, channelId: 13, key: new byte[VoiceSession.KeyBytes], options: Options());
+
+    // A session takes the relay's whole options now that it holds a budget per media stream, and
+    // those are only ever parsed from configuration; the share rate is the one this suite has
+    // always given a session, and every other ceiling keeps its default. Nothing here spends a
+    // byte budget: the subject is the AEAD pair.
+    private static VoiceOptions Options()
+        => VoiceOptions.FromConfiguration(
+            new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?> { ["Vorcall:ShareMaxKbps"] = "2000" })
+                .Build());
 
     private static byte[] Payload() => "twenty milliseconds of Opus"u8.ToArray();
 

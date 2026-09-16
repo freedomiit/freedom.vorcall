@@ -1,5 +1,9 @@
-//! Screen-share video on the media socket: one encoded access unit split over
-//! as many datagrams as it takes, and put back together on the other side.
+//! Video on the media socket: one encoded access unit split over as many
+//! datagrams as it takes, and put back together on the other side.
+//!
+//! A screen share and a camera are framed identically and differ only in the
+//! packet type that carries them, so everything here serves both; the streams
+//! stay apart because each has a [`Depacketizer`] of its own.
 //!
 //! Each fragment's plaintext is a 9-byte header followed by its slice of the
 //! access unit, big-endian:
@@ -161,8 +165,8 @@ struct Pending {
     bytes: usize,
 }
 
-/// Reassembles one sharer's video stream. One per watched ssrc: a new sharer
-/// gets a new depacketizer rather than this one's history.
+/// Reassembles one video stream. One per watched ssrc and per stream kind: a
+/// new sharer or camera gets a new depacketizer rather than this one's history.
 pub struct Depacketizer {
     pending: Vec<Pending>,
     /// The newest frame id that has been decided on, delivered or dropped.

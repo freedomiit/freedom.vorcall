@@ -75,6 +75,55 @@ public enum UnwatchShareOutcome
     Unwatched,
 }
 
+public enum StartCameraOutcome
+{
+    UnknownChannel,
+    NotInVoice,
+    PermissionDenied,
+
+    // Cameras are switched off on this server, or the relay never came up.
+    Unavailable,
+
+    // The channel already holds as many cameras as the relay allows.
+    Limit,
+    NotLive,
+    Started,
+}
+
+public enum StopCameraOutcome
+{
+    UnknownChannel,
+    NotInVoice,
+    NotOnCamera,
+    NotLive,
+    Stopped,
+}
+
+public enum WatchCameraOutcome
+{
+    UnknownChannel,
+    NotInVoice,
+
+    // The target is not in the channel or has no camera on.
+    NotOnCamera,
+
+    // The target is the caller itself.
+    Forbidden,
+
+    // The caller already watches as many cameras as the relay allows.
+    Limit,
+    NotLive,
+    Watching,
+}
+
+public enum UnwatchCameraOutcome
+{
+    UnknownChannel,
+    NotInVoice,
+    NotLive,
+    Unwatched,
+}
+
 public enum VoiceSelfStateOutcome
 {
     UnknownChannel,
@@ -96,15 +145,17 @@ public enum SendToOutcome
     Sent,
 }
 
-// Everything a scrape wants to know about the presence model, read in one pass so the six
-// figures describe the same moment rather than six different ones.
+// Everything a scrape wants to know about the presence model, read in one pass so the figures
+// describe the same moment rather than one moment each.
 public readonly record struct RegistrySnapshot(
     int Connections,
     int OnlineUsers,
     int Channels,
     int VoiceSessions,
     int Sharers,
-    int Watchers);
+    int Watchers,
+    int Cameras,
+    int CameraWatchers);
 
 // What a caller outside the registry needs to know about one channel without reaching into the
 // model: its kind, where it sits, and a DM's two members.
@@ -145,7 +196,8 @@ public sealed partial class ConnectionRegistry
         | (ulong)Perm.AddReactions
         | (ulong)Perm.Connect
         | (ulong)Perm.Speak
-        | (ulong)Perm.ShareScreen;
+        | (ulong)Perm.ShareScreen
+        | (ulong)Perm.Video;
 
     private readonly Lock _gate = new();
 
@@ -162,6 +214,9 @@ public sealed partial class ConnectionRegistry
     // channel there is nothing to resolve per reader.
     private readonly Dictionary<long, SoundRecord> _soundById = [];
 
+    // The sticker library, server-wide and unfiltered the same way.
+    private readonly Dictionary<long, StickerRecord> _stickerById = [];
+
     // Every account that is not banned, online or not.
     private readonly Dictionary<long, MemberState> _memberById = [];
 
@@ -175,6 +230,7 @@ public sealed partial class ConnectionRegistry
     private readonly VoiceRelay _relay;
     private readonly StreamRegistry _streams;
     private readonly SoundStore _sounds;
+    private readonly StickerStore _stickers;
     private readonly ILogger<ConnectionRegistry> _logger;
 
     private long _everyoneRoleId;
@@ -191,6 +247,7 @@ public sealed partial class ConnectionRegistry
         VoiceRelay relay,
         StreamRegistry streams,
         SoundStore sounds,
+        StickerStore stickers,
         ILogger<ConnectionRegistry> logger)
     {
         _channels = channels;
@@ -200,6 +257,7 @@ public sealed partial class ConnectionRegistry
         _relay = relay;
         _streams = streams;
         _sounds = sounds;
+        _stickers = stickers;
         _logger = logger;
         _relay.SpeakingChanged += OnSpeakingChanged;
     }
@@ -248,6 +306,8 @@ public sealed partial class ConnectionRegistry
             var voiceSessions = 0;
             var sharers = 0;
             var watchers = 0;
+            var cameras = 0;
+            var cameraWatchers = 0;
 
             foreach (var channel in _channelById.Values)
             {
@@ -263,6 +323,15 @@ public sealed partial class ConnectionRegistry
                     {
                         watchers++;
                     }
+
+                    if (slot.Camera)
+                    {
+                        cameras++;
+                    }
+
+                    // One viewer of four cameras counts four times: the figure is cameras
+                    // received, which is what the relay's fan-out costs.
+                    cameraWatchers += slot.WatchingCameras.Count;
                 }
             }
 
@@ -272,7 +341,9 @@ public sealed partial class ConnectionRegistry
                 _channelById.Count,
                 voiceSessions,
                 sharers,
-                watchers);
+                watchers,
+                cameras,
+                cameraWatchers);
         }
     }
 
@@ -291,6 +362,7 @@ public sealed partial class ConnectionRegistry
         var (categories, channels, overrides) = await _channels.LoadAllAsync(ct);
         var members = await _members.LoadAllAsync(ct);
         var sounds = await _sounds.ListAsync(ct);
+        var stickers = await _stickers.ListAsync(ct);
 
         int roleCount;
         int categoryCount;
@@ -386,6 +458,12 @@ public sealed partial class ConnectionRegistry
                 _soundById[sound.Id] = sound;
             }
 
+            _stickerById.Clear();
+            foreach (var sticker in stickers)
+            {
+                _stickerById[sticker.Id] = sticker;
+            }
+
             roleCount = _roleById.Count;
             categoryCount = _categories.Count;
             channelCount = _channelById.Count;
@@ -445,6 +523,15 @@ public sealed partial class ConnectionRegistry
 
             var record = channel.Record;
             return new ChannelInfo(record.Id, record.Kind, record.Name, record.CategoryId, record.DmLow, record.DmHigh);
+        }
+    }
+
+    // Whether a SendMessage may name this sticker: the mirror holds complete rows only.
+    public bool HasSticker(long stickerId)
+    {
+        lock (_gate)
+        {
+            return _stickerById.ContainsKey(stickerId);
         }
     }
 
@@ -1101,6 +1188,229 @@ public sealed partial class ConnectionRegistry
         return UnwatchShareOutcome.Unwatched;
     }
 
+    // A camera rides an existing voice session exactly as a share does, and independently of one:
+    // the same member may share a screen and be on camera at once. Repeating StartCamera is how a
+    // client re-announces a camera it is already running, which is why it neither counts against
+    // the channel's ceiling nor restarts anything on the relay.
+    public StartCameraOutcome StartCamera(ClientConnection connection, long channelId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return StartCameraOutcome.NotLive;
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId) || !_memberById.TryGetValue(userId, out var member))
+            {
+                return StartCameraOutcome.NotLive;
+            }
+
+            if (!VisibleLocked(member, channelId, out var channel))
+            {
+                return StartCameraOutcome.UnknownChannel;
+            }
+
+            if (!channel.Voice.TryGetValue(userId, out var slot))
+            {
+                return StartCameraOutcome.NotInVoice;
+            }
+
+            if (!Perms.Has(ResolveLocked(member, channel), Perm.Video))
+            {
+                return StartCameraOutcome.PermissionDenied;
+            }
+
+            if (!_relay.CameraEnabled)
+            {
+                return StartCameraOutcome.Unavailable;
+            }
+
+            if (!slot.Camera && channel.Voice.Values.Count(other => other.Camera) >= _relay.MaxCamerasPerRoom)
+            {
+                return StartCameraOutcome.Limit;
+            }
+
+            slot.Camera = true;
+
+            // SetCamera takes the relay's own lock and calls nothing back into here.
+            _relay.SetCamera(slot.Session.Ssrc, true);
+
+            BroadcastToChannelLocked(
+                channel,
+                new ServerFrame { CameraStarted = new CameraStarted { ChannelId = channelId, UserId = userId } },
+                except: null,
+                ref slow);
+
+            // Watchers of a camera that was already running keep their watch, so the count
+            // answered here is the real one rather than zero.
+            Enqueue(connection, CameraWatchersOf(channel, userId), ref slow);
+        }
+
+        CloseSlow(slow);
+        return StartCameraOutcome.Started;
+    }
+
+    public StopCameraOutcome StopCamera(ClientConnection connection, long channelId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return StopCameraOutcome.NotLive;
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId) || !_memberById.TryGetValue(userId, out var member))
+            {
+                return StopCameraOutcome.NotLive;
+            }
+
+            if (!VisibleLocked(member, channelId, out var channel))
+            {
+                return StopCameraOutcome.UnknownChannel;
+            }
+
+            if (!channel.Voice.TryGetValue(userId, out var slot))
+            {
+                return StopCameraOutcome.NotInVoice;
+            }
+
+            if (!slot.Camera)
+            {
+                return StopCameraOutcome.NotOnCamera;
+            }
+
+            StopCameraLocked(channel, userId, slot, ref slow);
+        }
+
+        CloseSlow(slow);
+        return StopCameraOutcome.Stopped;
+    }
+
+    // A viewer watches up to MaxWatchedCameras at once, so this adds to a set rather than
+    // replacing one: the camera it joins gains a watcher and hears about it.
+    public WatchCameraOutcome WatchCamera(ClientConnection connection, long channelId, long targetUserId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return WatchCameraOutcome.NotLive;
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId) || !_memberById.TryGetValue(userId, out var member))
+            {
+                return WatchCameraOutcome.NotLive;
+            }
+
+            if (!VisibleLocked(member, channelId, out var channel))
+            {
+                return WatchCameraOutcome.UnknownChannel;
+            }
+
+            if (!channel.Voice.TryGetValue(userId, out var viewer))
+            {
+                return WatchCameraOutcome.NotInVoice;
+            }
+
+            // A client draws its own camera from its own capture, so watching it over the relay is
+            // refused rather than quietly accepted.
+            if (targetUserId == userId)
+            {
+                return WatchCameraOutcome.Forbidden;
+            }
+
+            if (!channel.Voice.TryGetValue(targetUserId, out var target) || !target.Camera)
+            {
+                return WatchCameraOutcome.NotOnCamera;
+            }
+
+            if (viewer.WatchingCameras.Contains(targetUserId))
+            {
+                // Idempotent: nothing changed, so only the viewer's own answer is repeated and the
+                // camera's owner is not told its count again.
+                Enqueue(connection, CameraWatchStateOf(channel, viewer), ref slow);
+            }
+            else
+            {
+                if (viewer.WatchingCameras.Count >= _relay.MaxWatchedCameras)
+                {
+                    return WatchCameraOutcome.Limit;
+                }
+
+                viewer.WatchingCameras.Add(targetUserId);
+                _relay.WatchCamera(viewer.Session.Ssrc, target.Session.Ssrc, watch: true);
+                Enqueue(connection, CameraWatchStateOf(channel, viewer), ref slow);
+                Enqueue(target.Connection, CameraWatchersOf(channel, targetUserId), ref slow);
+            }
+        }
+
+        CloseSlow(slow);
+        return WatchCameraOutcome.Watching;
+    }
+
+    // targetUserId 0 drops every camera the caller watches; anything else drops that one. Either
+    // way the caller is answered with the set it holds afterwards.
+    public UnwatchCameraOutcome UnwatchCamera(ClientConnection connection, long channelId, long targetUserId)
+    {
+        if (connection.UserId is not { } userId)
+        {
+            return UnwatchCameraOutcome.NotLive;
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (!IsLive(connection, userId) || !_memberById.TryGetValue(userId, out var member))
+            {
+                return UnwatchCameraOutcome.NotLive;
+            }
+
+            if (!VisibleLocked(member, channelId, out var channel))
+            {
+                return UnwatchCameraOutcome.UnknownChannel;
+            }
+
+            if (!channel.Voice.TryGetValue(userId, out var viewer))
+            {
+                return UnwatchCameraOutcome.NotInVoice;
+            }
+
+            var dropped = new List<long>();
+            if (targetUserId == 0)
+            {
+                dropped.AddRange(viewer.WatchingCameras);
+            }
+            else if (viewer.WatchingCameras.Contains(targetUserId))
+            {
+                dropped.Add(targetUserId);
+            }
+
+            // Cleared before the counts are read, so every owner hears the figure that is true
+            // after this viewer left it.
+            viewer.WatchingCameras.ExceptWith(dropped);
+
+            foreach (var ownerId in dropped)
+            {
+                if (channel.Voice.TryGetValue(ownerId, out var owner))
+                {
+                    _relay.WatchCamera(viewer.Session.Ssrc, owner.Session.Ssrc, watch: false);
+                    Enqueue(owner.Connection, CameraWatchersOf(channel, ownerId), ref slow);
+                }
+            }
+
+            // Answered even when nothing was being watched, so a client that believed otherwise is
+            // corrected either way.
+            Enqueue(connection, CameraWatchStateOf(channel, viewer), ref slow);
+        }
+
+        CloseSlow(slow);
+        return UnwatchCameraOutcome.Unwatched;
+    }
+
     // Re-resolves visibility, voice CONNECT and the three voice flags after a permission change and
     // queues the resulting deltas. channelIds null is every channel, userIds null every online
     // member.
@@ -1360,6 +1670,25 @@ public sealed partial class ConnectionRegistry
             }
         }
 
+        // The camera graph goes the same way, and just as independently of the share.
+        if (slot.Camera)
+        {
+            StopCameraLocked(channel, userId, slot, ref slow);
+        }
+
+        if (slot.WatchingCameras.Count > 0)
+        {
+            var watchedCameras = slot.WatchingCameras.ToList();
+            slot.WatchingCameras.Clear();
+            foreach (var ownerId in watchedCameras)
+            {
+                if (channel.Voice.TryGetValue(ownerId, out var owner))
+                {
+                    Enqueue(owner.Connection, CameraWatchersOf(channel, ownerId), ref slow);
+                }
+            }
+        }
+
         channel.Voice.Remove(userId);
         removed.Add(slot.Session.Ssrc);
 
@@ -1426,6 +1755,29 @@ public sealed partial class ConnectionRegistry
         BroadcastToChannelLocked(
             channel,
             new ServerFrame { ShareStopped = new ShareStopped { ChannelId = channel.Record.Id, UserId = userId } },
+            except: null,
+            ref slow);
+    }
+
+    // Ends a camera and tells everyone it concerns, exactly as StopShareLocked does for a share.
+    // The relay drops its own watcher list with the flag, so no viewer has to be detached there one
+    // at a time.
+    private void StopCameraLocked(ChannelState channel, long userId, VoiceSlot slot, ref List<ClientConnection>? slow)
+    {
+        slot.Camera = false;
+
+        foreach (var (watcherId, watcher) in channel.Voice)
+        {
+            if (watcherId != userId && watcher.WatchingCameras.Remove(userId))
+            {
+                Enqueue(watcher.Connection, CameraWatchStateOf(channel, watcher), ref slow);
+            }
+        }
+
+        _relay.SetCamera(slot.Session.Ssrc, false);
+        BroadcastToChannelLocked(
+            channel,
+            new ServerFrame { CameraStopped = new CameraStopped { ChannelId = channel.Record.Id, UserId = userId } },
             except: null,
             ref slow);
     }
@@ -1612,6 +1964,11 @@ public sealed partial class ConnectionRegistry
             snapshot.Sounds.Add(SoundOf(sound));
         }
 
+        foreach (var sticker in _stickerById.Values.OrderBy(sticker => sticker.Id))
+        {
+            snapshot.Stickers.Add(StickerOf(sticker));
+        }
+
         return new ServerFrame { ServerSnapshot = snapshot };
     }
 
@@ -1647,6 +2004,16 @@ public sealed partial class ConnectionRegistry
             UploaderId = sound.UploaderId ?? 0,
             DurationMs = (uint)sound.DurationMs,
             Size = sound.Size,
+        };
+
+    private static Protocol.Sticker StickerOf(StickerRecord sticker)
+        => new()
+        {
+            Id = sticker.Id,
+            Name = sticker.Name,
+            UploaderId = sticker.UploaderId ?? 0,
+            ContentType = sticker.ContentType,
+            Size = sticker.Size,
         };
 
     private static Protocol.Category CategoryOf(CategoryRecord category)
@@ -1753,6 +2120,7 @@ public sealed partial class ConnectionRegistry
             Ssrc = slot.Session.Ssrc,
             Sharing = slot.Sharing,
             ShareAudio = slot.ShareAudio,
+            Camera = slot.Camera,
             ServerMuted = slot.Muted,
             ServerDeafened = slot.Deafened,
             Priority = slot.Priority,
@@ -1786,6 +2154,25 @@ public sealed partial class ConnectionRegistry
             {
                 ChannelId = channel.Record.Id,
                 Count = (uint)channel.Voice.Values.Count(slot => slot.Watching == sharerUserId),
+            },
+        };
+
+    // The whole set the viewer watches now, ascending: a client replaces its own set with it
+    // rather than patching one camera at a time.
+    private static ServerFrame CameraWatchStateOf(ChannelState channel, VoiceSlot viewer)
+    {
+        var state = new CameraWatchState { ChannelId = channel.Record.Id };
+        state.UserIds.AddRange(viewer.WatchingCameras.Order());
+        return new ServerFrame { CameraWatchState = state };
+    }
+
+    private static ServerFrame CameraWatchersOf(ChannelState channel, long ownerUserId)
+        => new()
+        {
+            CameraWatchers = new CameraWatchers
+            {
+                ChannelId = channel.Record.Id,
+                Count = (uint)channel.Voice.Values.Count(slot => slot.WatchingCameras.Contains(ownerUserId)),
             },
         };
 
@@ -1936,9 +2323,17 @@ public sealed partial class ConnectionRegistry
 
         public bool ShareAudio { get; set; }
 
+        // Whether this session's camera is on, which no share of its own ever touches: the two run
+        // side by side.
+        public bool Camera { get; set; }
+
         // The sharer this session is watching, if any. A viewer watches at most one share, and only
         // inside its own channel.
         public long? Watching { get; set; }
+
+        // The cameras this session watches, by user id, at most VoiceOptions.MaxWatchedCameras of
+        // them and only inside its own channel.
+        public HashSet<long> WatchingCameras { get; } = [];
 
         // The three moderation flags as last applied to the relay, which is what decides whether a
         // re-resolution has anything to tell it.

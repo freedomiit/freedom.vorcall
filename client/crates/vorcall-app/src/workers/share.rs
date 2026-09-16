@@ -1,4 +1,5 @@
-//! The two worker threads a screen share needs, both away from the interface.
+//! The worker threads a screen share needs, all of them away from the
+//! interface.
 //!
 //! The sharer's pipeline is one thread: the capture backend hands it frames
 //! and, where the platform can, this machine's own playout. It keeps nothing
@@ -8,6 +9,11 @@
 //! interleaved stereo, cancelled against what Vorcall itself played (a loopback
 //! capture carries the room's own voices straight back out otherwise) and sent
 //! as 20 ms Opus frames.
+//!
+//! That audio has a thread of its own, and the capture's events are split
+//! between the two the moment they arrive: a picture waits for the encoder,
+//! which spends tens of milliseconds on a frame and more on a keyframe, and
+//! audio waiting behind it is audio the watcher hears stutter.
 //!
 //! Opening the capture is a thread of its own, and a short-lived one: the
 //! portal's picker keeps it for as long as the user takes to answer it, and a
@@ -24,26 +30,29 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use futures::channel::mpsc as async_mpsc;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Async, FixedAsync, Resampler as _, SincInterpolationParameters};
 use tokio::sync::mpsc::UnboundedReceiver;
-use vorcall_screen::codec::{EncoderSettings, Picture, VideoDecoder, VideoEncoder};
+use vorcall_screen::codec::{Picture, VideoDecoder};
 use vorcall_screen::preset::Preset;
-use vorcall_screen::scale::scale_bgra;
 use vorcall_screen::{
     AudioChunk, AudioMode, CaptureEvent, CaptureRequest, Capturer, Unavailable, VideoFrame,
 };
 use vorcall_voice::cleanup::FAR_END_MAX_SAMPLES;
 use vorcall_voice::{
-    AccessUnit, FrameSender, SAMPLE_RATE, STEREO_FRAME_SAMPLES, ShareCleanup, StereoEncoder,
+    AccessUnit, FRAME_MS, FrameSender, SAMPLE_RATE, STEREO_FRAME_SAMPLES, ShareCleanup,
+    StereoEncoder,
 };
 
+use crate::workers::video::{STATS_INTERVAL, Track, VideoTrack};
 use crate::workers::voice::Throttle;
 use crate::workers::{Mailbox, lock};
 
@@ -55,18 +64,17 @@ const TICK: Duration = Duration::from_millis(5);
 /// and to report.
 const DECODE_TICK: Duration = Duration::from_millis(100);
 
-/// A gap at least this long ends a talk spurt, so the next frame sent is marked
-/// as the start of a new one.
-const SPURT_GAP: Duration = Duration::from_millis(200);
+/// How long the share-audio thread waits for a chunk before looking at the
+/// far-end reference again. It works when work arrives, so this is only what
+/// keeps the canceller's reference moving through a quiet capture.
+const AUDIO_WAIT: Duration = Duration::from_millis(20);
 
-const STATS_INTERVAL: Duration = Duration::from_secs(1);
+/// A stretch this long with no whole frame to send is a gap in the capture: the
+/// next frame goes out marked, and the clock skips the silence.
+const SPURT_GAP: Duration = Duration::from_millis(200);
 
 /// Opus at 96 kbit/s over 20 ms stereo frames never comes near this.
 const MAX_PACKET: usize = 1024;
-
-/// However many cores the machine has, never more slice threads than this: the
-/// rest of the client needs the processor too.
-const MAX_ENCODER_THREADS: usize = 8;
 
 /// Interleaved stereo, everywhere below.
 const CHANNELS: usize = 2;
@@ -113,6 +121,9 @@ pub struct ShareStats {
     pub dropped_frames: u64,
     pub skipped_frames: u64,
     pub audio_frames: u64,
+    /// Blocks of share audio the echo canceller produced nothing for, which
+    /// went out as they were captured.
+    pub audio_passed_through: u64,
     /// Datagrams the socket gave up on over the last window, retries included:
     /// a share that keeps losing fragments is one the watchers see freeze.
     pub send_failures: u64,
@@ -263,7 +274,7 @@ impl ShareThread {
                 // A capture still opening needs nothing: the first unit its
                 // pipeline encodes is a keyframe anyway.
                 if let Some(pipeline) = self.pipeline.as_mut() {
-                    pipeline.keyframe_pending = true;
+                    pipeline.video.force_keyframe();
                 }
             }
             ShareCommand::Stop => {
@@ -298,7 +309,7 @@ impl ShareThread {
     /// the app asked for while it was opening.
     fn start_pipeline(&mut self, capturer: Capturer, starting: Starting) {
         let paused = starting.paused;
-        let mut pipeline = Pipeline::new(
+        let built = Pipeline::new(
             self.events.clone(),
             capturer,
             starting.frames,
@@ -306,6 +317,15 @@ impl ShareThread {
             starting.sender,
             starting.share_far_end,
         );
+        let mut pipeline = match built {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                self.emit(ShareEvent::Failed(format!(
+                    "cannot start the capture: {error}"
+                )));
+                return;
+            }
+        };
         if let Some(paused) = paused {
             pipeline.set_paused(paused);
         }
@@ -329,108 +349,75 @@ impl ShareThread {
 }
 
 /// Everything one running share owns. Built on `Start`, dropped whole on `Stop`
-/// or when the capture ends; `!Send`, because [`ShareCleanup`] is.
+/// or when the capture ends, which stops the capture and joins the share-audio
+/// thread with it.
 struct Pipeline {
     events: async_mpsc::UnboundedSender<ShareEvent>,
     /// Only held so the capture keeps running: it stops the moment it is
     /// dropped, which must happen on this thread.
     capturer: Capturer,
+    /// Everything the capture produced except its audio, which the splitter
+    /// hands straight to the share-audio thread.
     frames: async_mpsc::UnboundedReceiver<CaptureEvent>,
-    preset: Preset,
     sender: FrameSender,
     share_far_end: Arc<Mutex<VecDeque<f32>>>,
 
-    /// `None` until the backend has said what it captures.
-    encoder: Option<VideoEncoder>,
-    /// The capture size the encoder was built for; a frame of any other size
-    /// rebuilds it.
-    source: Option<(u32, u32)>,
-    output: (u32, u32),
-    /// The newest captured frame, replaced rather than queued.
-    latest: Option<VideoFrame>,
-    /// Whether `latest` is a frame the encoder has not seen.
-    fresh: bool,
-    frame_id: u32,
-    keyframe_pending: bool,
-    next_encode: Instant,
+    /// The picture on its way out: the encoder, the frame waiting for it and the
+    /// counters, all shared with the camera's pipeline.
+    video: VideoTrack,
     /// No watchers, so nothing is encoded and no audio is sent. True until the
     /// server has accepted the share and named one: a frame put on the wire
     /// before that is a datagram the relay drops as not sharing.
     paused: bool,
 
-    audio: Option<ShareAudio>,
-
-    unit: Vec<u8>,
-    scaled: Vec<u8>,
-    far_end_scratch: Vec<f32>,
-
-    counters: Counters,
-    /// The counters as of the last [`ShareEvent::Stats`], for the two rates.
-    window: Counters,
-    /// The engine's own send-failure total as of that same report; it counts
-    /// the whole session, so only the difference belongs to this share.
-    last_send_failures: u64,
-    stats_at: Instant,
-    warning: Throttle,
+    /// The share-audio thread, once the backend has said there is audio to
+    /// send. Its end of the channel waits here until then.
+    audio: Option<AudioThread>,
+    audio_channel: Option<(Sender<AudioMessage>, Receiver<AudioMessage>)>,
+    audio_counters: Arc<AudioCounters>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Counters {
-    captured: u64,
-    encoded: u64,
-    /// Everything handed to the socket, video and share audio alike.
-    bytes: u64,
-    keyframes: u64,
-    keyframe_requests: u64,
-    dropped: u64,
-    skipped: u64,
-    audio_frames: u64,
+/// What the share-audio thread has done, for the pipeline's report.
+#[derive(Default)]
+struct AudioCounters {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    passed_through: AtomicU64,
 }
 
 impl Pipeline {
+    /// `Err` when the splitter thread will not start, which is a share that
+    /// would never see a frame.
     fn new(
         events: async_mpsc::UnboundedSender<ShareEvent>,
         capturer: Capturer,
-        frames: async_mpsc::UnboundedReceiver<CaptureEvent>,
+        capture: async_mpsc::UnboundedReceiver<CaptureEvent>,
         preset: Preset,
         sender: FrameSender,
         share_far_end: Arc<Mutex<VecDeque<f32>>>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let now = Instant::now();
-        // Read before the sender is handed over, so a session that already had
-        // failures does not report them all as this share's first second.
-        let last_send_failures = sender.send_failures();
-        Self {
+        let (pictures, frames) = async_mpsc::unbounded();
+        let (chunks, audio_inbox) = std::sync::mpsc::channel();
+        spawn_splitter(capture, pictures, chunks.clone())?;
+
+        Ok(Self {
             events,
             capturer,
             frames,
-            preset,
+            video: VideoTrack::new(Track::Screen(preset), sender.clone(), now),
             sender,
             share_far_end,
-            encoder: None,
-            source: None,
-            output: (0, 0),
-            latest: None,
-            fresh: false,
-            frame_id: 0,
-            keyframe_pending: true,
-            next_encode: now,
             paused: true,
             audio: None,
-            unit: Vec::new(),
-            scaled: Vec::new(),
-            far_end_scratch: Vec::with_capacity(FAR_END_MAX_SAMPLES),
-            counters: Counters::default(),
-            window: Counters::default(),
-            last_send_failures,
-            stats_at: now,
-            warning: Throttle::default(),
-        }
+            audio_channel: Some((chunks, audio_inbox)),
+            audio_counters: Arc::new(AudioCounters::default()),
+        })
     }
 
-    /// One pass: everything the backend produced since the last one, then the
-    /// encode deadline, the share audio and the report. `false` once the share
-    /// is over, which is when it has emitted its own last event.
+    /// One pass: every picture the backend produced since the last one, then
+    /// the encode deadline and the report. `false` once the share is over,
+    /// which is when it has emitted its own last event.
     fn pump(&mut self, now: Instant) -> bool {
         loop {
             match self.frames.try_recv() {
@@ -448,13 +435,9 @@ impl Pipeline {
                         return false;
                     }
                 }
-                Ok(CaptureEvent::Audio(chunk)) => {
-                    if let Some(audio) = self.audio.as_mut()
-                        && !self.paused
-                    {
-                        audio.framer.push(&chunk);
-                    }
-                }
+                // The splitter never sends audio this way: it belongs to the
+                // share-audio thread, which is the whole point of the split.
+                Ok(CaptureEvent::Audio(_)) => {}
                 Ok(CaptureEvent::Ended(reason)) => {
                     self.emit(ShareEvent::Ended(reason));
                     return false;
@@ -470,43 +453,43 @@ impl Pipeline {
         }
 
         self.encode_tick(now);
-        self.audio_tick(now);
         self.stats_tick(now);
         true
     }
 
     fn set_paused(&mut self, paused: bool) {
-        if paused == self.paused {
+        if !self.video.set_paused(paused) {
             return;
         }
         self.paused = paused;
-        if paused {
-            // Nobody is watching, so the audio already captured is dropped
-            // rather than played back late when someone arrives.
-            if let Some(audio) = self.audio.as_mut() {
-                audio.framer.clear();
-            }
-        } else {
-            // Whoever just started watching can only begin at a keyframe.
-            self.keyframe_pending = true;
-            // What played while nobody watched is no reference for the audio
-            // captured from here on; left in, the canceller would stay a
-            // ring's length behind for the rest of the share.
-            lock(&self.share_far_end).clear();
+        // The audio thread clears its own queue and its own reference: doing
+        // either from here would race whatever it is sending.
+        if let Some(audio) = self.audio.as_ref() {
+            audio.send(AudioMessage::Paused(paused));
         }
     }
 
     fn on_started(&mut self, width: u32, height: u32, audio: Option<AudioMode>) -> bool {
-        if !self.build_encoder((width, height)) {
+        if let Err(reason) = self.video.started((width, height)) {
+            self.emit(ShareEvent::Failed(reason));
             return false;
         }
-        self.frame_id = 0;
-        self.audio = audio.and_then(|mode| ShareAudio::new(mode, &self.share_far_end));
+        self.audio = match (audio, self.audio_channel.take()) {
+            (Some(mode), Some(channel)) => AudioThread::spawn(
+                mode,
+                self.paused,
+                channel,
+                self.sender.clone(),
+                Arc::clone(&self.share_far_end),
+                Arc::clone(&self.audio_counters),
+            ),
+            _ => None,
+        };
 
         self.emit(ShareEvent::Started {
             width,
             height,
-            output: self.output,
+            output: self.video.output(),
             // What is really sent: a share whose encoder would not build sends
             // no audio at all.
             audio: self.audio.as_ref().map(|audio| audio.mode),
@@ -516,210 +499,38 @@ impl Pipeline {
     }
 
     fn on_video(&mut self, frame: VideoFrame) -> bool {
-        if self.source != Some((frame.width, frame.height))
-            && !self.build_encoder((frame.width, frame.height))
-        {
+        if let Err(reason) = self.video.on_video(frame) {
+            self.emit(ShareEvent::Failed(reason));
             return false;
         }
-
-        self.counters.captured += 1;
-        // Paused, nothing is meant to be encoded, so replacing a frame is not
-        // a frame lost.
-        if self.fresh && !self.paused {
-            self.counters.dropped += 1;
-        }
-        self.latest = Some(frame);
-        self.fresh = true;
         true
     }
 
-    /// Builds the encoder for a capture of `source`, at the size and bitrate the
-    /// preset asks for. `false` once it has emitted [`ShareEvent::Failed`]: a
-    /// share with no encoder has nothing to send.
-    fn build_encoder(&mut self, source: (u32, u32)) -> bool {
-        let output = self.preset.output_size(source);
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |cores| cores.get() / 2)
-            .clamp(1, MAX_ENCODER_THREADS) as u16;
-        let settings = EncoderSettings {
-            width: output.0,
-            height: output.1,
-            fps: self.preset.fps.hz(),
-            bitrate_kbps: self.preset.bitrate_kbps(source),
-            threads,
-        };
-
-        match VideoEncoder::new(settings) {
-            Ok(encoder) => {
-                tracing::info!(
-                    source = ?source,
-                    output = ?output,
-                    bitrate_kbps = settings.bitrate_kbps,
-                    threads = encoder.threads(),
-                    "encoding a screen share"
-                );
-                self.encoder = Some(encoder);
-                self.source = Some(source);
-                self.output = output;
-                // Nothing a viewer holds decodes against the new stream.
-                self.keyframe_pending = true;
-                self.scaled.clear();
-                true
-            }
-            Err(error) => {
-                self.emit(ShareEvent::Failed(format!(
-                    "Cannot encode this screen: {error}"
-                )));
-                false
-            }
-        }
-    }
-
-    /// Encodes at most one frame, on the preset's cadence rather than the
-    /// capture's.
     fn encode_tick(&mut self, now: Instant) {
-        if now < self.next_encode {
-            return;
-        }
-        let interval = self.preset.fps.interval();
-        // Missed ticks are not made up for: this is live video, and a burst of
-        // late frames only pushes the next ones later still.
-        self.next_encode = if now.saturating_duration_since(self.next_encode) >= interval {
-            now + interval
-        } else {
-            self.next_encode + interval
-        };
-
-        if self.paused {
-            return;
-        }
-        if self.sender.take_keyframe_request() {
-            self.counters.keyframe_requests += 1;
-            self.keyframe_pending = true;
-        }
-        if !self.fresh && !self.keyframe_pending {
-            return;
-        }
-
-        let Some(frame) = self.latest.as_ref() else {
-            return;
-        };
-        let Some(encoder) = self.encoder.as_mut() else {
-            return;
-        };
-
-        let (pixels, stride) = if (frame.width, frame.height) == self.output {
-            (frame.bgra.as_slice(), frame.stride)
-        } else {
-            scale_bgra(
-                &frame.bgra,
-                frame.stride,
-                (frame.width, frame.height),
-                self.output,
-                &mut self.scaled,
-            );
-            (self.scaled.as_slice(), self.output.0 as usize * 4)
-        };
-
-        let force = self.keyframe_pending;
-        let encoded = encoder.encode(pixels, stride, force, &mut self.unit);
-        self.fresh = false;
-
-        let encoded = match encoded {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                if self.warning.allow(now) {
-                    tracing::warn!(%error, "dropping a frame the encoder refused");
-                }
-                self.counters.dropped += 1;
-                return;
-            }
-        };
-        if encoded.skipped {
-            // Rate control coded nothing, so a forced keyframe was not served
-            // either and stays pending.
-            self.counters.skipped += 1;
-            return;
-        }
-
-        self.keyframe_pending = false;
-        self.counters.encoded += 1;
-        self.counters.bytes += self.unit.len() as u64;
-        if encoded.keyframe {
-            self.counters.keyframes += 1;
-        }
-
-        let frame_id = self.frame_id;
-        self.frame_id = self.frame_id.wrapping_add(1);
-        if let Err(error) = self
-            .sender
-            .send_video(frame_id, encoded.keyframe, &self.unit)
-            && self.warning.allow(now)
-        {
-            tracing::debug!(%error, "dropping a frame the socket refused");
-        }
+        self.video.encode_tick(now);
     }
 
-    fn audio_tick(&mut self, now: Instant) {
-        let Some(audio) = self.audio.as_mut() else {
-            return;
-        };
-        if self.paused {
-            return;
-        }
-
-        // The reference the canceller subtracts: everything the mixer played
-        // since the last tick, drained in one go.
-        if audio.cleanup.is_some() {
-            {
-                let mut ring = lock(&self.share_far_end);
-                self.far_end_scratch.clear();
-                self.far_end_scratch.extend(ring.drain(..));
-            }
-            audio.push_far_end(&self.far_end_scratch);
-        }
-
-        audio.pump(&self.sender, now, &mut self.counters);
-    }
-
+    /// The picture's counters, with what the share-audio thread put on the wire
+    /// folded into the bitrate.
     fn stats_tick(&mut self, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.stats_at);
-        if elapsed < STATS_INTERVAL {
+        let audio_bytes = self.audio_counters.bytes.load(Ordering::Relaxed);
+        let Some(report) = self.video.report(now, audio_bytes) else {
             return;
-        }
-        self.stats_at = now;
-        let seconds = elapsed.as_secs_f64();
-        let counters = self.counters;
-        let rate = |current: u64, previous: u64| {
-            (current.saturating_sub(previous) as f64 / seconds) as f32
         };
 
-        let send_failures = self.sender.send_failures();
-        let refused = send_failures.saturating_sub(self.last_send_failures);
-        self.last_send_failures = send_failures;
-        if refused > 0 && self.warning.allow(now) {
-            tracing::warn!(
-                refused,
-                "share datagrams refused by the socket in the last second"
-            );
-        }
-
-        let stats = ShareStats {
-            capture_fps: rate(counters.captured, self.window.captured),
-            encode_fps: rate(counters.encoded, self.window.encoded),
-            kbps: (counters.bytes.saturating_sub(self.window.bytes) as f64 * 8.0
-                / 1_000.0
-                / seconds) as u32,
-            output: self.output,
-            keyframes: counters.keyframes,
-            keyframe_requests: counters.keyframe_requests,
-            dropped_frames: counters.dropped,
-            skipped_frames: counters.skipped,
-            audio_frames: counters.audio_frames,
-            send_failures: refused,
-        };
-        self.window = counters;
-        self.emit(ShareEvent::Stats(stats));
+        self.emit(ShareEvent::Stats(ShareStats {
+            capture_fps: report.capture_fps,
+            encode_fps: report.encode_fps,
+            kbps: report.kbps,
+            output: report.output,
+            keyframes: report.keyframes,
+            keyframe_requests: report.keyframe_requests,
+            dropped_frames: report.dropped_frames,
+            skipped_frames: report.skipped_frames,
+            audio_frames: self.audio_counters.frames.load(Ordering::Relaxed),
+            audio_passed_through: self.audio_counters.passed_through.load(Ordering::Relaxed),
+            send_failures: report.send_failures,
+        }));
     }
 
     fn emit(&self, event: ShareEvent) {
@@ -729,28 +540,163 @@ impl Pipeline {
     }
 }
 
-/// The share's own audio: whatever the backend captured, turned into the 20 ms
-/// stereo Opus frames the wire takes.
-struct ShareAudio {
+/// Splits the capture's events the moment they arrive: audio goes to the
+/// share-audio thread, everything else to the pipeline. The pipeline spends
+/// tens of milliseconds inside one encode, and a chunk waiting behind that is
+/// a chunk sent in a batch nobody can play back smoothly.
+///
+/// The thread ends with the capture, whose backend drops the sender when the
+/// [`Capturer`] is dropped, or as soon as the pipeline has stopped listening.
+fn spawn_splitter(
+    mut capture: async_mpsc::UnboundedReceiver<CaptureEvent>,
+    pictures: async_mpsc::UnboundedSender<CaptureEvent>,
+    chunks: Sender<AudioMessage>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("vorcall-share-split".to_string())
+        .spawn(move || {
+            futures::executor::block_on(async move {
+                while let Some(event) = capture.next().await {
+                    let listening = match event {
+                        // A share with no audio thread has nobody to take the
+                        // chunk, which is not a reason to stop the picture.
+                        CaptureEvent::Audio(chunk) => {
+                            let _ = chunks.send(AudioMessage::Chunk(chunk));
+                            !pictures.is_closed()
+                        }
+                        other => pictures.unbounded_send(other).is_ok(),
+                    };
+                    if !listening {
+                        break;
+                    }
+                }
+            });
+        })?;
+    Ok(())
+}
+
+/// What reaches the share-audio thread.
+enum AudioMessage {
+    Chunk(AudioChunk),
+    Paused(bool),
+    Stop,
+}
+
+/// The pipeline's end of the share-audio thread.
+struct AudioThread {
+    /// What the capture really gives, which is what the app is told about.
     mode: AudioMode,
+    messages: Sender<AudioMessage>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl AudioThread {
+    /// Starts the thread and waits for it to say whether it has an encoder:
+    /// a share whose encoder will not build sends no audio at all, and the
+    /// `Started` event has to say so. `None` is exactly that case.
+    fn spawn(
+        mode: AudioMode,
+        paused: bool,
+        channel: (Sender<AudioMessage>, Receiver<AudioMessage>),
+        sender: FrameSender,
+        far_end: Arc<Mutex<VecDeque<f32>>>,
+        counters: Arc<AudioCounters>,
+    ) -> Option<AudioThread> {
+        let (messages, inbox) = channel;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let (built, ready) = std::sync::mpsc::channel();
+
+        // `ShareCleanup` is `!Send`, so everything below is built, run and
+        // dropped on that thread and nowhere else.
+        let spawned = std::thread::Builder::new()
+            .name("vorcall-share-audio".to_string())
+            .spawn(move || {
+                let Some(mut audio) = ShareAudio::new(mode, sender, far_end, counters) else {
+                    let _ = built.send(false);
+                    return;
+                };
+                let _ = built.send(true);
+                audio.set_paused(paused);
+                audio.run(&inbox, &thread_stop);
+            });
+
+        let handle = match spawned {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(%error, "no share audio thread, sharing the picture only");
+                return None;
+            }
+        };
+        if !matches!(ready.recv(), Ok(true)) {
+            let _ = handle.join();
+            return None;
+        }
+        Some(AudioThread {
+            mode,
+            messages,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn send(&self, message: AudioMessage) {
+        if self.messages.send(message).is_err() {
+            tracing::debug!("the share audio thread is gone, dropping the message");
+        }
+    }
+}
+
+impl Drop for AudioThread {
+    /// Stops the thread and waits for it, so the capture's audio never outlives
+    /// the share it belongs to. The flag is what it stops on; the message is
+    /// only there to wake it out of its wait.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.messages.send(AudioMessage::Stop);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::warn!("the share audio thread panicked");
+        }
+    }
+}
+
+/// The share's own audio, on its thread: whatever the backend captured, turned
+/// into the 20 ms stereo Opus frames the wire takes and put on it as they come.
+struct ShareAudio {
+    sender: FrameSender,
+    /// What the mixer played, for the canceller below; the audio thread fills
+    /// it and this thread is what drains it.
+    far_end: Arc<Mutex<VecDeque<f32>>>,
+    counters: Arc<AudioCounters>,
     encoder: StereoEncoder,
     framer: AudioFramer,
     /// `None` when the capture excludes this machine's playout, and after the
     /// chain has failed: there is nothing to subtract, or nothing left to
     /// subtract it with.
     cleanup: Option<ShareCleanup>,
+    spurt: Spurt,
+    /// Nobody is watching: chunks are dropped rather than queued.
+    paused: bool,
     frame: [f32; STEREO_FRAME_SAMPLES],
     /// The frame as captured, restored if the chain fails mid-frame.
     raw: [f32; STEREO_FRAME_SAMPLES],
     packet: [u8; MAX_PACKET],
-    last_sent: Option<Instant>,
+    far_end_scratch: Vec<f32>,
     warning: Throttle,
 }
 
 impl ShareAudio {
     /// `None` when the encoder will not build, which is a share without audio
     /// rather than no share.
-    fn new(mode: AudioMode, far_end: &Mutex<VecDeque<f32>>) -> Option<ShareAudio> {
+    fn new(
+        mode: AudioMode,
+        sender: FrameSender,
+        far_end: Arc<Mutex<VecDeque<f32>>>,
+        counters: Arc<AudioCounters>,
+    ) -> Option<ShareAudio> {
         let encoder = match StereoEncoder::new() {
             Ok(encoder) => encoder,
             Err(error) => {
@@ -767,7 +713,7 @@ impl ShareAudio {
                 Ok(cleanup) => {
                     // Whatever the mixer played before this capture existed is
                     // no reference for it.
-                    lock(far_end).clear();
+                    lock(&far_end).clear();
                     Some(cleanup)
                 }
                 Err(error) => {
@@ -778,28 +724,82 @@ impl ShareAudio {
         };
 
         Some(ShareAudio {
-            mode,
+            sender,
+            far_end,
+            counters,
             encoder,
             framer: AudioFramer::new(),
             cleanup,
+            spurt: Spurt::default(),
+            paused: true,
             frame: [0.0; STEREO_FRAME_SAMPLES],
             raw: [0.0; STEREO_FRAME_SAMPLES],
             packet: [0; MAX_PACKET],
-            last_sent: None,
+            far_end_scratch: Vec::with_capacity(FAR_END_MAX_SAMPLES),
             warning: Throttle::default(),
         })
     }
 
-    fn push_far_end(&mut self, samples: &[f32]) {
-        if let Some(cleanup) = self.cleanup.as_mut() {
-            cleanup.push_far_end(samples);
+    /// Waits for chunks and sends what they add up to, until the pipeline stops
+    /// the thread or drops the channel.
+    fn run(&mut self, messages: &Receiver<AudioMessage>, stop: &AtomicBool) {
+        while !stop.load(Ordering::Relaxed) {
+            match messages.recv_timeout(AUDIO_WAIT) {
+                Ok(AudioMessage::Chunk(chunk)) => {
+                    if !self.paused {
+                        self.framer.push(&chunk);
+                    }
+                }
+                Ok(AudioMessage::Paused(paused)) => self.set_paused(paused),
+                Ok(AudioMessage::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            self.pump(Instant::now());
         }
     }
 
-    /// Sends every whole frame the framer has ready.
-    fn pump(&mut self, sender: &FrameSender, now: Instant, counters: &mut Counters) {
+    fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        if paused {
+            // Nobody is watching, so the audio already captured is dropped
+            // rather than played back late when someone arrives.
+            self.framer.clear();
+            return;
+        }
+        // What played while nobody watched is no reference for the audio
+        // captured from here on; left in, the canceller would stay a ring's
+        // length behind for the rest of the share.
+        lock(&self.far_end).clear();
+        // Every watcher joins a stream that begins here.
+        self.sender.reset_share_audio_clock();
+        self.spurt.restart();
+    }
+
+    /// Hands the canceller everything the mixer has played since the last pass.
+    fn push_far_end(&mut self) {
+        let Some(cleanup) = self.cleanup.as_mut() else {
+            return;
+        };
+        self.far_end_scratch.clear();
+        self.far_end_scratch.extend(lock(&self.far_end).drain(..));
+        cleanup.push_far_end(&self.far_end_scratch);
+    }
+
+    /// Sends every whole frame the framer has ready, back to back: a batch is
+    /// the thread having waited, not a gap in the capture, and it goes out
+    /// under consecutive timestamps so the watcher plays it as one stretch.
+    fn pump(&mut self, now: Instant) {
+        if self.paused {
+            return;
+        }
+        self.push_far_end();
+
         while self.framer.next_frame(&mut self.frame) {
             self.clean();
+            let start = self.spurt.next(now);
+            if start.skip > 0 {
+                self.sender.skip_share_audio(start.skip);
+            }
 
             let encoded = match self.encoder.encode(&self.frame, &mut self.packet) {
                 Ok(written) => written,
@@ -807,18 +807,25 @@ impl ShareAudio {
                     if self.warning.allow(now) {
                         tracing::warn!(%error, "dropping share audio the encoder refused");
                     }
+                    // Its slot on the clock goes with it, so the watcher
+                    // conceals the frame instead of hearing the next one early.
+                    self.sender.skip_share_audio(1);
+                    if start.marker {
+                        self.spurt.restart();
+                    }
                     continue;
                 }
             };
 
-            let marker = self
-                .last_sent
-                .is_none_or(|last| now.saturating_duration_since(last) >= SPURT_GAP);
-            match sender.send_share_audio(&self.packet[..encoded], marker) {
+            match self
+                .sender
+                .send_share_audio(&self.packet[..encoded], start.marker)
+            {
                 Ok(()) => {
-                    self.last_sent = Some(now);
-                    counters.audio_frames += 1;
-                    counters.bytes += encoded as u64;
+                    self.counters.frames.fetch_add(1, Ordering::Relaxed);
+                    self.counters
+                        .bytes
+                        .fetch_add(encoded as u64, Ordering::Relaxed);
                 }
                 Err(error) => {
                     if self.warning.allow(now) {
@@ -826,6 +833,12 @@ impl ShareAudio {
                     }
                 }
             }
+        }
+
+        if let Some(cleanup) = self.cleanup.as_ref() {
+            self.counters
+                .passed_through
+                .store(cleanup.passed_through(), Ordering::Relaxed);
         }
     }
 
@@ -858,6 +871,52 @@ impl ShareAudio {
             );
         }
     }
+}
+
+/// Where a run of share audio begins, judged on the share-audio thread's own
+/// clock: a stretch with no whole frame to send is a gap in the capture, while
+/// a batch of frames arriving together is only this thread having waited.
+#[derive(Default)]
+struct Spurt {
+    /// The stream (re)started and nothing has gone out under it yet.
+    starting: bool,
+    /// When a whole frame was last there to send.
+    last_frame_at: Option<Instant>,
+}
+
+/// How the next frame goes out: whether it opens a run, and how many frames of
+/// silence the media clock skips before it.
+#[derive(Debug, PartialEq, Eq)]
+struct FrameStart {
+    marker: bool,
+    skip: u32,
+}
+
+impl Spurt {
+    fn restart(&mut self) {
+        self.starting = true;
+        self.last_frame_at = None;
+    }
+
+    fn next(&mut self, now: Instant) -> FrameStart {
+        let gap = gap_frames(self.last_frame_at, now);
+        self.last_frame_at = Some(now);
+        FrameStart {
+            marker: std::mem::take(&mut self.starting) || gap.is_some(),
+            skip: gap.unwrap_or(0),
+        }
+    }
+}
+
+/// The frames a gap in the capture swallowed before the one now going out, or
+/// `None` when that frame simply follows the one before it.
+fn gap_frames(last_frame_at: Option<Instant>, now: Instant) -> Option<u32> {
+    let gap = now.saturating_duration_since(last_frame_at?);
+    if gap < SPURT_GAP {
+        return None;
+    }
+    let frames = gap.as_millis() / u128::from(FRAME_MS);
+    Some(u32::try_from(frames.saturating_sub(1)).unwrap_or(u32::MAX))
 }
 
 /// Whatever the capture backend hands over, cut into the 20 ms interleaved
@@ -1461,5 +1520,77 @@ mod tests {
         // there is nothing newer to skip to, so nothing is thrown away.
         assert_eq!(queued.len(), MAX_BACKLOG + 1);
         assert_eq!(units_to_skip(&queued), 0);
+    }
+
+    #[test]
+    fn only_a_real_silence_counts_as_a_gap() {
+        let t0 = Instant::now();
+        assert_eq!(
+            gap_frames(None, t0),
+            None,
+            "the first frame follows nothing"
+        );
+        assert_eq!(gap_frames(Some(t0), t0), None, "a batch is not a gap");
+        assert_eq!(gap_frames(Some(t0), t0 + Duration::from_millis(199)), None);
+        // 200 ms is ten 20 ms frames, nine of them before the one going out.
+        assert_eq!(
+            gap_frames(Some(t0), t0 + Duration::from_millis(200)),
+            Some(9)
+        );
+        assert_eq!(gap_frames(Some(t0), t0 + Duration::from_secs(1)), Some(49));
+    }
+
+    #[test]
+    fn a_batch_of_frames_runs_on_and_a_gap_opens_a_new_run() {
+        let t0 = Instant::now();
+        let mut spurt = Spurt::default();
+        spurt.restart();
+
+        // The first frame of the share opens the run and skips nothing.
+        assert_eq!(
+            spurt.next(t0),
+            FrameStart {
+                marker: true,
+                skip: 0
+            }
+        );
+        // The rest of the batch is the same run, at consecutive timestamps.
+        for late in [0, 0, 60] {
+            assert_eq!(
+                spurt.next(t0 + Duration::from_millis(late)),
+                FrameStart {
+                    marker: false,
+                    skip: 0
+                }
+            );
+        }
+
+        // Half a second of nothing to send: 25 frames' worth, 24 of them before
+        // the one that ends it.
+        let after = t0 + Duration::from_millis(560);
+        assert_eq!(
+            spurt.next(after),
+            FrameStart {
+                marker: true,
+                skip: 24
+            }
+        );
+        assert_eq!(
+            spurt.next(after),
+            FrameStart {
+                marker: false,
+                skip: 0
+            }
+        );
+
+        // A resume starts a run without pretending anything was lost.
+        spurt.restart();
+        assert_eq!(
+            spurt.next(after + Duration::from_secs(30)),
+            FrameStart {
+                marker: true,
+                skip: 0
+            }
+        );
     }
 }

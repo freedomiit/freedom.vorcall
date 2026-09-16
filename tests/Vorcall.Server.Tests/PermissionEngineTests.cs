@@ -40,7 +40,7 @@ public class PermissionEngineTests
     private const ulong Send = (ulong)Perm.SendMessages;                // 512
     private const ulong Connect = (ulong)Perm.Connect;                  // 8192
 
-    // The 23 defined bits and the 8 server-scoped ones, listed here rather than taken from Perms so
+    // The 25 defined bits and the 9 server-scoped ones, listed here rather than taken from Perms so
     // the matrix never agrees with the code by construction.
     private static readonly Perm[] AllBits =
     [
@@ -67,6 +67,8 @@ public class PermissionEngineTests
         Perm.ChangeNickname,
         Perm.Soundpad,
         Perm.ManageSounds,
+        Perm.Video,
+        Perm.ManageStickers,
     ];
 
     private static readonly Perm[] ServerScopedBits =
@@ -79,6 +81,7 @@ public class PermissionEngineTests
         Perm.BanMembers,
         Perm.ChangeNickname,
         Perm.ManageSounds,
+        Perm.ManageStickers,
     ];
 
     // ---- constants -------------------------------------------------------------------------
@@ -107,6 +110,8 @@ public class PermissionEngineTests
     [InlineData(Perm.ChangeNickname, 1048576UL, "CHANGE_NICKNAME")]
     [InlineData(Perm.Soundpad, 2097152UL, "SOUNDPAD")]
     [InlineData(Perm.ManageSounds, 4194304UL, "MANAGE_SOUNDS")]
+    [InlineData(Perm.Video, 8388608UL, "VIDEO")]
+    [InlineData(Perm.ManageStickers, 16777216UL, "MANAGE_STICKERS")]
     public void every_bit_keeps_its_wire_value_and_its_wire_name(Perm bit, ulong value, string name)
     {
         Assert.Equal(value, (ulong)bit);
@@ -130,15 +135,15 @@ public class PermissionEngineTests
             serverScoped |= (ulong)bit;
         }
 
-        // 1 | 4 | 8 | 32 | 64 | 128 | 1048576 | 4194304 = 5243117, which leaves 3145490
-        // channel-scoped.
-        Assert.Equal(0x7FFFFFUL, all);
-        Assert.Equal(5243117UL, serverScoped);
-        Assert.Equal(3145490UL, all & ~serverScoped);
+        // 1 | 4 | 8 | 32 | 64 | 128 | 1048576 | 4194304 | 16777216 = 22020333, which leaves
+        // 11534098 channel-scoped.
+        Assert.Equal(0x1FFFFFFUL, all);
+        Assert.Equal(22020333UL, serverScoped);
+        Assert.Equal(11534098UL, all & ~serverScoped);
 
-        Assert.Equal(0x7FFFFFUL, Perms.All);
-        Assert.Equal(5243117UL, Perms.ServerScoped);
-        Assert.Equal(3145490UL, Perms.ChannelScoped);
+        Assert.Equal(0x1FFFFFFUL, Perms.All);
+        Assert.Equal(22020333UL, Perms.ServerScoped);
+        Assert.Equal(11534098UL, Perms.ChannelScoped);
         Assert.Equal(0UL, Perms.ServerScoped & Perms.ChannelScoped);
         Assert.Equal(Perms.All, Perms.ServerScoped | Perms.ChannelScoped);
     }
@@ -154,10 +159,11 @@ public class PermissionEngineTests
             | (ulong)Perm.Speak
             | (ulong)Perm.ShareScreen
             | (ulong)Perm.ChangeNickname
-            | (ulong)Perm.Soundpad;
+            | (ulong)Perm.Soundpad
+            | (ulong)Perm.Video;
 
-        Assert.Equal(3206912UL, expected);
-        Assert.Equal(3206912UL, Perms.EveryoneDefault);
+        Assert.Equal(11595520UL, expected);
+        Assert.Equal(11595520UL, Perms.EveryoneDefault);
     }
 
     [Fact]
@@ -168,8 +174,8 @@ public class PermissionEngineTests
         Assert.True(Perms.Has(View | Send, (Perm)(View | Send)));
         Assert.False(Perms.Has(Send, (Perm)(View | Send)));
 
-        Assert.Equal(Send, Perms.Clean(Send | (1UL << 23) | (1UL << 63)));
-        Assert.Equal(0x7FFFFFUL, Perms.Clean(ulong.MaxValue));
+        Assert.Equal(Send, Perms.Clean(Send | (1UL << 25) | (1UL << 63)));
+        Assert.Equal(0x1FFFFFFUL, Perms.Clean(ulong.MaxValue));
     }
 
     [Fact]
@@ -177,7 +183,7 @@ public class PermissionEngineTests
     {
         Assert.Equal(string.Empty, PermNames.Name(Perm.None));
         Assert.Equal(string.Empty, PermNames.Name((Perm)(View | Send)));
-        Assert.Equal(string.Empty, PermNames.Name((Perm)(1UL << 23)));
+        Assert.Equal(string.Empty, PermNames.Name((Perm)(1UL << 25)));
     }
 
     [Fact]
@@ -197,11 +203,11 @@ public class PermissionEngineTests
         Assert.Equal(
             new[] { Perm.ManageServer, Perm.ViewChannel, Perm.ChangeNickname },
             PermNames.Bits(ManageServer | View | (ulong)Perm.ChangeNickname).ToArray());
-        Assert.Equal(AllBits, PermNames.Bits(0x7FFFFFUL).ToArray());
+        Assert.Equal(AllBits, PermNames.Bits(0x1FFFFFFUL).ToArray());
         Assert.Empty(PermNames.Bits(0));
         Assert.Equal(
             new[] { Perm.SendMessages },
-            PermNames.Bits(Send | (1UL << 23) | (1UL << 40)).ToArray());
+            PermNames.Bits(Send | (1UL << 25) | (1UL << 40)).ToArray());
     }
 
     // ---- resolution ------------------------------------------------------------------------
@@ -219,8 +225,8 @@ public class PermissionEngineTests
 
         var resolved = PermissionEngine.Resolve(h, owner, channel);
 
-        Assert.Equal(0x7FFFFFUL, resolved);
-        Assert.Equal(0x7FFFFFUL, PermissionEngine.Resolve(h, owner, null));
+        Assert.Equal(0x1FFFFFFUL, resolved);
+        Assert.Equal(0x1FFFFFFUL, PermissionEngine.Resolve(h, owner, null));
         foreach (var bit in AllBits)
         {
             Assert.True(Perms.Has(resolved, bit), PermNames.Name(bit));
@@ -264,7 +270,7 @@ public class PermissionEngineTests
         Assert.Equal(0UL, PermissionEngine.Resolve(h, member, channel));
     }
 
-    // 23 bits x 3 layers x {allow, deny, inherit} x {base has the bit, base lacks it} = 414 cases.
+    // 25 bits x 3 layers x {allow, deny, inherit} x {base has the bit, base lacks it} = 450 cases.
     public static TheoryData<Perm, OverrideLayer, OverrideAction, bool, ulong> OverrideMatrix()
     {
         var data = new TheoryData<Perm, OverrideLayer, OverrideAction, bool, ulong>();
@@ -589,8 +595,8 @@ public class PermissionEngineTests
         var h = H(OwnerId, EveryoneRole(0));
         var owner = Member(OwnerId);
 
-        Assert.True(PermissionEngine.CanGrant(h, owner, 0x7FFFFF));
-        Assert.Null(PermissionEngine.MissingGrant(h, owner, 0x7FFFFF));
+        Assert.True(PermissionEngine.CanGrant(h, owner, 0x1FFFFFF));
+        Assert.Null(PermissionEngine.MissingGrant(h, owner, 0x1FFFFFF));
     }
 
     [Fact]
@@ -600,10 +606,10 @@ public class PermissionEngineTests
         var actor = Member(ActorId);
 
         // Cleaned away rather than refused, so the two answers can never disagree.
-        Assert.True(PermissionEngine.CanGrant(h, actor, 1UL << 23));
-        Assert.Null(PermissionEngine.MissingGrant(h, actor, 1UL << 23));
+        Assert.True(PermissionEngine.CanGrant(h, actor, 1UL << 25));
+        Assert.Null(PermissionEngine.MissingGrant(h, actor, 1UL << 25));
 
-        foreach (var bits in new[] { 0UL, View, ManageServer, 1109760UL, 0x7FFFFFUL, ulong.MaxValue })
+        foreach (var bits in new[] { 0UL, View, ManageServer, 1109760UL, 0x1FFFFFFUL, ulong.MaxValue })
         {
             Assert.Equal(
                 PermissionEngine.CanGrant(h, actor, bits),

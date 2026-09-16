@@ -13,13 +13,13 @@ use vorcall_core::connection::{AdminCommand, Command};
 use crate::app::App;
 use crate::app::message::{
     AdminMsg, AuthMsg, ChannelsMsg, ChatMsg, CropMsg, DragMsg, Message, SettingsMsg, ShareMsg,
-    SoundMsg, ToastKind, UiMsg, VoiceMsg,
+    SoundMsg, StickerMsg, ToastKind, UiMsg, VoiceMsg,
 };
 use crate::app::state::ui::{
     ContextMenu, Dialog, DialogAction, ProfileCard, Route, SwitchEntry, SwitchTarget,
     rank_switcher, switcher_entries, validate_long, validate_name, wrap_index,
 };
-use crate::app::update::{channels, chat, drag, sound, voice};
+use crate::app::update::{channels, chat, drag, sound, sticker, voice};
 use crate::view;
 
 /// What a dialog says when the connection loop is not there to take its command:
@@ -152,6 +152,10 @@ fn escape(app: &mut App) -> Task<Message> {
     let padded = app.main().is_some_and(|main| main.sound.popover.is_some());
     if padded {
         return sound::update(app, SoundMsg::ClosePopover);
+    }
+    if app.main().is_some_and(|main| main.sticker.picker_open) {
+        sticker::close_picker(app);
+        return Task::none();
     }
     if app.ui.quick_switcher.open {
         close_switcher(app);
@@ -306,6 +310,11 @@ fn submit(app: &mut App) -> Task<Message> {
         // renamed in; this only asked.
         Dialog::ConfirmDeleteSound { sound_id } => {
             Task::done(Message::Sound(SoundMsg::Delete(sound_id)))
+        }
+        // The stickers page owns what a deletion does to the row it was being
+        // renamed in; this only asked.
+        Dialog::ConfirmDeleteSticker { sticker_id } => {
+            Task::done(Message::Sticker(StickerMsg::Delete(sticker_id)))
         }
         // The message list owns what a deletion does to the row; this only asked.
         Dialog::ConfirmDeleteMessage { message_id } => {

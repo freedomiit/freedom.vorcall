@@ -178,6 +178,9 @@ pub enum Dialog {
     ConfirmDeleteSound {
         sound_id: i64,
     },
+    ConfirmDeleteSticker {
+        sticker_id: i64,
+    },
     ConfirmDeleteMessage {
         message_id: i64,
     },
@@ -303,6 +306,10 @@ impl fmt::Debug for Dialog {
             Self::ConfirmDeleteSound { sound_id } => f
                 .debug_struct("ConfirmDeleteSound")
                 .field("sound_id", sound_id)
+                .finish(),
+            Self::ConfirmDeleteSticker { sticker_id } => f
+                .debug_struct("ConfirmDeleteSticker")
+                .field("sticker_id", sticker_id)
                 .finish(),
             Self::ConfirmDeleteMessage { message_id } => f
                 .debug_struct("ConfirmDeleteMessage")

@@ -637,6 +637,7 @@ mod tests {
                 last_message_id: 40,
             }],
             sounds: vec![],
+            stickers: vec![],
         });
         model
     }

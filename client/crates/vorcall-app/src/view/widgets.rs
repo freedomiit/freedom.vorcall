@@ -15,7 +15,7 @@ use vorcall_core::config::Density;
 use vorcall_core::permissions;
 use vorcall_core::{Config, Profile, Role};
 
-use crate::app::message::{Message, SettingsMsg, ShareMsg, SoundMsg, VoiceMsg};
+use crate::app::message::{CameraMsg, Message, SettingsMsg, ShareMsg, SoundMsg, VoiceMsg};
 use crate::app::state::chat::{ChatState, ImageState};
 use crate::app::state::settings::SettingsTab;
 use crate::app::{App, MainState};
@@ -494,8 +494,29 @@ pub fn live_badge<'a>(
     watching: bool,
     tokens: &'a ThemeTokens,
 ) -> Element<'a, Message> {
+    lit_badge("LIVE", tip, on_press, watching, tokens)
+}
+
+/// The same marker, in the same accent, for a camera. Two words are all that
+/// tell them apart on a row: one is a screen, the other a face.
+pub fn camera_badge_of<'a>(
+    tip: &str,
+    on_press: Option<Message>,
+    watching: bool,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, Message> {
+    lit_badge("CAM", tip, on_press, watching, tokens)
+}
+
+fn lit_badge<'a>(
+    label: &'static str,
+    tip: &str,
+    on_press: Option<Message>,
+    watching: bool,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, Message> {
     let tokens_for_style = *tokens;
-    let control = button(text("LIVE").size(TEXT_BADGE).font(bold()))
+    let control = button(text(label).size(TEXT_BADGE).font(bold()))
         .padding([0.0, 5.0])
         .style(move |_theme: &Theme, status: button::Status| {
             let accent = match (watching, status) {
@@ -548,6 +569,40 @@ pub fn watch_badge<'a>(
     live_badge(
         "Watch their screen",
         Some(Message::Share(ShareMsg::Watch(user_id))),
+        false,
+        tokens,
+    )
+}
+
+/// The CAM badge a member on camera draws, pressable into their stream. Watching
+/// is receiving the media, which only happens from inside the voice channel, so
+/// the badge is inert anywhere else — and a second press comes back off it.
+pub fn camera_badge<'a>(
+    main: &'a MainState,
+    channel_id: i64,
+    user_id: i64,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, Message> {
+    if user_id == main.member_id {
+        return camera_badge_of("Your camera is on", None, false, tokens);
+    }
+    let joined = main.voice.is_live() && main.voice.channel_id == channel_id;
+    if !joined {
+        return camera_badge_of("Join the channel to watch", None, false, tokens);
+    }
+    if main.voice.cameras.tiles.contains_key(&user_id) {
+        return camera_badge_of(
+            "Stop watching their camera",
+            Some(Message::Camera(CameraMsg::StopWatching(user_id))),
+            true,
+            tokens,
+        );
+    }
+    // The cap is not a reason to draw the badge dead: the press is what says so,
+    // in a sentence.
+    camera_badge_of(
+        "Watch their camera",
+        Some(Message::Camera(CameraMsg::Watch(user_id))),
         false,
         tokens,
     )

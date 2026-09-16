@@ -31,14 +31,15 @@ use tokio_tungstenite::tungstenite::{
 use vorcall_proto::v1::{
     Attachment, Ban, BanMember, Category, Channel, ChannelKind, ChannelPosition, ChatMessage,
     ClientFrame, CreateCategory, CreateChannel, CreateRole, DeleteCategory, DeleteChannel,
-    DeleteMessage, DeleteRole, DeleteSound, EditMessage, ErrorCode, Hello, Image, Invite,
-    InviteCreated, JoinVoice, KickMember, LeaveVoice, MarkRead, MessagePage, OpenDm, Override,
-    Ping, PlaySound, Profile, React, Reaction, ReorderCategories, ReorderChannels, ReorderRoles,
-    Role, SendMessage, Server, ServerFrame, ServerSnapshot, SetMemberRoles, SetNickname,
-    SetOverride, Sound, StartShare, StopShare, StopSound, StreamRequest, StreamedFile,
-    TransferOwnership, UnbanMember, UnwatchShare, UpdateCategory, UpdateChannel, UpdateProfile,
-    UpdateRole, UpdateServer, UpdateSound, VoiceMember, VoiceModerate, VoiceSelfState, WatchShare,
-    client_frame, server_frame,
+    DeleteMessage, DeleteRole, DeleteSound, DeleteSticker, EditMessage, ErrorCode, Hello, Image,
+    Invite, InviteCreated, JoinVoice, KickMember, LeaveVoice, MarkRead, MessagePage, OpenDm,
+    Override, Ping, PlaySound, Profile, React, Reaction, ReorderCategories, ReorderChannels,
+    ReorderRoles, Role, SendMessage, Server, ServerFrame, ServerSnapshot, SetMemberRoles,
+    SetNickname, SetOverride, Sound, StartCamera, StartShare, Sticker, StopCamera, StopShare,
+    StopSound, StreamRequest, StreamedFile, TransferOwnership, UnbanMember, UnwatchCamera,
+    UnwatchShare, UpdateCategory, UpdateChannel, UpdateProfile, UpdateRole, UpdateServer,
+    UpdateSound, UpdateSticker, VoiceMember, VoiceModerate, VoiceSelfState, WatchCamera,
+    WatchShare, client_frame, server_frame,
 };
 
 use crate::admin;
@@ -93,6 +94,9 @@ pub enum Command {
         /// a message. Nothing was uploaded: the bytes stay on this disk and are
         /// read back out of this client.
         streamed_file_ids: Vec<i64>,
+        /// A sticker message: the server refuses one that also carries text,
+        /// attachments or streamed files.
+        sticker_id: Option<i64>,
     },
     /// The newest page of a channel, asked for when the UI first opens it.
     LoadHistory {
@@ -233,6 +237,33 @@ pub enum Command {
     DeleteSound {
         sound_id: i64,
     },
+    /// Turns the local camera on in a voice session. Needs VIDEO in that
+    /// channel and a live voice session there; idempotent server-side.
+    StartCamera {
+        channel_id: i64,
+    },
+    StopCamera {
+        channel_id: i64,
+    },
+    /// Adds one camera to the watched set, which the server caps at four.
+    WatchCamera {
+        channel_id: i64,
+        user_id: i64,
+    },
+    /// `user_id` 0 unwatches every camera in that channel.
+    UnwatchCamera {
+        channel_id: i64,
+        user_id: i64,
+    },
+    /// Renames a sticker; needs MANAGE_STICKERS.
+    UpdateSticker {
+        sticker_id: i64,
+        name: String,
+    },
+    /// Deletes a sticker; needs MANAGE_STICKERS.
+    DeleteSticker {
+        sticker_id: i64,
+    },
     /// One management frame. Nothing is awaited: the server answers with an
     /// `Error` or with the delta the change produced.
     Admin(AdminCommand),
@@ -273,6 +304,12 @@ impl Command {
             Self::StopSound { .. } => "StopSound",
             Self::UpdateSound { .. } => "UpdateSound",
             Self::DeleteSound { .. } => "DeleteSound",
+            Self::StartCamera { .. } => "StartCamera",
+            Self::StopCamera { .. } => "StopCamera",
+            Self::WatchCamera { .. } => "WatchCamera",
+            Self::UnwatchCamera { .. } => "UnwatchCamera",
+            Self::UpdateSticker { .. } => "UpdateSticker",
+            Self::DeleteSticker { .. } => "DeleteSticker",
             Self::Admin(inner) => inner.kind_name(),
             Self::Rest(_) => "Rest",
         }
@@ -759,6 +796,31 @@ pub enum Event {
     SoundStopped {
         channel_id: i64,
     },
+    CameraStarted {
+        channel_id: i64,
+        user_id: i64,
+    },
+    CameraStopped {
+        channel_id: i64,
+        user_id: i64,
+    },
+    /// Every camera this client watches now in that channel, ascending; empty
+    /// means none.
+    CameraWatchState {
+        channel_id: i64,
+        user_ids: Vec<i64>,
+    },
+    /// How many peers are watching the local camera.
+    CameraWatchers {
+        channel_id: i64,
+        count: u32,
+    },
+    StickerUpserted {
+        sticker: Sticker,
+    },
+    StickerDeleted {
+        sticker_id: i64,
+    },
     SendDropped,
     /// A management frame the loop could not send, named by its kind.
     AdminDropped {
@@ -873,6 +935,23 @@ fn describe(frame: &ServerFrame) -> String {
             let channel_id = stopped.channel_id;
             format!("SoundStopped {{ channel_id: {channel_id} }}")
         }
+        // A sticker's name is what somebody typed, like a clip's.
+        Some(server_frame::Payload::StickerUpserted(upserted)) => match &upserted.sticker {
+            Some(sticker) => {
+                let id = sticker.id;
+                let uploader_id = sticker.uploader_id;
+                let name_len = sticker.name.len();
+                let size = sticker.size;
+                format!(
+                    "StickerUpserted {{ id: {id}, uploader_id: {uploader_id}, name_len: {name_len}, size: {size} }}"
+                )
+            }
+            None => "StickerUpserted { sticker: None }".to_owned(),
+        },
+        Some(server_frame::Payload::StickerDeleted(deleted)) => {
+            let sticker_id = deleted.sticker_id;
+            format!("StickerDeleted {{ sticker_id: {sticker_id} }}")
+        }
         // Nothing here needs redacting today; naming every field keeps a later
         // addition to the frame out of the `{frame:?}` catch-all by accident.
         Some(server_frame::Payload::StreamRequest(request)) => {
@@ -897,8 +976,9 @@ fn describe_message(message: &ChatMessage) -> String {
     let text_len = message.text.len();
     let attachments = message.attachments.len();
     let reply_to = message.reply_to.is_some();
+    let sticker_id = message.sticker_id;
     format!(
-        "id: {id}, channel_id: {channel_id}, author_id: {author_id}, text_len: {text_len}, attachments: {attachments}, reply_to: {reply_to}"
+        "id: {id}, channel_id: {channel_id}, author_id: {author_id}, text_len: {text_len}, attachments: {attachments}, reply_to: {reply_to}, sticker_id: {sticker_id}"
     )
 }
 
@@ -954,6 +1034,12 @@ fn classify_first_frame(payload: Option<server_frame::Payload>) -> FirstFrame {
         Some(server_frame::Payload::SoundDeleted(_)) => FirstFrame::Ignore("SoundDeleted"),
         Some(server_frame::Payload::SoundPlayed(_)) => FirstFrame::Ignore("SoundPlayed"),
         Some(server_frame::Payload::SoundStopped(_)) => FirstFrame::Ignore("SoundStopped"),
+        Some(server_frame::Payload::CameraStarted(_)) => FirstFrame::Ignore("CameraStarted"),
+        Some(server_frame::Payload::CameraStopped(_)) => FirstFrame::Ignore("CameraStopped"),
+        Some(server_frame::Payload::CameraWatchState(_)) => FirstFrame::Ignore("CameraWatchState"),
+        Some(server_frame::Payload::CameraWatchers(_)) => FirstFrame::Ignore("CameraWatchers"),
+        Some(server_frame::Payload::StickerUpserted(_)) => FirstFrame::Ignore("StickerUpserted"),
+        Some(server_frame::Payload::StickerDeleted(_)) => FirstFrame::Ignore("StickerDeleted"),
         None => FirstFrame::Unknown,
     }
 }
@@ -1540,6 +1626,18 @@ async fn drop_command(command: Command, events: &mut mpsc::Sender<Event>) -> boo
         }
         Command::UpdateSound { sound_id, .. } | Command::DeleteSound { sound_id } => {
             tracing::debug!(sound_id, "cannot manage a sound while disconnected");
+            true
+        }
+        // No event: the UI re-asserts the camera state after the next VoiceReady.
+        Command::StartCamera { channel_id }
+        | Command::StopCamera { channel_id }
+        | Command::WatchCamera { channel_id, .. }
+        | Command::UnwatchCamera { channel_id, .. } => {
+            tracing::debug!(channel_id, "cannot change the camera while disconnected");
+            true
+        }
+        Command::UpdateSticker { sticker_id, .. } | Command::DeleteSticker { sticker_id } => {
+            tracing::debug!(sticker_id, "cannot manage a sticker while disconnected");
             true
         }
         // No event either: the UI disables these while disconnected.
@@ -3018,6 +3116,41 @@ where
                                     channel_id: stopped.channel_id,
                                 });
                             }
+                            Some(server_frame::Payload::CameraStarted(started)) => {
+                                emit_or_break!('live, events, Event::CameraStarted {
+                                    channel_id: started.channel_id,
+                                    user_id: started.user_id,
+                                });
+                            }
+                            Some(server_frame::Payload::CameraStopped(stopped)) => {
+                                emit_or_break!('live, events, Event::CameraStopped {
+                                    channel_id: stopped.channel_id,
+                                    user_id: stopped.user_id,
+                                });
+                            }
+                            Some(server_frame::Payload::CameraWatchState(state)) => {
+                                emit_or_break!('live, events, Event::CameraWatchState {
+                                    channel_id: state.channel_id,
+                                    user_ids: state.user_ids,
+                                });
+                            }
+                            Some(server_frame::Payload::CameraWatchers(watchers)) => {
+                                emit_or_break!('live, events, Event::CameraWatchers {
+                                    channel_id: watchers.channel_id,
+                                    count: watchers.count,
+                                });
+                            }
+                            Some(server_frame::Payload::StickerUpserted(upserted)) => {
+                                match upserted.sticker {
+                                    Some(sticker) => emit_or_break!('live, events, Event::StickerUpserted { sticker }),
+                                    None => tracing::warn!("ignoring a StickerUpserted without a sticker"),
+                                }
+                            }
+                            Some(server_frame::Payload::StickerDeleted(deleted)) => {
+                                emit_or_break!('live, events, Event::StickerDeleted {
+                                    sticker_id: deleted.sticker_id,
+                                });
+                            }
                             // The app owns the registry: it resolves the id to a
                             // local file and answers with `ServeStream`, or
                             // declines the transfer itself.
@@ -3215,13 +3348,14 @@ where
                 tracing::debug!(kind = command.kind_name(), "command");
 
                 match command {
-                    Command::Send { channel_id, text, reply_to_id, attachment_ids, streamed_file_ids } => {
+                    Command::Send { channel_id, text, reply_to_id, attachment_ids, streamed_file_ids, sticker_id } => {
                         let payload = client_frame::Payload::Send(SendMessage {
                             text,
                             channel_id,
                             reply_to_id: reply_to_id.unwrap_or_default(),
                             attachment_ids,
                             streamed_file_ids,
+                            sticker_id: sticker_id.unwrap_or_default(),
                         });
                         if let Err(e) = send_frame(sink, payload).await {
                             tracing::warn!(error = %e, "cannot send the message");
@@ -3303,6 +3437,30 @@ where
                     Command::DeleteSound { sound_id } => send_or_break!(
                         'live, sink, "DeleteSound",
                         client_frame::Payload::DeleteSound(DeleteSound { sound_id })
+                    ),
+                    Command::StartCamera { channel_id } => send_or_break!(
+                        'live, sink, "StartCamera",
+                        client_frame::Payload::StartCamera(StartCamera { channel_id })
+                    ),
+                    Command::StopCamera { channel_id } => send_or_break!(
+                        'live, sink, "StopCamera",
+                        client_frame::Payload::StopCamera(StopCamera { channel_id })
+                    ),
+                    Command::WatchCamera { channel_id, user_id } => send_or_break!(
+                        'live, sink, "WatchCamera",
+                        client_frame::Payload::WatchCamera(WatchCamera { channel_id, user_id })
+                    ),
+                    Command::UnwatchCamera { channel_id, user_id } => send_or_break!(
+                        'live, sink, "UnwatchCamera",
+                        client_frame::Payload::UnwatchCamera(UnwatchCamera { channel_id, user_id })
+                    ),
+                    Command::UpdateSticker { sticker_id, name } => send_or_break!(
+                        'live, sink, "UpdateSticker",
+                        client_frame::Payload::UpdateSticker(UpdateSticker { sticker_id, name })
+                    ),
+                    Command::DeleteSticker { sticker_id } => send_or_break!(
+                        'live, sink, "DeleteSticker",
+                        client_frame::Payload::DeleteSticker(DeleteSticker { sticker_id })
                     ),
                     // Fire and forget: the server answers with an `Error` or
                     // with the delta the change produced.
@@ -4071,9 +4229,15 @@ mod tests {
             server_frame::Payload::SoundDeleted(Default::default()),
             server_frame::Payload::SoundPlayed(Default::default()),
             server_frame::Payload::SoundStopped(Default::default()),
+            server_frame::Payload::CameraStarted(Default::default()),
+            server_frame::Payload::CameraStopped(Default::default()),
+            server_frame::Payload::CameraWatchState(Default::default()),
+            server_frame::Payload::CameraWatchers(Default::default()),
+            server_frame::Payload::StickerUpserted(Default::default()),
+            server_frame::Payload::StickerDeleted(Default::default()),
         ];
-        // `ServerFrame` carries 34 payloads: these are all but Welcome and Error.
-        assert_eq!(ignored.len(), 32);
+        // `ServerFrame` carries 40 payloads: these are all but Welcome and Error.
+        assert_eq!(ignored.len(), 38);
 
         for payload in ignored {
             let printed = format!("{payload:?}");

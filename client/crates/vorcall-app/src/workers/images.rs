@@ -22,12 +22,13 @@ pub const MAX_SIDE: u32 = 1600;
 /// How much of the cache survives a start.
 pub const CACHE_LIMIT: u64 = 500 << 20;
 
-/// Which image one cache entry is. Attachment and image ids are both
+/// Which image one cache entry is. Attachment, image and sticker ids are all
 /// server-assigned and independent of each other, so the kind is part of the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ImageKey {
     Attachment(i64),
     Image(i64),
+    Sticker(i64),
 }
 
 impl ImageKey {
@@ -36,6 +37,7 @@ impl ImageKey {
         match self {
             Self::Attachment(id) => format!("attachment-{id}"),
             Self::Image(id) => format!("image-{id}"),
+            Self::Sticker(id) => format!("sticker-{id}"),
         }
     }
 }
@@ -325,6 +327,24 @@ mod tests {
                 .expect("the fixture encodes");
         }
         gif
+    }
+
+    /// The three kinds share one cache directory and each carries a
+    /// server-assigned id of its own, so nothing but the prefix keeps an
+    /// attachment, an image and a sticker of the same id apart.
+    #[test]
+    fn every_kind_of_key_is_cached_under_a_name_of_its_own() {
+        assert_eq!(ImageKey::Attachment(7).file_name(), "attachment-7");
+        assert_eq!(ImageKey::Image(7).file_name(), "image-7");
+        assert_eq!(ImageKey::Sticker(7).file_name(), "sticker-7");
+
+        let names = [
+            ImageKey::Attachment(7).file_name(),
+            ImageKey::Image(7).file_name(),
+            ImageKey::Sticker(7).file_name(),
+        ];
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
     }
 
     fn rect(x: u32, y: u32, width: u32, height: u32) -> Rectangle<u32> {

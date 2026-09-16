@@ -4,7 +4,6 @@
 //! watcher decodes whatever the relay hands back. Both run on worker threads,
 //! because the encoder, the decoder and [`FrameSender::send_video`] all block.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -12,13 +11,14 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::error::TryRecvError;
-use vorcall_core::Event;
-use vorcall_screen::codec::{EncoderSettings, VideoDecoder, VideoEncoder};
+use vorcall_screen::codec::{EncoderSettings, Usage, VideoDecoder, VideoEncoder};
 use vorcall_screen::pattern::test_pattern;
 use vorcall_screen::preset::{FrameRate, Preset, Resolution};
 use vorcall_voice::codec::StereoEncoder;
 use vorcall_voice::tone::Tone;
 use vorcall_voice::{AccessUnit, FRAME_MS, FRAME_SAMPLES, FrameSender, STEREO_FRAME_SAMPLES};
+
+use crate::Roster;
 
 /// The share tone: 660 Hz on the left, the same tone halved on the right. The
 /// asymmetry is what [`is_share_tone`] recognizes on the other side.
@@ -36,21 +36,20 @@ const MAX_SHARE_PACKET: usize = 1024;
 /// How long the decode thread waits before looking for another access unit.
 const DECODE_POLL: Duration = Duration::from_millis(2);
 
-/// `WxH`, both even and non-zero — H.264 subsamples chroma by two.
-pub fn parse_size(raw: &str) -> Result<(u32, u32), String> {
+/// `WxH`, both even and non-zero — H.264 subsamples chroma by two. `flag` names
+/// the option being parsed, since the camera has a size of its own.
+pub fn parse_size(flag: &str, raw: &str) -> Result<(u32, u32), String> {
     let (width, height) = raw
         .split_once(['x', 'X'])
-        .ok_or_else(|| format!("--share-size wants WxH, got {raw}"))?;
+        .ok_or_else(|| format!("{flag} wants WxH, got {raw}"))?;
     let width: u32 = width
         .parse()
-        .map_err(|_| format!("--share-size wants WxH, got {raw}"))?;
+        .map_err(|_| format!("{flag} wants WxH, got {raw}"))?;
     let height: u32 = height
         .parse()
-        .map_err(|_| format!("--share-size wants WxH, got {raw}"))?;
+        .map_err(|_| format!("{flag} wants WxH, got {raw}"))?;
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(format!(
-            "--share-size wants even, non-zero dimensions, got {raw}"
-        ));
+        return Err(format!("{flag} wants even, non-zero dimensions, got {raw}"));
     }
     Ok((width, height))
 }
@@ -180,6 +179,7 @@ fn send_share_video(sender: FrameSender, plan: SharePlan) -> ShareOutcome {
         fps: plan.fps.hz(),
         bitrate_kbps: plan.bitrate_kbps,
         threads: plan.threads,
+        usage: Usage::Screen,
     }) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -231,6 +231,9 @@ fn send_share_video(sender: FrameSender, plan: SharePlan) -> ShareOutcome {
     outcome
 }
 
+/// Keeps the share's stereo tone going on a real-time 20 ms clock of its own,
+/// away from the encoder next door: the timestamps it stamps are a sample
+/// clock, so a watcher hears one unbroken run whatever the video thread does.
 fn send_share_tone(sender: FrameSender, seconds: u64) {
     let mut encoder = match StereoEncoder::new() {
         Ok(encoder) => encoder,
@@ -239,6 +242,7 @@ fn send_share_tone(sender: FrameSender, seconds: u64) {
             return;
         }
     };
+    sender.reset_share_audio_clock();
     let mut tone = Tone::new(SHARE_TONE_HZ, SHARE_TONE_AMPLITUDE);
     let mut mono = [0.0f32; FRAME_SAMPLES];
     let mut pcm = [0.0f32; STEREO_FRAME_SAMPLES];
@@ -291,9 +295,28 @@ impl DecodeOutcome {
     }
 }
 
-struct Decode {
+/// One decode thread and the flag that stops it. Shared with the camera
+/// watcher, which decodes the same H.264 the same way.
+pub struct Decode {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<DecodeOutcome>,
+}
+
+impl Decode {
+    pub fn start(units: UnboundedReceiver<AccessUnit>, name: &str) -> Decode {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || decode_units(units, flag))
+            .expect("spawning the decode thread");
+        Decode { stop, handle }
+    }
+
+    pub fn finish(self) -> DecodeOutcome {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.join().unwrap_or_default()
+    }
 }
 
 /// Drives the watcher: finds the sharer, asks for their stream, and keeps the
@@ -304,7 +327,6 @@ pub struct WatchPlan {
     /// The watch has to be confirmed by then, or the run has failed.
     pub confirm_by: Instant,
     user_id: Option<i64>,
-    sharing: HashSet<i64>,
     requested: bool,
     confirmed: bool,
     decode: Option<Decode>,
@@ -317,7 +339,6 @@ impl WatchPlan {
             channel_id,
             confirm_by,
             user_id: None,
-            sharing: HashSet::new(),
             requested: false,
             confirmed: false,
             decode: None,
@@ -332,42 +353,14 @@ impl WatchPlan {
         self.confirmed
     }
 
-    /// Follows who is sharing, from the roster and from the share events.
-    pub fn note(&mut self, event: &Event) {
-        match event {
-            Event::VoiceState { members, .. } => {
-                for member in members {
-                    if member.sharing {
-                        self.sharing.insert(member.user_id);
-                    } else {
-                        self.sharing.remove(&member.user_id);
-                    }
-                }
-            }
-            Event::VoiceMemberJoined { member, .. } if member.sharing => {
-                self.sharing.insert(member.user_id);
-            }
-            Event::ShareStarted { user_id, .. } => {
-                self.sharing.insert(*user_id);
-            }
-            Event::ShareStopped { user_id, .. } | Event::VoiceMemberLeft { user_id, .. } => {
-                self.sharing.remove(user_id);
-            }
-            _ => {}
-        }
-    }
-
     /// The user id to watch, once the target is both known and sharing and no
     /// watch has been asked for yet.
-    pub fn pending_request(&mut self, names: &HashMap<u32, (i64, String)>) -> Option<i64> {
+    pub fn pending_request(&mut self, roster: &Roster) -> Option<i64> {
         if self.requested {
             return None;
         }
-        let user_id = names
-            .values()
-            .find(|(_, username)| *username == self.user)
-            .map(|(user_id, _)| *user_id)?;
-        if !self.sharing.contains(&user_id) {
+        let user_id = roster.user_id_of(&self.user)?;
+        if !roster.sharing.contains(&user_id) {
             return None;
         }
         self.requested = true;
@@ -383,23 +376,11 @@ impl WatchPlan {
             tracing::warn!("the access units were taken already; decoding nothing");
             return;
         };
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
-        let handle = std::thread::Builder::new()
-            .name("probe-decode".to_owned())
-            .spawn(move || decode_units(units, flag))
-            .expect("spawning the decode thread");
-        self.decode = Some(Decode { stop, handle });
+        self.decode = Some(Decode::start(units, "probe-decode"));
     }
 
     pub fn finish(self) -> DecodeOutcome {
-        match self.decode {
-            Some(decode) => {
-                decode.stop.store(true, Ordering::Relaxed);
-                decode.handle.join().unwrap_or_default()
-            }
-            None => DecodeOutcome::default(),
-        }
+        self.decode.map(Decode::finish).unwrap_or_default()
     }
 }
 
@@ -451,12 +432,21 @@ mod tests {
 
     #[test]
     fn share_size_parses_and_rejects_odd_values() {
-        assert_eq!(parse_size("1280x720"), Ok((1280, 720)));
-        assert_eq!(parse_size("640X480"), Ok((640, 480)));
+        assert_eq!(parse_size("--share-size", "1280x720"), Ok((1280, 720)));
+        assert_eq!(parse_size("--camera-size", "640X480"), Ok((640, 480)));
 
         for bad in ["1281x720", "1280x721", "0x720", "1280x0", "1280", "axb", ""] {
-            assert!(parse_size(bad).is_err(), "{bad} should not parse");
+            assert!(
+                parse_size("--share-size", bad).is_err(),
+                "{bad} should not parse"
+            );
         }
+        assert!(
+            parse_size("--camera-size", "1x1")
+                .expect_err("odd dimensions")
+                .contains("--camera-size"),
+            "the error names the flag that was given"
+        );
     }
 
     #[test]

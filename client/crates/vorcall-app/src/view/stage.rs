@@ -1,29 +1,36 @@
-//! The screen-share stage: the toolbar over the video, and the wgpu path that
-//! turns a decoded I420 picture into pixels.
+//! The stage: a watched screen share, the cameras beside it, the toolbar over
+//! the lot, and the wgpu path that turns a decoded I420 picture into pixels.
 //!
 //! [`view`] and [`popped`] read nothing but [`StageView`] and [`StageHandlers`],
 //! so the same stage is drawn in the chat column and in the popped-out window;
 //! [`in_chat`] and [`popped_window`] are what fill those in from the application
 //! state.
+//!
+//! Several pictures are on screen at once, and one renderer draws all of them
+//! through a single [`StagePipeline`] — so the planes are cached per tile rather
+//! than per renderer, and every primitive says which tile it is.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use iced::alignment::Vertical;
+use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    Space, button, column, container, pick_list, row, shader, slider, svg, text, tooltip,
+    Space, button, column, container, mouse_area, pick_list, row, shader, slider, stack, svg, text,
+    tooltip,
 };
-use iced::{Color, Element, Length, Rectangle, mouse, wgpu};
+use iced::{Color, Element, Length, Padding, Rectangle, mouse, wgpu};
 use vorcall_screen::codec::Picture;
 
-use crate::app::message::{Message, ShareMsg};
+use crate::app::message::{CameraMsg, Message, ShareMsg};
 use crate::app::state::rules::{self, SHARE_VOLUME_MAX};
+use crate::app::state::voice::CameraTileId;
 use crate::app::{App, MainState};
 use crate::icons::Icon;
 use crate::theme::{ThemeTokens, styles};
 use crate::view::widgets::ICON_SIZE;
-use crate::view::{TEXT_BODY, TEXT_SECONDARY};
+use crate::view::{TEXT_BADGE, TEXT_BODY, TEXT_SECONDARY};
 
 /// BT.709 limited range, the range the encoder writes. Black sits at 16 and white
 /// at 235 on the luma plane, neutral chroma at 128; the coefficients are the ones
@@ -45,16 +52,45 @@ const VOLUME_WIDTH: f32 = 120.0;
 /// everywhere else.
 const ICON_PADDING: f32 = 6.0;
 
+/// How tall the camera strip under a large picture is. The tiles are 16:9, so
+/// this is what decides their width as well.
+const STRIP_HEIGHT: f32 = 132.0;
+
+/// The gap between two tiles, and the inset of a tile's own name.
+const TILE_SPACING: f32 = 6.0;
+
+/// Where the grid goes to two columns: one tile fills the stage, two sit side by
+/// side, and everything past that is a grid.
+const GRID_COLUMNS: usize = 2;
+
+/// How many tiles' textures one renderer keeps. At most a share, this client's
+/// own preview and four watched cameras are ever on screen; the rest are peers
+/// who have come and gone, and their planes are worth evicting rather than
+/// holding for the window's life.
+const MAX_CACHED_TILES: usize = 8;
+
 /// What the stage sends back. The caller owns the message type, so the stage can
 /// be drawn from any of them.
 pub struct StageHandlers<M: Clone> {
     pub watch: fn(i64) -> M,
+    /// Stop watching the share, or — with no share on the stage — every camera.
     pub stop: M,
+    pub stop_cameras: M,
     pub pop_out: M,
     pub pop_in: M,
     pub fullscreen: M,
+    pub feature: fn(CameraTileId) -> M,
     pub volume: fn(f32) -> M,
     pub volume_released: M,
+}
+
+/// One camera on the stage, as the caller read it out of the state.
+pub struct StageTile<'a> {
+    pub id: CameraTileId,
+    /// The member's own name; this client's preview says "You".
+    pub name: Cow<'a, str>,
+    pub picture: Option<&'a Arc<Picture>>,
+    pub seq: u64,
 }
 
 /// Everything the stage draws, read out of the application state by the caller.
@@ -62,13 +98,57 @@ pub struct StageView<'a> {
     pub sharer: &'a str,
     pub sharers: Vec<(i64, String)>,
     pub current: i64,
+    /// The watched share's newest picture, when one is being watched at all.
     pub picture: Option<&'a Arc<Picture>>,
     pub seq: u64,
+    /// Whether a share is on the stage, which a share still waiting for its
+    /// first picture also is.
+    pub sharing: bool,
+    /// This client's own preview first, then the watched cameras by name.
+    pub cameras: Vec<StageTile<'a>>,
+    /// The camera a press promoted into the large picture.
+    pub featured: Option<CameraTileId>,
     pub has_audio: bool,
     pub volume: f32,
     pub stats: String,
     pub popped: bool,
     pub fullscreen: bool,
+}
+
+/// How the stage lays its pictures out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageLayout {
+    /// Nothing to draw at all.
+    Empty,
+    /// One large picture with `strip` tiles in a row beneath it.
+    Featured { strip: usize },
+    /// Tiles only, filling the stage.
+    Grid { rows: usize, columns: usize },
+}
+
+/// Where `tiles` pictures go: `featured` is a share on the stage, or a camera a
+/// press promoted, and it always takes the large picture with the rest in a row
+/// beneath. With no featured picture the tiles fill the stage — one alone, two
+/// side by side, and two columns past that.
+pub fn stage_layout(featured: bool, tiles: usize) -> StageLayout {
+    if featured {
+        return StageLayout::Featured { strip: tiles };
+    }
+    match tiles {
+        0 => StageLayout::Empty,
+        1 => StageLayout::Grid {
+            rows: 1,
+            columns: 1,
+        },
+        2 => StageLayout::Grid {
+            rows: 1,
+            columns: GRID_COLUMNS,
+        },
+        more => StageLayout::Grid {
+            rows: more.div_ceil(GRID_COLUMNS),
+            columns: GRID_COLUMNS,
+        },
+    }
 }
 
 /// The in-window stage: toolbar above the video.
@@ -91,39 +171,220 @@ pub fn popped<'a, M: Clone + 'a>(
 }
 
 fn content<'a, M: Clone + 'a>(
-    stage: StageView<'a>,
+    mut stage: StageView<'a>,
     handlers: StageHandlers<M>,
     tokens: &'a ThemeTokens,
     popped: bool,
 ) -> Element<'a, M> {
-    let video = video(stage.picture, stage.seq, tokens);
-    column![toolbar(stage, handlers, tokens, popped), video]
+    let cameras = std::mem::take(&mut stage.cameras);
+    let on_stage = cameras.len();
+    let body = body(&stage, cameras, handlers.feature, tokens);
+    column![toolbar(stage, handlers, on_stage, tokens, popped), body]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
+/// The pictures themselves, filling whatever is left under the toolbar.
+fn body<'a, M: Clone + 'a>(
+    stage: &StageView<'a>,
+    cameras: Vec<StageTile<'a>>,
+    feature: fn(CameraTileId) -> M,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, M> {
+    // A press on the promoted tile puts it back in the row, and one on any other
+    // swaps it into the large picture.
+    let mut strip: Vec<Element<'a, M>> = Vec::new();
+    let mut featured: Option<Element<'a, M>> = None;
+
+    for tile in cameras {
+        let promoted = stage.featured == Some(tile.id);
+        let press = feature(tile.id);
+        let drawn = camera_tile(tile, press, tokens);
+        if promoted && featured.is_none() {
+            featured = Some(drawn);
+        } else {
+            strip.push(drawn);
+        }
+    }
+
+    if stage.sharing {
+        // A promoted camera takes the large picture and the share joins the row,
+        // which is the only way round the two ever swap.
+        let share = share_tile(stage, tokens);
+        match featured {
+            Some(_) => strip.insert(0, share),
+            None => featured = Some(share),
+        }
+    }
+
+    match stage_layout(featured.is_some(), strip.len()) {
+        StageLayout::Empty => ground(waiting(tokens), tokens),
+        StageLayout::Featured { strip: 0 } => {
+            ground(featured.unwrap_or_else(|| waiting(tokens)), tokens)
+        }
+        StageLayout::Featured { .. } => {
+            let large = featured.unwrap_or_else(|| waiting(tokens));
+            // The strip keeps its height whatever the window does; the large
+            // picture takes the rest.
+            let row = row(strip)
+                .spacing(TILE_SPACING)
+                .height(Length::Fixed(STRIP_HEIGHT));
+            ground(
+                column![
+                    container(large).width(Length::Fill).height(Length::Fill),
+                    container(row).width(Length::Fill).padding(
+                        Padding::ZERO
+                            .left(TILE_SPACING)
+                            .right(TILE_SPACING)
+                            .bottom(TILE_SPACING),
+                    ),
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+                tokens,
+            )
+        }
+        StageLayout::Grid { columns, .. } => {
+            let mut rows: Vec<Element<'a, M>> = Vec::new();
+            let mut cells: Vec<Element<'a, M>> = Vec::new();
+            for tile in strip {
+                cells.push(tile);
+                if cells.len() == columns {
+                    rows.push(grid_row(std::mem::take(&mut cells)));
+                }
+            }
+            if !cells.is_empty() {
+                rows.push(grid_row(cells));
+            }
+            ground(
+                column(rows)
+                    .spacing(TILE_SPACING)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(TILE_SPACING)
+                    .into(),
+                tokens,
+            )
+        }
+    }
+}
+
+/// The stage's own surface, which is what the letterbox bars around every tile
+/// are.
+fn ground<'a, M: 'a>(content: Element<'a, M>, tokens: &'a ThemeTokens) -> Element<'a, M> {
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(styles::container::chat(tokens))
+        .into()
+}
+
+fn grid_row<'a, M: 'a>(cells: Vec<Element<'a, M>>) -> Element<'a, M> {
+    row(cells)
+        .spacing(TILE_SPACING)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// The watched share, which is never pressable: it is the large picture unless a
+/// camera has been promoted over it, and the pick list is what changes sharer.
+fn share_tile<'a, M: Clone + 'a>(stage: &StageView<'a>, tokens: &'a ThemeTokens) -> Element<'a, M> {
+    labelled(
+        picture(stage.picture, stage.seq, TileId::Share, tokens),
+        Cow::Borrowed(stage.sharer),
+        tokens,
+    )
+}
+
+/// One camera, labelled and pressable into the large picture.
+fn camera_tile<'a, M: Clone + 'a>(
+    tile: StageTile<'a>,
+    press: M,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, M> {
+    let drawn = labelled(
+        picture(tile.picture, tile.seq, TileId::from(tile.id), tokens),
+        tile.name,
+        tokens,
+    );
+    mouse_area(drawn).on_press(press).into()
+}
+
+/// A picture with the member's name over its bottom-left corner.
+fn labelled<'a, M: 'a>(
+    body: Element<'a, M>,
+    name: Cow<'a, str>,
+    tokens: &'a ThemeTokens,
+) -> Element<'a, M> {
+    let label = container(
+        text(name.into_owned())
+            .size(TEXT_BADGE)
+            .color(tokens.text_primary),
+    )
+    .padding([2.0, 6.0])
+    .style(styles::container::popover(tokens));
+
+    stack![
+        container(body).width(Length::Fill).height(Length::Fill),
+        container(label)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(TILE_SPACING)
+            .align_x(Horizontal::Left)
+            .align_y(Vertical::Bottom),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn waiting<'a, M: 'a>(tokens: &'a ThemeTokens) -> Element<'a, M> {
+    container(
+        text("Waiting for video…")
+            .size(TEXT_BODY)
+            .color(tokens.text_muted),
+    )
+    .center(Length::Fill)
+    .into()
+}
+
 fn toolbar<'a, M: Clone + 'a>(
     stage: StageView<'a>,
     handlers: StageHandlers<M>,
+    cameras_on_stage: usize,
     tokens: &'a ThemeTokens,
     popped: bool,
 ) -> Element<'a, M> {
     let StageHandlers {
         watch,
         stop,
+        stop_cameras,
         pop_out,
         pop_in,
         fullscreen,
+        feature: _,
         volume,
         volume_released,
     } = handlers;
 
+    // With no share on the stage the cameras are what is being watched, and the
+    // close button comes off all of them at once.
+    let (icon, title, close) = if stage.sharing {
+        (Icon::Screen, format!("Watching {}", stage.sharer), stop)
+    } else {
+        let title = match cameras_on_stage {
+            1 => "Watching 1 camera".to_owned(),
+            _ => format!("Watching {cameras_on_stage} cameras"),
+        };
+        (Icon::Image, title, stop_cameras)
+    };
+
     let mut bar = row![
-        glyph(Icon::Screen, tokens.text_secondary),
-        text(format!("Watching {}", stage.sharer))
-            .size(TEXT_BODY)
-            .color(tokens.text_primary),
+        glyph(icon, tokens.text_secondary),
+        text(title).size(TEXT_BODY).color(tokens.text_primary),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
@@ -131,7 +392,7 @@ fn toolbar<'a, M: Clone + 'a>(
     // In fullscreen the video is the whole window: only the controls that get the
     // viewer back out of it, and the volume, stay. With a single sharer there is
     // nothing to pick between, so the name above is the whole story.
-    if !stage.fullscreen && stage.sharers.len() > 1 {
+    if !stage.fullscreen && stage.sharing && stage.sharers.len() > 1 {
         let options: Vec<Sharer> = stage
             .sharers
             .into_iter()
@@ -153,7 +414,8 @@ fn toolbar<'a, M: Clone + 'a>(
 
     bar = bar.push(Space::new().width(Length::Fill));
 
-    if stage.has_audio {
+    // Only a share carries audio, so the volume belongs to one.
+    if stage.sharing && stage.has_audio {
         bar = bar.push(
             slider(0.0..=SHARE_VOLUME_MAX, stage.volume, volume)
                 .on_release(volume_released)
@@ -169,11 +431,13 @@ fn toolbar<'a, M: Clone + 'a>(
     }
 
     if !stage.fullscreen {
-        bar = bar.push(
-            text(stage.stats)
-                .size(TEXT_SECONDARY)
-                .color(tokens.text_muted),
-        );
+        if !stage.stats.is_empty() {
+            bar = bar.push(
+                text(stage.stats)
+                    .size(TEXT_SECONDARY)
+                    .color(tokens.text_muted),
+            );
+        }
         let (tip, press) = if popped {
             ("Pop in", pop_in)
         } else {
@@ -196,7 +460,7 @@ fn toolbar<'a, M: Clone + 'a>(
         button(glyph(Icon::Close, tokens.text_on_accent))
             .padding(ICON_PADDING)
             .style(styles::button::danger(tokens))
-            .on_press(stop),
+            .on_press(close),
         "Stop watching",
         tokens,
     ));
@@ -208,28 +472,27 @@ fn toolbar<'a, M: Clone + 'a>(
         .into()
 }
 
-/// The picture itself, filling whatever is left under the toolbar.
-fn video<'a, M: 'a>(
-    picture: Option<&'a Arc<Picture>>,
+/// One picture, letterboxed inside whatever box it is given. The letterbox bars
+/// are this container's ground: the shader only paints inside the aspect-fitted
+/// rectangle.
+fn picture<'a, M: 'a>(
+    decoded: Option<&'a Arc<Picture>>,
     seq: u64,
+    tile: TileId,
     tokens: &'a ThemeTokens,
 ) -> Element<'a, M> {
-    let body: Element<'a, M> = match picture {
-        Some(picture) => shader(StageProgram {
-            picture: Some(picture.clone()),
+    let body: Element<'a, M> = match decoded {
+        Some(decoded) => shader(StageProgram {
+            picture: Some(decoded.clone()),
             seq,
+            tile,
         })
         .width(Length::Fill)
         .height(Length::Fill)
         .into(),
-        None => text("Waiting for video…")
-            .size(TEXT_BODY)
-            .color(tokens.text_muted)
-            .into(),
+        None => waiting(tokens),
     };
 
-    // The letterbox bars are this container's ground: the shader only paints
-    // inside the aspect-fitted rectangle.
     container(body)
         .center(Length::Fill)
         .style(styles::container::chat(tokens))
@@ -295,10 +558,31 @@ impl fmt::Display for Sharer {
     }
 }
 
+/// Which picture a tile draws, and the key its textures are cached under. Every
+/// tile on the stage keeps a set of its own: one renderer draws all of them
+/// through the single pipeline below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TileId {
+    Share,
+    /// This client's own preview.
+    Own,
+    Peer(i64),
+}
+
+impl From<CameraTileId> for TileId {
+    fn from(tile: CameraTileId) -> Self {
+        match tile {
+            CameraTileId::Own => TileId::Own,
+            CameraTileId::Peer(user_id) => TileId::Peer(user_id),
+        }
+    }
+}
+
 /// One decoded picture on its way to the shader.
 pub struct StageProgram {
     pub picture: Option<Arc<Picture>>,
     pub seq: u64,
+    pub tile: TileId,
 }
 
 impl<M> shader::Program<M> for StageProgram {
@@ -309,6 +593,7 @@ impl<M> shader::Program<M> for StageProgram {
         StagePrimitive {
             picture: self.picture.clone(),
             seq: self.seq,
+            tile: self.tile,
         }
     }
 }
@@ -317,16 +602,18 @@ impl<M> shader::Program<M> for StageProgram {
 pub struct StagePrimitive {
     pub picture: Option<Arc<Picture>>,
     pub seq: u64,
+    pub tile: TileId,
 }
 
 impl fmt::Debug for StagePrimitive {
-    /// Sizes only: a picture is somebody's screen.
+    /// Sizes only: a picture is somebody's screen or somebody's face.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let size = self
             .picture
             .as_ref()
             .map(|picture| (picture.width, picture.height));
         f.debug_struct("StagePrimitive")
+            .field("tile", &self.tile)
             .field("size", &size)
             .field("seq", &self.seq)
             .finish()
@@ -351,34 +638,44 @@ impl shader::Primitive for StagePrimitive {
             return;
         }
 
-        let stale = pipeline
-            .planes
-            .as_ref()
-            .is_none_or(|planes| planes.width != picture.width || planes.height != picture.height);
+        pipeline.clock += 1;
+        let touched = pipeline.clock;
+        let stale = pipeline.tiles.get(&self.tile).is_none_or(|cached| {
+            cached.planes.width != picture.width || cached.planes.height != picture.height
+        });
         if stale {
-            pipeline.planes = Some(Planes::new(
-                device,
-                &pipeline.layout,
-                &pipeline.sampler,
-                picture.width,
-                picture.height,
-            ));
-            pipeline.uploaded_seq = None;
+            pipeline.tiles.insert(
+                self.tile,
+                Cached {
+                    planes: Planes::new(
+                        device,
+                        &pipeline.layout,
+                        &pipeline.sampler,
+                        picture.width,
+                        picture.height,
+                    ),
+                    uploaded_seq: None,
+                    fit: None,
+                    touched,
+                },
+            );
+            pipeline.evict(self.tile);
         }
 
-        let Some(planes) = pipeline.planes.as_ref() else {
+        let Some(cached) = pipeline.tiles.get_mut(&self.tile) else {
             return;
         };
+        cached.touched = touched;
 
         // The primitive is rebuilt on every view(); only a new decoded picture is
         // worth the three uploads.
-        if pipeline.uploaded_seq != Some(self.seq) {
+        if cached.uploaded_seq != Some(self.seq) {
             let chroma_width = picture.width.div_ceil(2);
             let chroma_height = picture.height.div_ceil(2);
 
             upload(
                 queue,
-                &planes.y,
+                &cached.planes.y,
                 &picture.y,
                 picture.y_stride,
                 picture.width,
@@ -386,7 +683,7 @@ impl shader::Primitive for StagePrimitive {
             );
             upload(
                 queue,
-                &planes.u,
+                &cached.planes.u,
                 &picture.u,
                 picture.uv_stride,
                 chroma_width,
@@ -394,20 +691,20 @@ impl shader::Primitive for StagePrimitive {
             );
             upload(
                 queue,
-                &planes.v,
+                &cached.planes.v,
                 &picture.v,
                 picture.uv_stride,
                 chroma_width,
                 chroma_height,
             );
 
-            pipeline.uploaded_seq = Some(self.seq);
+            cached.uploaded_seq = Some(self.seq);
         }
 
         // iced draws with the render pass's viewport already set to the widget in
         // physical pixels; the fit is the same rectangle, shrunk to the picture's
         // aspect ratio.
-        pipeline.fit = Some(fit_rect(
+        cached.fit = Some(fit_rect(
             *bounds * viewport.scale_factor(),
             picture.width,
             picture.height,
@@ -415,7 +712,10 @@ impl shader::Primitive for StagePrimitive {
     }
 
     fn draw(&self, pipeline: &StagePipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        let (Some(planes), Some(fit)) = (pipeline.planes.as_ref(), pipeline.fit) else {
+        let Some(cached) = pipeline.tiles.get(&self.tile) else {
+            return false;
+        };
+        let Some(fit) = cached.fit else {
             return false;
         };
         if fit.width < 1.0 || fit.height < 1.0 {
@@ -423,7 +723,7 @@ impl shader::Primitive for StagePrimitive {
         }
 
         render_pass.set_pipeline(&pipeline.render);
-        render_pass.set_bind_group(0, &planes.bind_group, &[]);
+        render_pass.set_bind_group(0, &cached.planes.bind_group, &[]);
         render_pass.set_viewport(fit.x, fit.y, fit.width, fit.height, 0.0, 1.0);
         render_pass.draw(0..3, 0..1);
 
@@ -431,16 +731,45 @@ impl shader::Primitive for StagePrimitive {
     }
 }
 
-/// The Y, U and V planes on the device, one set per renderer engine — and one
-/// stage is on screen per window, so they belong to whatever picture that
-/// window's renderer last prepared.
+/// The Y, U and V planes on the device, one set per tile per renderer engine:
+/// several tiles are on screen at once and every window's renderer has a
+/// pipeline of its own.
 pub struct StagePipeline {
     render: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     layout: wgpu::BindGroupLayout,
-    planes: Option<Planes>,
+    tiles: HashMap<TileId, Cached>,
+    /// Counts prepares, so the least recently drawn tile can be told from the
+    /// rest without a clock of any other kind.
+    clock: u64,
+}
+
+/// One tile's planes, what was last uploaded into them and where they are drawn.
+struct Cached {
+    planes: Planes,
     uploaded_seq: Option<u64>,
     fit: Option<Rectangle>,
+    touched: u64,
+}
+
+impl StagePipeline {
+    /// Drops the tile drawn longest ago once the cache is over its bound, never
+    /// the one being prepared. A peer who left is the only thing that ever fills
+    /// it up, and their planes are megabytes.
+    fn evict(&mut self, keep: TileId) {
+        while self.tiles.len() > MAX_CACHED_TILES {
+            let Some(oldest) = self
+                .tiles
+                .iter()
+                .filter(|(tile, _)| **tile != keep)
+                .min_by_key(|(_, cached)| cached.touched)
+                .map(|(tile, _)| *tile)
+            else {
+                return;
+            };
+            self.tiles.remove(&oldest);
+        }
+    }
 }
 
 impl shader::Pipeline for StagePipeline {
@@ -527,15 +856,14 @@ impl shader::Pipeline for StagePipeline {
             render,
             sampler,
             layout,
-            planes: None,
-            uploaded_seq: None,
-            fit: None,
+            tiles: HashMap::new(),
+            clock: 0,
         }
     }
 
     // trim() is left at its no-op default: dropping the planes between frames
     // would cost a full re-upload on the next one, and they go with the pipeline
-    // when the window does.
+    // when the window does. `evict` is what bounds the map instead.
 }
 
 struct Planes {
@@ -743,12 +1071,16 @@ pub fn popped_window<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Messa
 /// What the stage reads out of the state.
 fn stage_view(main: &MainState) -> StageView<'_> {
     let watch = &main.voice.watch;
+    let sharing = watch.state.is_some();
     StageView {
         sharer: rules::sharer_name(&main.voice, &main.server),
         sharers: rules::sharer_list(&main.voice, main.member_id),
         current: watch.state.unwrap_or_default(),
         picture: watch.picture.as_ref(),
         seq: watch.seq,
+        sharing,
+        cameras: camera_tiles(main),
+        featured: main.voice.cameras.featured(),
         has_audio: watch
             .state
             .and_then(|user_id| main.voice.sharing(user_id))
@@ -756,10 +1088,42 @@ fn stage_view(main: &MainState) -> StageView<'_> {
         // Every step of a drag reaches the mixer through this; only its release
         // reaches `config.share_volume` and the disk.
         volume: watch.volume,
-        stats: stats_line(main),
+        stats: if sharing {
+            stats_line(main)
+        } else {
+            camera_stats_line(main)
+        },
         popped: watch.popped.is_some(),
         fullscreen: watch.fullscreen.is_some(),
     }
+}
+
+/// The camera tiles in the order the stage draws them, each with the newest
+/// picture decoded for it — this client's own preview included.
+fn camera_tiles(main: &MainState) -> Vec<StageTile<'_>> {
+    let voice = &main.voice;
+    rules::camera_tile_list(
+        voice.camera.active,
+        &voice.cameras.watched(),
+        voice.roster(),
+    )
+    .into_iter()
+    .map(|(id, name)| {
+        let (picture, seq) = match id {
+            CameraTileId::Own => (voice.camera.preview.as_ref(), voice.camera.preview_seq),
+            CameraTileId::Peer(user_id) => match voice.cameras.tiles.get(&user_id) {
+                Some(tile) => (tile.picture.as_ref(), tile.seq),
+                None => (None, 0),
+            },
+        };
+        StageTile {
+            id,
+            name: Cow::Owned(name),
+            picture,
+            seq,
+        }
+    })
+    .collect()
 }
 
 /// The picture's own size, the decoder's rate, and what the depacketizer took in:
@@ -775,14 +1139,33 @@ fn stats_line(main: &MainState) -> String {
     format!("{width}×{height} · {fps:.0} fps · {kbps} kbit/s")
 }
 
+/// What the cameras on the stage are decoding at, once there is no share to
+/// describe instead. The slowest tile is the one a viewer notices, so that is
+/// the rate worth showing.
+fn camera_stats_line(main: &MainState) -> String {
+    let slowest = main
+        .voice
+        .cameras
+        .tiles
+        .values()
+        .filter_map(|tile| tile.stats.map(|(decode_fps, _, _)| decode_fps))
+        .min_by(f32::total_cmp);
+    match slowest {
+        Some(fps) => format!("{fps:.0} fps"),
+        None => String::new(),
+    }
+}
+
 /// The messages the stage sends.
 fn handlers() -> StageHandlers<Message> {
     StageHandlers {
         watch: |user_id| Message::Share(ShareMsg::Watch(user_id)),
         stop: Message::Share(ShareMsg::StopWatching),
+        stop_cameras: Message::Camera(CameraMsg::StopWatchingAll),
         pop_out: Message::Share(ShareMsg::PopOut),
         pop_in: Message::Share(ShareMsg::PopIn),
         fullscreen: Message::Share(ShareMsg::ToggleFullscreen),
+        feature: |tile| Message::Camera(CameraMsg::Feature(tile)),
         volume: |volume| Message::Share(ShareMsg::SetVolume(volume)),
         volume_released: Message::Share(ShareMsg::VolumeReleased),
     }
@@ -884,6 +1267,97 @@ mod tests {
         }
         for channel in white {
             assert!((channel - 1.0).abs() < 1e-4, "white channel {channel}");
+        }
+    }
+
+    /// A share on the stage, or a camera promoted over it, is always the large
+    /// picture, and everything else is a row under it.
+    #[test]
+    fn a_featured_picture_puts_the_rest_in_a_row() {
+        for tiles in 0..=5 {
+            assert_eq!(
+                stage_layout(true, tiles),
+                StageLayout::Featured { strip: tiles },
+                "{tiles} beside the large picture"
+            );
+        }
+    }
+
+    /// With nothing featured the cameras fill the stage: one alone, two side by
+    /// side, and two columns past that.
+    #[test]
+    fn cameras_alone_fill_the_stage_as_a_grid() {
+        assert_eq!(stage_layout(false, 0), StageLayout::Empty);
+        assert_eq!(
+            stage_layout(false, 1),
+            StageLayout::Grid {
+                rows: 1,
+                columns: 1
+            }
+        );
+        assert_eq!(
+            stage_layout(false, 2),
+            StageLayout::Grid {
+                rows: 1,
+                columns: 2
+            }
+        );
+        assert_eq!(
+            stage_layout(false, 3),
+            StageLayout::Grid {
+                rows: 2,
+                columns: 2
+            }
+        );
+        assert_eq!(
+            stage_layout(false, 4),
+            StageLayout::Grid {
+                rows: 2,
+                columns: 2
+            }
+        );
+        // Four watched cameras and this client's own preview is the most there
+        // can ever be.
+        assert_eq!(
+            stage_layout(false, 5),
+            StageLayout::Grid {
+                rows: 3,
+                columns: 2
+            }
+        );
+    }
+
+    /// Every grid holds every tile it was given: a row short of a column still
+    /// gets a row of its own.
+    #[test]
+    fn every_grid_has_room_for_its_tiles() {
+        for tiles in 1..=5 {
+            let StageLayout::Grid { rows, columns } = stage_layout(false, tiles) else {
+                panic!("{tiles} tiles laid out without a grid");
+            };
+            assert!(
+                rows * columns >= tiles,
+                "{tiles} tiles into {rows}x{columns}"
+            );
+            assert!(
+                (rows - 1) * columns < tiles,
+                "{rows}x{columns} has an empty row for {tiles} tiles"
+            );
+        }
+    }
+
+    /// The share, the local preview and each peer keep their own textures: one
+    /// renderer draws all of them through one pipeline.
+    #[test]
+    fn every_tile_is_its_own_cache_key() {
+        assert_eq!(TileId::from(CameraTileId::Own), TileId::Own);
+        assert_eq!(TileId::from(CameraTileId::Peer(9)), TileId::Peer(9));
+
+        let keys = [TileId::Share, TileId::Own, TileId::Peer(4), TileId::Peer(9)];
+        for (at, key) in keys.iter().enumerate() {
+            for other in &keys[at + 1..] {
+                assert_ne!(key, other);
+            }
         }
     }
 

@@ -24,6 +24,7 @@ public sealed class ServerFixture : IAsyncLifetime
     public const int TightDiagnosticsPerHour = 2;
     public const int TightAuthPerWindow = 3;
     public const int TightStreamTimeoutSeconds = 1;
+    public const int TightCamerasPerRoom = 2;
 
     private const string DefaultAdminConnectionString =
         "Host=localhost;Port=5433;Username=vorcall;Password=vorcall;Database=postgres";
@@ -84,6 +85,17 @@ public sealed class ServerFixture : IAsyncLifetime
     public Task<VorcallFactory> ShareDisabledAsync() => NamedAsync(
         "share-off",
         settings => settings["Vorcall:ShareEnabled"] = "false");
+
+    // Cameras off, voice and screen sharing on: the two kill switches are independent.
+    public Task<VorcallFactory> CameraDisabledAsync() => NamedAsync(
+        "camera-off",
+        settings => settings["Vorcall:CameraEnabled"] = "false");
+
+    // A channel ceiling of two cameras, which a party of three reaches without needing nine
+    // accounts in one voice session.
+    public Task<VorcallFactory> TightCamerasAsync() => NamedAsync(
+        "tight-cameras",
+        settings => settings["Vorcall:MaxCamerasPerRoom"] = TightCamerasPerRoom.ToString(CultureInfo.InvariantCulture));
 
     // No relay at all: JoinVoice answers VOICE_UNAVAILABLE.
     public Task<VorcallFactory> VoiceDisabledAsync() => NamedAsync(

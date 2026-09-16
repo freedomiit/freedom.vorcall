@@ -176,6 +176,7 @@ try
     AttachmentsEndpoints.Map(app);
     ImagesEndpoints.Map(app);
     SoundsEndpoints.Map(app);
+    StickersEndpoints.Map(app);
     StreamsEndpoints.Map(app);
     InvitesEndpoints.Map(app);
     BansEndpoints.Map(app);

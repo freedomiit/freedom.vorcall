@@ -10,9 +10,9 @@ public static class Seed
     public const string EveryoneRoleName = "everyone";
 
     // VIEW_CHANNEL | SEND_MESSAGES | ATTACH_FILES | ADD_REACTIONS | CONNECT | SPEAK |
-    // SHARE_SCREEN | CHANGE_NICKNAME | SOUNDPAD — the everyone defaults of PROTOCOL.md § Roles and
-    // permissions, as Permissions.Perms.EveryoneDefault and the migration's insert spell them.
-    public const long EveryonePermissions = 3206912;
+    // SHARE_SCREEN | CHANGE_NICKNAME | SOUNDPAD | VIDEO — the everyone defaults of PROTOCOL.md § Roles
+    // and permissions, as Permissions.Perms.EveryoneDefault and the migration's insert spell them.
+    public const long EveryonePermissions = 11595520;
 
     public const string GeneralCategoryName = "General";
 

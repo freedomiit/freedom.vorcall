@@ -258,6 +258,8 @@ public sealed class MemberDirectory(
                         .SetProperty(m => m.MentionIds, Array.Empty<long>())
                         .SetProperty(m => m.MentionEveryone, false)
                         .SetProperty(m => m.MentionHere, false)
+                        .SetProperty(m => m.StickerId, (long?)null)
+                        .SetProperty(m => m.IsSticker, false)
                         .SetProperty(m => m.DeletedAt, (DateTime?)now),
                     ct);
             await db.Reactions.Where(r => messageIds.Contains(r.MessageId)).ExecuteDeleteAsync(ct);

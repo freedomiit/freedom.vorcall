@@ -34,16 +34,21 @@ app. What there is:
   for joining, leaving, muting and deafening.
 - **Screen sharing** — a monitor or a single window, with its audio, watched by everyone
   else in the channel.
+- **Camera** — a second video stream beside (or instead of) a screen share, watched
+  independently, up to four cameras at once per viewer.
 - **A shared soundpad** — short clips anyone may upload once and anyone may fire into a
   voice channel, played by every client in it.
-- **Roles and permissions**: 23 of them, with colours, icons and a hierarchy, overridable
+- **A sticker library** — small images anyone may send in place of a message, shared by
+  the whole server.
+- **Roles and permissions**: 25 of them, with colours, icons and a hierarchy, overridable
   per channel and per member.
-- **Messages** with replies, edits, reactions and attachments of any file type — up to
-  2 GiB kept on the server, anything larger streamed straight off the sender's machine;
-  selectable text, clickable links, paste a file to attach it; unread and mention counts;
-  `@everyone` and `@here`.
+- **Messages** with replies, edits, reactions, stickers and attachments of any file type —
+  up to 2 GiB kept on the server, anything larger streamed straight off the sender's
+  machine; selectable text, clickable links, paste a file to attach it; unread and mention
+  counts; `@everyone` and `@here`.
 - **Profiles**: avatar, banner, nickname, description, accent colour.
 - **Moderation**: kick, ban, server mute and deafen, move, invite revocation.
+- **Desktop notifications** for messages that arrive while the window isn't focused.
 - **A native desktop client** for Linux, Windows and macOS — Rust and `iced`, not a browser
   in a box. Themable, with a quick switcher and rebindable keys.
 

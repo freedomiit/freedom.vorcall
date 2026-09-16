@@ -138,9 +138,15 @@ internal sealed class WsClient : IAsyncDisposable
         Kind.ShareStarted, Kind.ShareStopped, Kind.WatchState, Kind.ShareWatchers,
     };
 
+    // A camera signals on the voice session too, and independently of a share.
+    public static readonly IReadOnlySet<Kind> CameraKinds = new HashSet<Kind>
+    {
+        Kind.CameraStarted, Kind.CameraStopped, Kind.CameraWatchState, Kind.CameraWatchers,
+    };
+
     // Voice frames (PROTOCOL.md "Voice") ride the same socket; a client without voice support
     // ignores them, and so does a read here unless it asks for one.
-    public static readonly IReadOnlySet<Kind> VoiceKinds = new HashSet<Kind>(ShareKinds)
+    public static readonly IReadOnlySet<Kind> VoiceKinds = new HashSet<Kind>(ShareKinds.Concat(CameraKinds))
     {
         Kind.VoiceReady, Kind.VoiceState, Kind.VoiceMemberJoined, Kind.VoiceMemberLeft, Kind.Speaking, Kind.VoiceMoved,
     };

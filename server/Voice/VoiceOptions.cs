@@ -2,28 +2,56 @@ using System.Globalization;
 
 namespace Vorcall.Server.Voice;
 
-// The relay's UDP endpoint and the screen share's ceilings. Every value has a usable default, so
-// an absent key is fine; a key that is present but unusable is not, and fails the boot like the
-// other Vorcall options.
+// The relay's UDP endpoint and the ceilings of the two video streams, a screen share and a camera.
+// Every value has a usable default, so an absent key is fine; a key that is present but unusable is
+// not, and fails the boot like the other Vorcall options.
 public sealed record VoiceOptions
 {
     public const int DefaultPort = 5005;
     public const int DefaultShareMaxKbps = 30_000;
+    public const int DefaultShareAudioMaxKbps = 256;
     public const int DefaultMaxSharersPerRoom = 3;
+    public const int DefaultCameraMaxKbps = 4_000;
+    public const int DefaultMaxCamerasPerRoom = 8;
+    public const int DefaultMaxWatchedCameras = 4;
 
     private const int ShareKbpsFloor = 1_000;
     private const int ShareKbpsCeiling = 200_000;
+    private const int ShareAudioKbpsFloor = 64;
+    private const int ShareAudioKbpsCeiling = 1_000;
     private const int SharersFloor = 1;
     private const int SharersCeiling = 16;
+    private const int CameraKbpsFloor = 500;
+    private const int CameraKbpsCeiling = 50_000;
+    private const int CamerasFloor = 1;
+    private const int CamerasCeiling = 16;
+    private const int WatchedCamerasFloor = 1;
+    private const int WatchedCamerasCeiling = 8;
 
-    private VoiceOptions(bool enabled, int port, string host, bool shareEnabled, int shareMaxKbps, int maxSharersPerRoom)
+    private VoiceOptions(
+        bool enabled,
+        int port,
+        string host,
+        bool shareEnabled,
+        int shareMaxKbps,
+        int shareAudioMaxKbps,
+        int maxSharersPerRoom,
+        bool cameraEnabled,
+        int cameraMaxKbps,
+        int maxCamerasPerRoom,
+        int maxWatchedCameras)
     {
         Enabled = enabled;
         Port = port;
         Host = host;
         ShareEnabled = shareEnabled;
         ShareMaxKbps = shareMaxKbps;
+        ShareAudioMaxKbps = shareAudioMaxKbps;
         MaxSharersPerRoom = maxSharersPerRoom;
+        CameraEnabled = cameraEnabled;
+        CameraMaxKbps = cameraMaxKbps;
+        MaxCamerasPerRoom = maxCamerasPerRoom;
+        MaxWatchedCameras = maxWatchedCameras;
     }
 
     public bool Enabled { get; }
@@ -37,10 +65,25 @@ public sealed record VoiceOptions
     // The kill switch for screen sharing: voice keeps working without it.
     public bool ShareEnabled { get; }
 
-    // The byte budget one sharer's video and share audio may spend, per session.
+    // The byte budget one sharer's video may spend, per session.
     public int ShareMaxKbps { get; }
 
+    // Share audio's own budget, separate from the video one so a burst of fragments cannot starve
+    // the audio that goes with it.
+    public int ShareAudioMaxKbps { get; }
+
     public int MaxSharersPerRoom { get; }
+
+    // The kill switch for cameras, independent of the share one: either may run without the other.
+    public bool CameraEnabled { get; }
+
+    // The byte budget one camera may spend, per session.
+    public int CameraMaxKbps { get; }
+
+    public int MaxCamerasPerRoom { get; }
+
+    // How many cameras one viewer may receive at once.
+    public int MaxWatchedCameras { get; }
 
     public static VoiceOptions FromConfiguration(IConfiguration configuration)
         => new(
@@ -49,7 +92,12 @@ public sealed record VoiceOptions
             configuration["Vorcall:VoiceHost"]?.Trim() ?? string.Empty,
             ParseEnabled(configuration["Vorcall:ShareEnabled"], "Vorcall:ShareEnabled"),
             ParseRange(configuration["Vorcall:ShareMaxKbps"], "Vorcall:ShareMaxKbps", DefaultShareMaxKbps, ShareKbpsFloor, ShareKbpsCeiling),
-            ParseRange(configuration["Vorcall:MaxSharersPerRoom"], "Vorcall:MaxSharersPerRoom", DefaultMaxSharersPerRoom, SharersFloor, SharersCeiling));
+            ParseRange(configuration["Vorcall:ShareAudioMaxKbps"], "Vorcall:ShareAudioMaxKbps", DefaultShareAudioMaxKbps, ShareAudioKbpsFloor, ShareAudioKbpsCeiling),
+            ParseRange(configuration["Vorcall:MaxSharersPerRoom"], "Vorcall:MaxSharersPerRoom", DefaultMaxSharersPerRoom, SharersFloor, SharersCeiling),
+            ParseEnabled(configuration["Vorcall:CameraEnabled"], "Vorcall:CameraEnabled"),
+            ParseRange(configuration["Vorcall:CameraMaxKbps"], "Vorcall:CameraMaxKbps", DefaultCameraMaxKbps, CameraKbpsFloor, CameraKbpsCeiling),
+            ParseRange(configuration["Vorcall:MaxCamerasPerRoom"], "Vorcall:MaxCamerasPerRoom", DefaultMaxCamerasPerRoom, CamerasFloor, CamerasCeiling),
+            ParseRange(configuration["Vorcall:MaxWatchedCameras"], "Vorcall:MaxWatchedCameras", DefaultMaxWatchedCameras, WatchedCamerasFloor, WatchedCamerasCeiling));
 
     private static bool ParseEnabled(string? configured, string key)
     {

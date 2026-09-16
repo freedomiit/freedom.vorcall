@@ -47,6 +47,13 @@ public sealed record AttachmentsOptions
 
     public const string SoundMediaType = "application/vnd.vorcall.sound";
 
+    // A sticker: one of the four image types, magic-checked like an image, at a far smaller cap
+    // since it is drawn at sticker size and never as a banner.
+    public const int StickerMaxFileBytes = 1 << 20;
+
+    // Complete rows only: an upload still in flight is not yet part of the library.
+    public const int MaxStickers = 200;
+
     // An upload nothing linked to a message within this is swept, file and row together; the same
     // age makes an unreferenced image sweepable.
     public static readonly TimeSpan UnlinkedTtl = TimeSpan.FromHours(1);

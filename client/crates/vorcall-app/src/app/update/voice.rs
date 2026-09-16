@@ -23,7 +23,7 @@ use crate::app::state::rules::{
 };
 use crate::app::state::sound::{Switch, Switches, press};
 use crate::app::state::voice::{EngineHandoff, HotkeyHandoff, HotkeyStatus, MediaSession, VoiceUi};
-use crate::app::update::share;
+use crate::app::update::{camera, share};
 use crate::app::{App, SPEAKING_WINDOW, STATS_EVERY, Status, VOICE_TICK};
 use crate::workers::lock;
 use crate::workers::share::ShareCommand;
@@ -329,8 +329,14 @@ pub fn close_session(app: &mut App) -> Task<Message> {
     voice.share.stopped();
     voice.watch.decoder = None;
     voice.watch.stopped();
+    // The camera and every tile under it read the same engine, so they go the
+    // same way.
+    camera::close(app);
 
-    let Some(session) = voice.take_session() else {
+    let Some(main) = app.main_mut() else {
+        return stage;
+    };
+    let Some(session) = main.voice.take_session() else {
         return stage;
     };
     tracing::debug!(
@@ -572,8 +578,9 @@ fn media_connected(app: &mut App, handoff: EngineHandoff) -> Task<Message> {
     // `VoiceReady` normally lands before this, so the watch is usually decided
     // right here rather than left waiting for one.
     let share = share::after_voice_ready(app);
+    let camera = camera::after_voice_ready(app);
     let hotkey = start_hotkey(app);
-    Task::batch([closing, events, share, hotkey])
+    Task::batch([closing, events, share, camera, hotkey])
 }
 
 fn media_failed(app: &mut App, reason: String) -> Task<Message> {
@@ -640,15 +647,25 @@ fn voice_state(app: &mut App, channel_id: i64, members: Vec<VoiceMember>) -> Tas
     push_peers(app);
     push_ducking(app);
 
-    // The media path came up before this roster did, so the watch a reconnect kept
-    // is still waiting to be judged.
-    let pending = app
-        .main()
-        .is_some_and(|main| main.voice.watch.resume_pending);
-    if pending {
-        return share::resume_watch(app);
-    }
-    Task::none()
+    // The media path came up before this roster did, so the watches a reconnect
+    // kept are still waiting to be judged.
+    let (share_pending, camera_pending) = app.main().map_or((false, false), |main| {
+        (
+            main.voice.watch.resume_pending,
+            main.voice.cameras.resume_pending,
+        )
+    });
+    let share = if share_pending {
+        share::resume_watch(app)
+    } else {
+        Task::none()
+    };
+    let cameras = if camera_pending {
+        camera::resume_watches(app)
+    } else {
+        Task::none()
+    };
+    Task::batch([share, cameras])
 }
 
 /// Whether one channel's roster frame is about the session this client is in,

@@ -174,6 +174,14 @@ fn member_row<'a>(
         ) {
             line = line.push(mark);
         }
+        if member.camera {
+            line = line.push(widgets::camera_badge(
+                main,
+                voice_channel_id,
+                user_id,
+                tokens,
+            ));
+        }
         if member.sharing {
             line = line.push(widgets::watch_badge(
                 main,
@@ -181,7 +189,7 @@ fn member_row<'a>(
                 user_id,
                 tokens,
             ));
-        } else {
+        } else if !member.camera {
             line = line.push(icons::icon(
                 Icon::Speaker,
                 widgets::ICON_MARK,

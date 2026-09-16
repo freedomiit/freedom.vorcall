@@ -104,6 +104,32 @@ internal static class Uploads
                 }
             });
 
+    // POST /api/stickers?name=..., the sticker store's own upload: four image types, magic-checked,
+    // at 1 MiB, behind MANAGE_STICKERS. Same door key, bearer and rate-limit policy as an attachment's.
+    public static Task<ProtoResponse> UploadStickerAsync(
+        VorcallFactory factory,
+        string bearer,
+        string name,
+        byte[] body,
+        string? contentType = "image/png",
+        long? declaredLength = null)
+        => Proto.PostBytesAsync(
+            factory,
+            $"/api/stickers?name={Uri.EscapeDataString(name)}",
+            body,
+            contentType,
+            bearer,
+            configure: request =>
+            {
+                if (declaredLength is { } length)
+                {
+                    request.Content!.Headers.ContentLength = length;
+                }
+            });
+
+    public static Task<ProtoResponse> DownloadStickerAsync(VorcallFactory factory, string bearer, long id)
+        => Proto.GetAsync(factory, $"/api/stickers/{id}", bearer);
+
     public static Task<ProtoResponse> DownloadSoundAsync(VorcallFactory factory, string bearer, long id, string? range = null)
         => Proto.GetAsync(
             factory,

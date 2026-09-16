@@ -22,6 +22,7 @@ public enum OpStatus
     UnknownUser,
     UnknownImage,
     UnknownSound,
+    UnknownSticker,
     NotInVoice,
     NotLive,
 }
@@ -1898,6 +1899,115 @@ public sealed partial class ConnectionRegistry
         return OpResult.Ok;
     }
 
+    // The endpoint's follow-up to a stored upload, like CreateSound: MANAGE_STICKERS was checked
+    // and the bytes are down, and the library is server-wide, so the upsert goes to everyone.
+    public void CreateSticker(StickerRecord record)
+    {
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            _stickerById[record.Id] = record;
+            BroadcastToAllLocked(StickerUpsertedOf(record), except: null, ref slow);
+        }
+
+        CloseSlow(slow);
+    }
+
+    // MANAGE_STICKERS is server-scoped, hence the null channel: no override can grant it.
+    public async Task<OpResult> UpdateStickerAsync(
+        ClientConnection connection,
+        long stickerId,
+        string name,
+        CancellationToken ct)
+    {
+        if (connection.UserId is not { } actorId)
+        {
+            return OpResult.Of(OpStatus.NotLive);
+        }
+
+        lock (_gate)
+        {
+            if (!IsLive(connection, actorId) || !_memberById.TryGetValue(actorId, out var actor))
+            {
+                return OpResult.Of(OpStatus.NotLive);
+            }
+
+            var allowed = CheckLocked(actor, null, Perm.ManageStickers);
+            if (!allowed.IsOk)
+            {
+                return allowed;
+            }
+
+            if (!_stickerById.ContainsKey(stickerId))
+            {
+                return OpResult.Of(OpStatus.UnknownSticker);
+            }
+        }
+
+        if (!await _stickers.RenameAsync(stickerId, name, ct))
+        {
+            return OpResult.Of(OpStatus.UnknownSticker);
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            if (_stickerById.TryGetValue(stickerId, out var record))
+            {
+                var renamed = record with { Name = name };
+                _stickerById[stickerId] = renamed;
+                BroadcastToAllLocked(StickerUpsertedOf(renamed), except: null, ref slow);
+            }
+        }
+
+        CloseSlow(slow);
+        return OpResult.Ok;
+    }
+
+    // The messages that sent it stay: the foreign key nulls their sticker_id and they keep reading
+    // as sticker messages.
+    public async Task<OpResult> DeleteStickerAsync(ClientConnection connection, long stickerId, CancellationToken ct)
+    {
+        if (connection.UserId is not { } actorId)
+        {
+            return OpResult.Of(OpStatus.NotLive);
+        }
+
+        lock (_gate)
+        {
+            if (!IsLive(connection, actorId) || !_memberById.TryGetValue(actorId, out var actor))
+            {
+                return OpResult.Of(OpStatus.NotLive);
+            }
+
+            var allowed = CheckLocked(actor, null, Perm.ManageStickers);
+            if (!allowed.IsOk)
+            {
+                return allowed;
+            }
+
+            if (!_stickerById.ContainsKey(stickerId))
+            {
+                return OpResult.Of(OpStatus.UnknownSticker);
+            }
+        }
+
+        if (!await _stickers.DeleteAsync(stickerId, ct))
+        {
+            return OpResult.Of(OpStatus.UnknownSticker);
+        }
+
+        List<ClientConnection>? slow = null;
+        lock (_gate)
+        {
+            _stickerById.Remove(stickerId);
+            BroadcastToAllLocked(StickerDeletedOf(stickerId), except: null, ref slow);
+        }
+
+        CloseSlow(slow);
+        return OpResult.Ok;
+    }
+
     // One clip plays per channel: this replaces whatever was playing, finished or not, and the
     // second SoundPlayed is the cut — PROTOCOL.md § Sounds sends no SoundStopped for one. The
     // audience is every member who may view the channel, the caller included, since the caller
@@ -2100,6 +2210,12 @@ public sealed partial class ConnectionRegistry
 
     private static ServerFrame SoundDeletedOf(long soundId)
         => new() { SoundDeleted = new SoundDeleted { SoundId = soundId } };
+
+    private static ServerFrame StickerUpsertedOf(StickerRecord sticker)
+        => new() { StickerUpserted = new StickerUpserted { Sticker = StickerOf(sticker) } };
+
+    private static ServerFrame StickerDeletedOf(long stickerId)
+        => new() { StickerDeleted = new StickerDeleted { StickerId = stickerId } };
 
     private static ServerFrame SoundPlayedOf(long channelId, long userId, long soundId)
         => new() { SoundPlayed = new SoundPlayed { ChannelId = channelId, UserId = userId, SoundId = soundId } };

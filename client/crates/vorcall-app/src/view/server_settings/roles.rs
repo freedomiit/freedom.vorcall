@@ -485,6 +485,7 @@ fn permission_groups<'a>(
                 permissions::BAN_MEMBERS,
                 permissions::CHANGE_NICKNAME,
                 permissions::MANAGE_SOUNDS,
+                permissions::MANAGE_STICKERS,
             ],
         ),
         (
@@ -505,6 +506,7 @@ fn permission_groups<'a>(
                 permissions::CONNECT,
                 permissions::SPEAK,
                 permissions::SHARE_SCREEN,
+                permissions::VIDEO,
                 permissions::MUTE_MEMBERS,
                 permissions::DEAFEN_MEMBERS,
                 permissions::MOVE_MEMBERS,

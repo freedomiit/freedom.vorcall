@@ -454,6 +454,7 @@ fn on_share_event(app: &mut App, event: ShareEvent) -> Task<Message> {
                 dropped = stats.dropped_frames,
                 skipped = stats.skipped_frames,
                 audio_frames = stats.audio_frames,
+                audio_passed_through = stats.audio_passed_through,
                 "sharing a screen"
             );
             if let Some(main) = app.main_mut() {
@@ -601,8 +602,13 @@ fn pop_out(app: &mut App) -> Task<Message> {
     let Some(main) = app.main_mut() else {
         return Task::none();
     };
+    // The pop-out carries the whole stage, cameras included, so it opens for
+    // anything on it rather than for a share alone.
+    if !rules::on_stage(&main.voice) {
+        return Task::none();
+    }
     let watch = &mut main.voice.watch;
-    if watch.state.is_none() || watch.popped.is_some() {
+    if watch.popped.is_some() {
         return Task::none();
     }
     // The stage leaves the window it was in, so nothing there is fullscreen for it

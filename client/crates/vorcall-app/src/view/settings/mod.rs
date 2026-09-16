@@ -178,6 +178,7 @@ fn server_tab_icon(tab: ServerTab) -> Icon {
         ServerTab::Roles => Icon::Shield,
         ServerTab::Members => Icon::Users,
         ServerTab::Sounds => Icon::Speaker,
+        ServerTab::Stickers => Icon::Star,
         ServerTab::Invites => Icon::Link,
         ServerTab::Bans => Icon::Ban,
     }

@@ -23,6 +23,7 @@ block2.workspace = true
 core-graphics.workspace = true
 dispatch2.workspace = true
 objc2.workspace = true
+objc2-av-foundation.workspace = true
 objc2-core-audio-types.workspace = true
 objc2-core-foundation.workspace = true
 objc2-core-media.workspace = true

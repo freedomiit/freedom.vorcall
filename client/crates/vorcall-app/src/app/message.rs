@@ -21,16 +21,18 @@ use vorcall_core::config::{Density, Entrance, TransmitMode};
 use vorcall_core::connection::Blob;
 use vorcall_core::images::ImagePurpose;
 use vorcall_core::update;
-use vorcall_core::{ApiFailure, ChannelKind, Session, Sound};
+use vorcall_core::{ApiFailure, ChannelKind, Session, Sound, Sticker};
 use vorcall_hotkey::Edge;
-use vorcall_screen::{Source, SourceId};
+use vorcall_screen::preset::CameraResolution;
+use vorcall_screen::{CameraSource, Source, SourceId};
 
 use crate::app::state::settings::{ServerTab, SettingsTab};
 use crate::app::state::sound::TrimEdge;
 use crate::app::state::ui::{Dialog, TransferSource};
-use crate::app::state::voice::{EngineHandoff, HotkeyHandoff};
+use crate::app::state::voice::{CameraTileId, EngineHandoff, HotkeyHandoff};
 // `vorcall_screen::Source` is a screen to capture; this one is a decoded audio
 // file waiting to be trimmed.
+use crate::workers::camera::CameraEvent;
 use crate::workers::clips::Source as ClipSource;
 use crate::workers::share::{ShareEvent, StageEvent};
 use crate::workers::voice::{AudioEvent, DeviceLists};
@@ -46,8 +48,12 @@ pub enum Message {
     Channels(ChannelsMsg),
     Voice(VoiceMsg),
     Share(ShareMsg),
+    /// This client's camera, and the ones it watches.
+    Camera(CameraMsg),
     /// The interface motifs and the shared soundpad.
     Sound(SoundMsg),
+    /// The shared sticker library.
+    Sticker(StickerMsg),
     Settings(SettingsMsg),
     Admin(AdminMsg),
     /// Framing a picked picture before it is uploaded.
@@ -345,6 +351,33 @@ pub enum ShareMsg {
     SetShareAudio(bool),
 }
 
+/// This client's camera, and the ones it watches.
+#[derive(Debug, Clone)]
+pub enum CameraMsg {
+    /// The camera switch in the voice card: on when it is off, off when it is
+    /// on.
+    Toggle,
+    /// What the camera thread reports. Never carries a picture: the preview
+    /// travels through the handle's mailbox.
+    Event(CameraEvent),
+    /// What one watched camera's decode thread reports.
+    Tile(i64, StageEvent),
+    Watch(i64),
+    StopWatching(i64),
+    /// Come off every camera at once, which is what the stage's close button
+    /// does when there is no share on it.
+    StopWatchingAll,
+    /// A press on one tile: into the large picture, or back out of it.
+    Feature(CameraTileId),
+    /// Every camera this machine can name, listed off the interface thread when
+    /// the Voice settings page opens.
+    DevicesListed(Vec<CameraSource>),
+    /// `None` is the system's default device.
+    SetDevice(Option<CameraSource>),
+    SetResolution(CameraResolution),
+    SetFps(u32),
+}
+
 /// The shared soundpad: playing a clip, and the library behind it.
 #[derive(Clone)]
 pub enum SoundMsg {
@@ -417,6 +450,53 @@ impl fmt::Debug for SoundMsg {
             Self::TrimApply => f.write_str("TrimApply"),
             Self::Uploaded(result) => match result {
                 Ok(sound) => write!(f, "Uploaded({}, {} bytes)", sound.id, sound.size),
+                Err(error) => write!(f, "Uploaded(Err({error}))"),
+            },
+            Self::RenameDraft(id, _) => write!(f, "RenameDraft({id}, <hidden>)"),
+            Self::RenameSave(id) => write!(f, "RenameSave({id})"),
+            Self::Delete(id) => write!(f, "Delete({id})"),
+        }
+    }
+}
+
+/// The shared sticker library: picking one to send, and managing the library.
+#[derive(Clone)]
+pub enum StickerMsg {
+    /// The composer's picker, which one press opens and the next closes.
+    TogglePicker,
+    ClosePicker,
+    /// Send one sticker as a message of its own into the channel in view.
+    Send(i64),
+    /// Add a sticker: the file dialog, off the interface thread.
+    PickFile,
+    /// The picked file: its name, the type it travels as, and its bytes. An
+    /// empty error is a dismissal rather than a failure, the same convention the
+    /// picture pickers use.
+    Picked(Result<(String, String, Blob), String>),
+    Uploaded(Result<Sticker, String>),
+    /// One sticker's name as it is being typed on the stickers page.
+    RenameDraft(i64, String),
+    RenameSave(i64),
+    Delete(i64),
+}
+
+impl fmt::Debug for StickerMsg {
+    /// A picked file is a picture and a sticker's name is somebody's text; a
+    /// debug file log always exists, so neither ever reaches one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TogglePicker => f.write_str("TogglePicker"),
+            Self::ClosePicker => f.write_str("ClosePicker"),
+            Self::Send(id) => write!(f, "Send({id})"),
+            Self::PickFile => f.write_str("PickFile"),
+            Self::Picked(result) => match result {
+                Ok((_, content_type, bytes)) => {
+                    write!(f, "Picked(<hidden>, {content_type}, {} bytes)", bytes.len())
+                }
+                Err(error) => write!(f, "Picked(Err({error}))"),
+            },
+            Self::Uploaded(result) => match result {
+                Ok(sticker) => write!(f, "Uploaded({}, {} bytes)", sticker.id, sticker.size),
                 Err(error) => write!(f, "Uploaded(Err({error}))"),
             },
             Self::RenameDraft(id, _) => write!(f, "RenameDraft({id}, <hidden>)"),

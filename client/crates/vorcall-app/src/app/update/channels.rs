@@ -120,6 +120,9 @@ pub fn select(app: &mut App, channel_id: i64) -> Task<Message> {
         // was in view, and so do the row states; a draft of a new message follows
         // the reader, because only an edit's text was another channel's message.
         main.chat.leave_channel();
+        // The picker belongs to the channel it was opened over, like the
+        // composer's other popovers.
+        main.sticker.picker_open = false;
     }
 
     // History is per channel and on demand: the first open is what asks for it.

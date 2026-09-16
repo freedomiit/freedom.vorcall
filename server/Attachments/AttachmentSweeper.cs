@@ -8,11 +8,13 @@ namespace Vorcall.Server.Attachments;
 // purpose, so its two passes reclaim what an upload that died mid-flight left behind: the rows
 // whose bytes never arrived, and the files no row names. An attachment row whose bytes never
 // finished arriving waits for the far longer incomplete cutoff instead, since a large upload can
-// still be in flight — a 16 MiB clip cannot, which is why its own cutoff is the short one.
+// still be in flight — a 16 MiB clip cannot, which is why its own cutoff is the short one. A
+// sticker is the library by definition too, and gets the same two passes on the same cutoff.
 public sealed class AttachmentSweeper(
     AttachmentStore store,
     ImageStore images,
     SoundStore sounds,
+    StickerStore stickers,
     ILogger<AttachmentSweeper> logger) : BackgroundService
 {
     // Late enough that a restart does not compete with the migration and the first connections.
@@ -42,20 +44,33 @@ public sealed class AttachmentSweeper(
                         now - AttachmentsOptions.UnlinkedTtl,
                         stoppingToken);
                     var orphanSoundFiles = await sounds.SweepOrphanFilesAsync(stoppingToken);
-                    if (removed > 0 || removedImages > 0 || incompleteSounds > 0 || orphanSoundFiles > 0)
+                    var incompleteStickers = await stickers.SweepIncompleteAsync(
+                        now - AttachmentsOptions.UnlinkedTtl,
+                        stoppingToken);
+                    var orphanStickerFiles = await stickers.SweepOrphanFilesAsync(stoppingToken);
+                    if (removed > 0
+                        || removedImages > 0
+                        || incompleteSounds > 0
+                        || orphanSoundFiles > 0
+                        || incompleteStickers > 0
+                        || orphanStickerFiles > 0)
                     {
                         logger.LogInformation(
                             "Swept {Count} unlinked attachments, {ImageCount} unreferenced images, "
-                            + "{SoundCount} incomplete sounds and {SoundFileCount} orphaned sound files",
+                            + "{SoundCount} incomplete sounds, {SoundFileCount} orphaned sound files, "
+                            + "{StickerCount} incomplete stickers and {StickerFileCount} orphaned sticker files",
                             removed,
                             removedImages,
                             incompleteSounds,
-                            orphanSoundFiles);
+                            orphanSoundFiles,
+                            incompleteStickers,
+                            orphanStickerFiles);
                     }
                     else
                     {
                         logger.LogDebug(
-                            "Swept no unlinked attachments, no unreferenced images, no incomplete sounds and no orphaned sound files");
+                            "Swept no unlinked attachments, no unreferenced images, no incomplete sounds, no orphaned sound files, "
+                            + "no incomplete stickers and no orphaned sticker files");
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)

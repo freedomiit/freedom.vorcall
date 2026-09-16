@@ -8,6 +8,7 @@ use vorcall_core::ChannelKind;
 
 use crate::app::message::{ChatMsg, Message, UiMsg, VoiceMsg};
 use crate::app::state::chat::ChannelUi;
+use crate::app::state::rules;
 use crate::app::state::server::channel_kind;
 use crate::app::{App, MainState, Status};
 use crate::icons::{self, Icon};
@@ -70,10 +71,11 @@ pub fn pane<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     .into()
 }
 
-/// Whether the stage belongs in this column: something is being watched and the
-/// pop-out window is not holding it.
+/// Whether the stage belongs in this column: there is a picture on it — a share,
+/// a watched camera or this client's own — and the pop-out window is not holding
+/// it.
 pub fn watching_here(main: &MainState) -> bool {
-    main.voice.watch.state.is_some() && main.voice.watch.popped.is_none()
+    rules::on_stage(&main.voice) && main.voice.watch.popped.is_none()
 }
 
 /// Where the "new messages" divider goes: the oldest message of the unread run at

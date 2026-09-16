@@ -143,14 +143,14 @@ Visibility is maintained per member: when a role, override, channel or category 
 
 A `Role` is `{id, name, color, icon_emoji, icon_image_id, position, permissions, hoist, everyone}`. `color` and `accent_color` are `0xRRGGBB` with `0` meaning "none". `position` orders the hierarchy: higher outranks lower. `hoist` asks clients to list the role's members as their own group. At most 100 roles exist, `@everyone` counted among them, so 99 are creatable; a create beyond that is `ERROR_CODE_INVALID_ARGUMENT{"roles"}`.
 
-`@everyone` is the row with `everyone = true`. It sits at position `0`, every member holds it implicitly, it cannot be deleted, and only its `permissions` may be edited — a frame touching its name, colour, icon, hoist or position is `ERROR_CODE_INVALID_ARGUMENT`. Its default permissions are `VIEW_CHANNEL | SEND_MESSAGES | ATTACH_FILES | ADD_REACTIONS | CONNECT | SPEAK | SHARE_SCREEN | CHANGE_NICKNAME | SOUNDPAD`.
+`@everyone` is the row with `everyone = true`. It sits at position `0`, every member holds it implicitly, it cannot be deleted, and only its `permissions` may be edited — a frame touching its name, colour, icon, hoist or position is `ERROR_CODE_INVALID_ARGUMENT`. Its default permissions are `VIEW_CHANNEL | SEND_MESSAGES | ATTACH_FILES | ADD_REACTIONS | CONNECT | SPEAK | SHARE_SCREEN | CHANGE_NICKNAME | SOUNDPAD | VIDEO` (`EVERYONE_DEFAULT = 11595520`).
 
 A member holds any number of further roles (`Profile.role_ids`). The name is painted by the highest-positioned role of that member whose `color` is non-zero; if none has one, the client's default text colour applies.
 
-`Permission` is a bit set (`uint64` on the wire, 23 bits defined). Bits split into two scopes:
+`Permission` is a bit set (`uint64` on the wire, 25 bits defined, `ALL = 0x1FFFFFF`). Bits split into two scopes:
 
-- **server-scoped** — `MANAGE_SERVER` (1), `MANAGE_ROLES` (4), `MANAGE_MEMBERS` (8), `MANAGE_INVITES` (32), `KICK_MEMBERS` (64), `BAN_MEMBERS` (128), `CHANGE_NICKNAME` (1048576), `MANAGE_SOUNDS` (4194304). They are held server-wide and **never** appear in an override; an override carrying one has that bit masked away.
-- **channel-scoped** — every other bit: `MANAGE_CHANNELS` (2), `MANAGE_MESSAGES` (16), `VIEW_CHANNEL` (256), `SEND_MESSAGES` (512), `ATTACH_FILES` (1024), `ADD_REACTIONS` (2048), `MENTION_EVERYONE` (4096), `CONNECT` (8192), `SPEAK` (16384), `SHARE_SCREEN` (32768), `MUTE_MEMBERS` (65536), `DEAFEN_MEMBERS` (131072), `MOVE_MEMBERS` (262144), `PRIORITY_SPEAKER` (524288), `SOUNDPAD` (2097152).
+- **server-scoped** — `MANAGE_SERVER` (1), `MANAGE_ROLES` (4), `MANAGE_MEMBERS` (8), `MANAGE_INVITES` (32), `KICK_MEMBERS` (64), `BAN_MEMBERS` (128), `CHANGE_NICKNAME` (1048576), `MANAGE_SOUNDS` (4194304), `MANAGE_STICKERS` (16777216). They are held server-wide and **never** appear in an override; an override carrying one has that bit masked away.
+- **channel-scoped** — every other bit: `MANAGE_CHANNELS` (2), `MANAGE_MESSAGES` (16), `VIEW_CHANNEL` (256), `SEND_MESSAGES` (512), `ATTACH_FILES` (1024), `ADD_REACTIONS` (2048), `MENTION_EVERYONE` (4096), `CONNECT` (8192), `SPEAK` (16384), `SHARE_SCREEN` (32768), `MUTE_MEMBERS` (65536), `DEAFEN_MEMBERS` (131072), `MOVE_MEMBERS` (262144), `PRIORITY_SPEAKER` (524288), `SOUNDPAD` (2097152), `VIDEO` (8388608).
 
 ### Resolution
 
@@ -226,7 +226,7 @@ Mentions on the wire are the token `<@user_id>`. Clients render it as the mentio
 
 Every error above is non-fatal. Every broadcast in this section is serialized under the same server lock as every other mutation.
 
-**Write rate limit** — the five frames any member may send without holding a permission draw from one token bucket per account: 20 tokens, refilling 2 per second (`Vorcall:MessageBurst`, `Vorcall:MessagesPerSecond`). Charged are `SendMessage`, `EditMessage`, `DeleteMessage`, `React` and `OpenDm`. A charged frame that finds the bucket empty is not handled at all and answers non-fatal `ERROR_CODE_RATE_LIMITED` (27) with detail `"too many messages, slow down"`; the client shows it as a notice. Reads, `MarkRead`, presence, voice and share signalling, pings, and every management and moderation frame (`CreateChannel`, `UpdateChannel`, `DeleteChannel`, `CreateCategory`, `UpdateCategory`, `DeleteCategory`, `ReorderChannels`, `ReorderCategories`, `SetOverride`, `CreateRole`, `UpdateRole`, `DeleteRole`, `ReorderRoles`, `SetMemberRoles`, `SetNickname`, `UpdateProfile`, `KickMember`, `BanMember`, `UnbanMember`, `VoiceModerate`, `UpdateServer` and `TransferOwnership`) are never charged — the last group because each sits behind a permission such as `MANAGE_CHANNELS` or `MANAGE_ROLES` that only a trusted member holds, so a throttled account can still navigate and a settings page can save a burst of changes.
+**Write rate limit** — one token bucket per account governs both the frames any member may send without holding a scarce permission and a few frames that do sit behind one but have no other spam control: 20 tokens, refilling 2 per second (`Vorcall:MessageBurst`, `Vorcall:MessagesPerSecond`). Charged are `SendMessage`, `EditMessage`, `DeleteMessage`, `React`, `OpenDm`, `PlaySound`, `StopSound`, `UpdateSound`, `DeleteSound`, `UpdateSticker` and `DeleteSticker` — the four soundpad frames because `SOUNDPAD` is an `@everyone` default and this bucket is the soundpad's only spam control, and the two sticker management frames alongside them for the same reason, even though `MANAGE_STICKERS` gates them. A charged frame that finds the bucket empty is not handled at all and answers non-fatal `ERROR_CODE_RATE_LIMITED` (27) with detail `"too many messages, slow down"`; the client shows it as a notice. Reads, `MarkRead`, presence, voice, share and camera signalling, pings, and every other management and moderation frame (`CreateChannel`, `UpdateChannel`, `DeleteChannel`, `CreateCategory`, `UpdateCategory`, `DeleteCategory`, `ReorderChannels`, `ReorderCategories`, `SetOverride`, `CreateRole`, `UpdateRole`, `DeleteRole`, `ReorderRoles`, `SetMemberRoles`, `SetNickname`, `UpdateProfile`, `KickMember`, `BanMember`, `UnbanMember`, `VoiceModerate`, `UpdateServer` and `TransferOwnership`) are never charged — each of those sits behind a permission such as `MANAGE_CHANNELS` or `MANAGE_ROLES` that only a trusted member holds and has no other reason to be throttled, so a throttled account can still navigate and a settings page can save a burst of changes.
 
 ## Attachments
 
@@ -364,6 +364,21 @@ The server keeps at most `Vorcall:MaxSharersPerRoom` (default 3) sharers per cha
 
 Sharing and watching are client intent and survive a reconnect the way "in voice" does: after `Welcome` and the new `JoinVoice`/`VoiceReady`, a client that was sharing sends `StartShare` again, and a client that was watching sends `WatchShare` again — the latter only if the watched user is still listed as sharing in the new `VoiceState`.
 
+### Camera
+
+A camera is a second video stream a voice member may run beside a screen share — independent of one, and independent of the other members' cameras: a channel holds at most `Vorcall:MaxCamerasPerRoom` (default 8) cameras at once, and a member may run its own camera and share a screen at the same time. `Vorcall:CameraEnabled` (default true) is the kill switch, separate from `Vorcall:ShareEnabled`: every `StartCamera` then answers non-fatal `ERROR_CODE_CAMERA_UNAVAILABLE`, while a share keeps working.
+
+- `StartCamera{channel_id}` — unknown or invisible channel: non-fatal `ERROR_CODE_UNKNOWN_CHANNEL`. Not in that channel's voice session: non-fatal `ERROR_CODE_NOT_IN_VOICE`. Without `VIDEO` in it: non-fatal `ERROR_CODE_PERMISSION_DENIED{"VIDEO"}`. Camera video disabled on the server: non-fatal `ERROR_CODE_CAMERA_UNAVAILABLE`. The channel already at its camera limit: non-fatal `ERROR_CODE_CAMERA_LIMIT`. Otherwise the session is marked as on camera, `CameraStarted{channel_id, user_id}` is broadcast to every viewer of the channel, **the owner included**, and the owner receives `CameraWatchers{channel_id, count}` (non-zero when watchers of an already-running camera kept their watch). The frame is idempotent: repeating it re-sends both frames, restarts nothing on the relay, and does not count against the limit again.
+- `StopCamera{channel_id}` — unknown or invisible channel: `ERROR_CODE_UNKNOWN_CHANNEL`. Not in that channel's voice session: non-fatal `ERROR_CODE_NOT_IN_VOICE`. In voice but not on camera: non-fatal `ERROR_CODE_NOT_ON_CAMERA`. Otherwise `CameraStopped{channel_id, user_id}` is broadcast to the same audience and every watcher of that camera receives a fresh `CameraWatchState` with it removed.
+- `WatchCamera{channel_id, user_id}` — unknown or invisible channel: `ERROR_CODE_UNKNOWN_CHANNEL`. The viewer not in that channel's voice session: `ERROR_CODE_NOT_IN_VOICE`. `user_id` naming the viewer itself: non-fatal `ERROR_CODE_FORBIDDEN` — a client draws its own camera from its own capture, never watched back over the relay. The named user not on camera in that channel: non-fatal `ERROR_CODE_NOT_ON_CAMERA`. Already watching it: idempotent, only the viewer's own `CameraWatchState` is re-sent and the owner is not told again. Otherwise, once the viewer's watched set already holds `Vorcall:MaxWatchedCameras` (default 4) cameras: non-fatal `ERROR_CODE_CAMERA_WATCH_LIMIT`. Otherwise the camera is **added** to the viewer's watched set — unlike `WatchShare`, this does not replace a previous watch — the viewer receives `CameraWatchState{channel_id, user_ids}` carrying its whole set, and the camera's owner receives a fresh `CameraWatchers`.
+- `UnwatchCamera{channel_id, user_id}` — unknown or invisible channel: `ERROR_CODE_UNKNOWN_CHANNEL`. Not in that channel's voice session: non-fatal `ERROR_CODE_NOT_IN_VOICE`. `user_id = 0` drops every camera the caller watches in that channel; any other value drops that one, if watched. Idempotent either way: the caller receives `CameraWatchState` carrying whatever remains, and each camera actually dropped sends its owner a fresh `CameraWatchers`.
+
+Audience: `CameraStarted` and `CameraStopped` go to every viewer of the channel, in voice or not, the camera's owner included. `CameraWatchState` goes only to the viewer it describes, carrying its whole watched set (at most `Vorcall:MaxWatchedCameras`); `CameraWatchers` only to the camera's owner, on every change to its watcher count.
+
+A camera ends whenever the voice session behind it ends, exactly as a share does — `LeaveVoice`, a moderator's move or disconnect, a lost `VIEW_CHANNEL`/`CONNECT`, the connection ending, or a session replacement — and `CameraStopped` is sent before `VoiceMemberLeft`. A viewer's watch of a camera ends silently the same way when the viewer's own voice session ends.
+
+`VoiceMember.camera` carries the same fact in `VoiceState` and `VoiceMemberJoined`, so a client that arrives late learns who is already on camera without waiting for a `CameraStarted`.
+
 ### Sounds
 
 A **sound** is a short audio clip in one shared library. The library is server-wide: every member sees every clip, there is nothing per member or per channel. The whole of it travels in `ServerSnapshot.sounds`, and `SoundUpserted{sound}` / `SoundDeleted{sound_id}` keep it current — both go to **everyone**, like a role delta.
@@ -388,6 +403,22 @@ offset 18  frames x [ length u16 LE (1..1275) ][ opus packet ]
 
 Media type `application/vnd.vorcall.sound`. Duration is `frames * 20` ms. The server validates the container's shape and **never decodes a sample**: it accepts the body only when the magic matches, the rate is 48000, `channels` is 2, `reserved` is 0, `frames` is in range, every `length` is in range, and walking all the lengths lands exactly on end-of-body.
 
+### Stickers
+
+A **sticker** is a small image in one shared, server-wide library — the sticker library's own soundpad: every member sees every sticker, there is nothing per member or per channel, and a sticker message carries no text of its own. The whole library travels in `ServerSnapshot.stickers`, and `StickerUpserted{sticker}` / `StickerDeleted{sticker_id}` keep it current — both go to **everyone**.
+
+- `SendMessage.sticker_id` sends a sticker: when it is non-zero, `text`, `attachment_ids` and `streamed_file_ids` must all be empty, else non-fatal `ERROR_CODE_INVALID_MESSAGE` with detail `"a sticker message carries no text, attachments or streamed files"`. The id must name a sticker in the library, checked after `SEND_MESSAGES` is confirmed like every other `SendMessage` rule, else non-fatal `ERROR_CODE_UNKNOWN_STICKER`. A `reply_to_id` is still allowed on a sticker message. The result's `ChatMessage.sticker` is true and `sticker_id` non-zero.
+- A sticker message **cannot be edited**: `EditMessage` on one is non-fatal `ERROR_CODE_INVALID_MESSAGE`, detail `"a sticker message cannot be edited"`. It can still be tombstoned like any other message, by `DeleteMessage` or by a ban.
+- Deleting the sticker itself (`DeleteSticker`, below) does not touch the messages that sent it: they keep `sticker = true` but their `sticker_id` becomes `0`, which a client reads as "this sticker no longer exists" and renders as "Sticker removed" rather than losing the message.
+- `UpdateSticker{sticker_id, name}` and `DeleteSticker{sticker_id}` require `MANAGE_STICKERS` (server-scoped, so a channel override can never grant it), else `ERROR_CODE_PERMISSION_DENIED{"MANAGE_STICKERS"}`; an invalid `name` is `ERROR_CODE_INVALID_ARGUMENT{"name"}`, checked before the permission; an unknown id is `ERROR_CODE_UNKNOWN_STICKER`. They broadcast `StickerUpserted` and `StickerDeleted` to everyone.
+
+The bytes are uploaded with `POST /api/stickers?name=<name>`, which answers the `Sticker`, and read back with `GET /api/stickers/{id}`; both need the door key and a bearer access token.
+
+- **Upload** — the raw image bytes as the body, held to an image's rules: `Content-Type` must be one of `image/png`, `image/jpeg`, `image/gif`, `image/webp` (else `415 ApiError{"unsupported image type"}`), magic-byte checked as the body streams in (else `400 ApiError{"body is not the declared image type"}`), and at most 1 MiB (`413 ApiError{"stickers must be 1 MiB or smaller"}`). Needs `MANAGE_STICKERS` (`403 ApiError{"MANAGE_STICKERS"}`); no `Content-Length` is `411 ApiError{"length required"}`. The library already holding 200 complete stickers: `409 ApiError{"the sticker library is full"}`. The storage quota and the 20-uploads-per-minute-per-user rate limit are the attachment upload's, shared with attachments, images, sounds and stream offers. Success is `201 Sticker{id, name, uploader_id, content_type, size}`.
+- **Download** — any bearer may read any sticker; an unknown id, or a row whose file is missing, is `404`. The response carries `Content-Length`, the strong `ETag` `"<id>"` — the id alone, like an image's, because a sticker's bytes never change — `Cache-Control: private, max-age=31536000, immutable`, and Range support.
+
+Sticker names follow the usual 1..32 scalar grammar. At most 200 stickers exist in the library at once; deleting one frees a slot for another.
+
 ### Media transport
 
 Media takes a separate UDP path, IPv4, default port 5005 (`Vorcall:VoicePort`), advertised in `VoiceReady`. An empty `VoiceReady.host` means the host part of the WebSocket URL.
@@ -396,15 +427,15 @@ Every datagram is big-endian, with the header in clear and used as AEAD associat
 
 ```
 offset 0   ver    u8   = 1
-offset 1   type   u8   1 = audio, 2 = ping, 3 = pong, 4 = video, 5 = share audio, 6 = keyframe request
-offset 2   flags  u8   bit 0 = marker (talk-spurt start for audio, first packet of a share-audio run); other bits 0
+offset 1   type   u8   1 = audio, 2 = ping, 3 = pong, 4 = video, 5 = share audio, 6 = keyframe request, 7 = camera video, 8 = camera keyframe request
+offset 2   flags  u8   bit 0 = marker (talk-spurt start for audio; for share audio, the first frame after a start, a resume, or a capture gap of 200 ms or more); other bits 0
 offset 3   ssrc   u32
 offset 7   seq    u64
 offset 15  ts     u32  sender's 48 kHz sample clock
 offset 19  ciphertext, then tag (16 bytes)
 ```
 
-`ts` is the sender's 48 kHz clock for every type; on a video packet it is the capture instant of the frame it belongs to.
+`ts` is the sender's 48 kHz clock for audio, ping/pong, video and camera video, and on the two video types it is the capture instant of the frame it belongs to. Share audio is the one exception: its `ts` is a media clock of its own, advancing by exactly one 20 ms frame (960 samples) each time a frame actually goes out, reset to the sender's clock when a share or its audio (re)starts, and skipped forward by the frames a capture gap swallowed rather than left to jump — so a watcher's jitter buffer measures the run's own timing rather than however long the sender's audio pipeline happened to be idle.
 
 Cipher: IETF ChaCha20-Poly1305 (RFC 8439). The key is the 32-byte session key from `VoiceReady`; the nonce is the 12 header bytes `ssrc || seq`. The header is authenticated, not encrypted.
 
@@ -412,7 +443,9 @@ Cipher: IETF ChaCha20-Poly1305 (RFC 8439). The key is the 32-byte session key fr
 - **Relay to client, audio** — the relay opens the packet with the sender's key, re-seals the plaintext with the recipient's key under the unchanged header, so the recipient sees the original sender's `ssrc`, `seq` and `ts`, and forwards it to every other voice member of the channel that is not deafened. No mixing, no transcoding.
 - **Relay to client, pong** — the same header as the ping except `type = 3` and `seq = ping.seq | (1 << 63)`, sealed with that session's key. The bit keeps the pong nonce distinct from the ping nonce.
 - **Relay to client, share media** — types 4 and 5 are accepted only from a session that is sharing (type 5 only when that share was started with `audio`), and are re-sealed per recipient under the unchanged header and forwarded **only to that sharer's watchers**, the deafened ones skipped, never to the rest of the channel. They leave from a per-session sender worker rather than the receive path, which stays free for audio.
+- **Relay to client, camera media** — type 7 is accepted only from a session that is on camera, and is re-sealed per recipient and forwarded **only to that camera's watchers**, the deafened ones skipped, exactly as share media is — independently: a member's share and its camera each have their own watcher list, and a camera's video never reaches a share's watchers or the rest of the channel.
 - **Relay to client, keyframe request** — type 6 is accepted only from a viewer that is watching the session named by `target_ssrc`, and is forwarded to that target re-sealed with the target's key, the payload unchanged.
+- **Relay to client, camera keyframe request** — type 8 is the same rule for a camera watch: accepted only from a viewer watching the camera named by `target_ssrc`, forwarded to that target re-sealed, payload unchanged.
 
 Ping/pong payload: 8 bytes, an opaque client clock value echoed unchanged. Clients send a ping every 5 s from the moment they hold a `VoiceReady`, regardless of push-to-talk, to keep NAT and conntrack mappings alive and to measure the media path RTT. A client that receives no pong for 15 s reports the media link as down.
 
@@ -428,13 +461,17 @@ offset 8   flags     u8   bit 0 = keyframe (an IDR access unit carrying SPS/PPS)
 offset 9   data      up to 1156 bytes of the encoded frame
 ```
 
+Camera video (type 7) is the identical fragment format, carrying a camera's own encoded frame under its own `ssrc`; a member's share and its camera run as two independent video streams when both are on at once.
+
 Share audio payload (type 5): exactly one Opus packet of 20 ms at 48 kHz **stereo**, CELT-only mode, 96 kbps CBR.
 
 Keyframe request payload (type 6): 4 bytes, `target_ssrc u32` — the sharer the request is for. A viewer sends at most 2 per second; a sharer coalesces the requests it receives into at most one extra keyframe.
 
-The relay processes each inbound datagram in this order: size (≤ 1200 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2, 4, 5, 6}`) → session lookup by ssrc → per-session rate limit — share media (types 4 and 5) is charged to a byte budget (`Vorcall:ShareMaxKbps`, default 30000 kbit/s, burst the larger of 1.5 MiB and half a second of that rate) instead of the packet bucket, and types 1, 2 and 6 to the packet bucket (100 packets/s sustained, burst 200) → AEAD open → server mute (a type 1 packet from a muted session is dropped here and never marks the session speaking) → replay window (1024 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason — `size`, `header`, `unknown_ssrc`, `rate`, `bad_tag`, `replay`, `no_address`, `muted` (a server-muted session's audio), the share-media reasons `share_rate`, `not_sharing`, `not_watching`, `queue_full`, and the send-side reasons `send_error`, `channel_gone`, `seal_failed` — logs per-channel counters every 30 s while the channel has voice members, and exposes the totals as `vorcall_relay_drops_total{reason}` on `GET /metrics`.
+Camera keyframe request payload (type 8) is the identical payload, `target_ssrc` naming the camera instead; the same 2/s-per-viewer sending rule and coalescing apply.
 
-`Speaking` is derived from type 1 alone: share media never marks a session as speaking. The relay's UDP socket buffers are 8 MiB in each direction, which the host sysctl in `deploy/provision-host.sh` has to allow.
+The relay processes each inbound datagram in this order: size (≤ 1200 bytes, ≥ 35 bytes) → header (`ver = 1`, `type ∈ {1, 2, 4, 5, 6, 7, 8}`) → session lookup by ssrc → per-session rate limit — share video, share audio and camera video (types 4, 5 and 7) are each charged to a byte budget of their own instead of the packet bucket: `Vorcall:ShareMaxKbps` (default 30000 kbit/s, burst the larger of 1.5 MiB and half a second of that rate) for share video, `Vorcall:CameraMaxKbps` (default 4000 kbit/s, burst the larger of 384 KiB and half a second of that rate) for camera video, `Vorcall:ShareAudioMaxKbps` (default 256 kbit/s, burst half a second of that rate) for share audio; types 1, 2, 6 and 8 draw on the packet bucket instead (100 packets/s sustained, burst 200) → AEAD open → server mute (a type 1 packet from a muted session is dropped here and never marks the session speaking) → replay window (1024 sequence numbers; a seq already seen or older than the window is dropped) → the source address is learned from this packet, and re-learned whenever an authenticated packet arrives from a new address, which is how NAT rebinding is survived → dispatch. Every failure drops the datagram silently; the relay counts drops by reason — `size`, `header`, `unknown_ssrc`, `rate`, `bad_tag`, `replay`, `no_address`, `muted` (a server-muted session's audio), the share-media reasons `share_rate`, `not_sharing`, the camera-media reasons `camera_rate`, `not_camera`, `not_watching`, `queue_full`, and the send-side reasons `send_error`, `channel_gone`, `seal_failed` — logs per-channel counters every 30 s while the channel has voice members, and exposes the totals as `vorcall_relay_drops_total{reason}` on `GET /metrics`.
+
+`Speaking` is derived from type 1 alone: share media and camera video never mark a session as speaking. The relay's UDP socket buffers are 8 MiB in each direction, which the host sysctl in `deploy/provision-host.sh` has to allow.
 
 The relay only ever sends to an address it learned this way: a member whose address is not known yet receives nothing. A media session ends when the voice membership ends; late packets for a removed ssrc are dropped as unknown.
 
@@ -453,7 +490,7 @@ The receive side keeps one jitter buffer per ssrc: adaptive 60–100 ms, packet 
 ## Server session state machine (per connection)
 
 1. **AwaitingHello** — starts at upgrade, 5 s deadline. The bearer token of the upgrade request already identified the user; a banned account never gets that far, the upgrade itself answers `403`, and a disabled one fails bearer validation with `401`. The first frame must be `Hello{protocol_version = 1}`; `nickname` is ignored. `Hello` may also carry `client_version` (e.g. `"0.5.0"`) and `client_platform` (e.g. `"linux-x86_64"`), both optional: the server logs them and stores them on the account (`users.last_client_version`/`last_client_platform`/`last_seen_at`) for the admin CLI's `users list` and `users outdated`. Neither field is enforced — a client that omits them still connects normally. The server replies `Welcome{latest_message_id, member_id, username}` (`latest_message_id` is 0 when no message exists yet) immediately followed by the Hello sequence — `ServerSnapshot`, then the `VoiceState`s — then moves to Ready. Anything else (other frame, bad version, timeout) gets `Error{fatal = true}` with `ERROR_CODE_PROTOCOL`, then close code 1008.
-2. **Ready** — handles `OpenDm` and `MarkRead` as described under Server, channels and categories and Messages; `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages; `JoinVoice`/`LeaveVoice`/`VoiceSelfState` as described under Voice; `StartShare`/`StopShare`/`WatchShare`/`UnwatchShare` as described under Screen share; the channel, category and override frames under Server, channels and categories; the role, member-role and nickname frames under Roles and permissions and Profiles and images; `UpdateProfile` under Profiles and images; `KickMember`, `BanMember`, `UnbanMember`, `VoiceModerate`, `UpdateServer` and `TransferOwnership` under Moderation; and `Ping`, which gets a `Pong` echoing `sent_at_unix_ms`. `SendMessage`, `EditMessage`, `DeleteMessage`, `React` and `OpenDm` are subject to the write rate limit under Messages; every management and moderation frame is not, because each is already gated behind a permission. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
+2. **Ready** — handles `OpenDm` and `MarkRead` as described under Server, channels and categories and Messages; `SendMessage`, `EditMessage`, `DeleteMessage` and `React` as described under Messages; `JoinVoice`/`LeaveVoice`/`VoiceSelfState` as described under Voice; `StartShare`/`StopShare`/`WatchShare`/`UnwatchShare` as described under Screen share; `StartCamera`/`StopCamera`/`WatchCamera`/`UnwatchCamera` as described under Camera; `PlaySound`/`StopSound`/`UpdateSound`/`DeleteSound` under Sounds; `UpdateSticker`/`DeleteSticker` under Stickers; the channel, category and override frames under Server, channels and categories; the role, member-role and nickname frames under Roles and permissions and Profiles and images; `UpdateProfile` under Profiles and images; `KickMember`, `BanMember`, `UnbanMember`, `VoiceModerate`, `UpdateServer` and `TransferOwnership` under Moderation; and `Ping`, which gets a `Pong` echoing `sent_at_unix_ms`. `SendMessage`, `EditMessage`, `DeleteMessage`, `React`, `OpenDm`, the four sound frames and the two sticker management frames are subject to the write rate limit under Messages; every other management and moderation frame is not, because each is already gated behind a permission with no other reason to be throttled. A second `Hello` is a fatal `ERROR_CODE_PROTOCOL`.
 3. **Any state** — unparsable bytes or a text frame: fatal protocol error, close 1008. No frame received for 120 s: close 1001. A connection whose outbound queue exceeds 256 frames is closed with 1013. On server shutdown every socket is closed with 1001. If a connection's outbound queue is already full when a fatal error occurs, the `Error` frame may be dropped and only the close frame (1013 or 1008) is delivered: a slow consumer is closed as a slow consumer. The admin CLI closes a connection with the application close codes 4001 "kicked by admin" (`users kick`) or 4003 "account disabled" (`users disable` — an account lock, not a ban; the same 4003 also reaches a socket that was already open, at its next write frame, because the handler asks the disabled-account cache before charging the write limiter), no `Error` frame first; the channels the account was in see the usual `VoiceMemberLeft` and the `MemberUpdated{online = false}`. A client must not reconnect on either: 4001 means sign in again by hand, 4003 means the account is locked and cannot sign in at all until the owner enables it again.
 
 The server also sends WebSocket-level keep-alive pings every 30 s; clients answer with pong frames automatically.
@@ -482,6 +519,8 @@ A client that receives a `ServerFrame` whose payload it does not recognise — i
 The 0.5.0 release replaced rooms with channels and **removed** the room frames rather than keeping them: `ClientFrame` tags 4, 5 and 8 (`join_room`, `leave_room`, `create_room`), `ServerFrame` tags 5, 6, 7, 13 and 14 (`room_state`, `member_joined`, `member_left`, `room_list`, `room_updated`), `ChatMessage` field 5 (`room_id`) and `ErrorCode` 6 and 10 (`NOT_A_MEMBER`, `ROOM_EXISTS`) are all reserved by number and by name, and none of them will ever be reused. `ERROR_CODE_UNKNOWN_ROOM` (5) and `ERROR_CODE_INVALID_ROOM_NAME` (13) kept their numbers under the names `ERROR_CODE_UNKNOWN_CHANNEL` and `ERROR_CODE_INVALID_NAME`, and every `string room_id` became an `int64 channel_id` at its old tag.
 
 The 0.6.0 release is additive: `ChatMessage.streamed_files` (16), `SendMessage.streamed_file_ids` (5), `ServerFrame.stream_request` (35) and `ERROR_CODE_INVALID_STREAM` (28) are new, and nothing was removed or renumbered. A pre-0.6.0 client therefore still connects; it ignores the new payload, and a message carrying nothing but streamed files reads to it as an empty message.
+
+The 0.8.0 release is additive too: `ClientFrame` tags 45–50 (`start_camera`, `stop_camera`, `watch_camera`, `unwatch_camera`, `update_sticker`, `delete_sticker`), `ServerFrame` tags 40–45 (`camera_started`, `camera_stopped`, `camera_watch_state`, `camera_watchers`, `sticker_upserted`, `sticker_deleted`), `ServerSnapshot.stickers` (8), `ChatMessage.sticker_id`/`sticker` (17, 18), `SendMessage.sticker_id` (6), the `VIDEO`/`MANAGE_STICKERS` permission bits and `ErrorCode` 30–34 are all new, and nothing was removed or renumbered. A pre-0.8.0 client still connects and ignores every one of them. `min_version` is raised to `0.8.0` regardless — a decision to keep the whole group on one build, not a protocol necessity the way the 0.4.x cutoff below was.
 
 The protocol version stays 1, but a 0.4.x client cannot be served: it knows no channels and would read every id as an empty string. The release's `min_version` is therefore `0.5.0`, so such a client is asked to update by the manifest rather than refused by the protocol.
 
@@ -523,6 +562,10 @@ The protocol version stays 1, but a 0.4.x client cannot be served: it knows no c
 | Sound clip size | 16 MiB |
 | Sound name | 1..32 scalars after trim, no control chars |
 | Sound storage quota | shared with attachments and images |
+| Sticker upload | 1 MiB, png/jpeg/gif/webp, magic-checked |
+| Sticker library | 200 stickers, server-wide |
+| Sticker name | 1..32 scalars after trim, no control chars |
+| Sticker storage quota | shared with attachments, images and sounds |
 | Write frame rate limit | bucket of 20 per account, refilling 2/s, configurable |
 | Diagnostics report | 4 MiB per file, text only |
 | Diagnostics rate limit | 10 reports/hour per account, configurable |
@@ -557,5 +600,10 @@ The protocol version stays 1, but a 0.4.x client cannot be served: it knows no c
 | Video fragment payload | 1156 bytes of frame data |
 | Share audio frame | 20 ms, 48 kHz stereo, 96 kbps CBR |
 | Share media budget | 30 Mbit/s per session, configurable |
+| Share audio budget | 256 kbit/s per session, configurable |
+| Client manual share bitrate | 1..24 Mbit/s, clamped |
 | Sharers per channel | 3, configurable |
-| Keyframe requests | 2/s per viewer |
+| Camera media budget | 4 Mbit/s per session, configurable |
+| Cameras per channel | 8, configurable |
+| Watched cameras per viewer | 4, configurable |
+| Keyframe requests | 2/s per viewer, share or camera alike |

@@ -13,6 +13,8 @@
 //! is not allowed.
 
 mod audio;
+pub(crate) mod camera;
+mod convert;
 mod portal;
 mod video;
 
@@ -65,37 +67,66 @@ const PORTAL_SLICE: Duration = Duration::from_millis(1);
 /// session, the user answered the picker, the stream runs.
 type Report = Result<(), Unavailable>;
 
-/// Capture threads that have not returned yet. A stop that runs out of budget
-/// leaves one behind still owning the portal session it has to close, and a
-/// second session on top of that one would put a second picker in front of the
-/// user.
-static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+/// The two things this backend captures. They are counted apart because they
+/// are two different portals with two different sessions: a camera running is
+/// no reason to refuse a share, or the other way round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Screen,
+    Camera,
+}
 
-/// Holds one slot in [`LIVE_THREADS`] for as long as it lives, so a capture
-/// thread that returns early or panics gives its slot back all the same.
-struct Live;
+impl Kind {
+    fn live(self) -> &'static AtomicUsize {
+        match self {
+            Kind::Screen => &LIVE_SCREEN,
+            Kind::Camera => &LIVE_CAMERA,
+        }
+    }
+
+    /// What this kind is called in a message the user may read.
+    fn what(self) -> &'static str {
+        match self {
+            Kind::Screen => "screen capture",
+            Kind::Camera => "camera",
+        }
+    }
+}
+
+/// Capture threads of each kind that have not returned yet. A stop that runs
+/// out of budget leaves one behind still owning the portal session it has to
+/// close, and a second session on top of that one would put a second picker in
+/// front of the user.
+static LIVE_SCREEN: AtomicUsize = AtomicUsize::new(0);
+static LIVE_CAMERA: AtomicUsize = AtomicUsize::new(0);
+
+/// Holds one slot for as long as it lives, so a capture thread that returns
+/// early or panics gives its slot back all the same.
+struct Live(Kind);
 
 impl Live {
-    fn claim() -> Live {
-        LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
-        Live
+    fn claim(kind: Kind) -> Live {
+        kind.live().fetch_add(1, Ordering::SeqCst);
+        Live(kind)
     }
 }
 
 impl Drop for Live {
     fn drop(&mut self) {
-        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+        self.0.live().fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// Whether a capture may start with `live` capture threads still running.
-/// Nothing here can hurry an abandoned one along — it owns a portal session
-/// until its own D-Bus call returns — so the only honest answer is to wait.
-fn admit(live: usize) -> Result<(), Unavailable> {
+/// Whether a capture of `kind` may start with `live` threads of that same kind
+/// still running. Nothing here can hurry an abandoned one along — it owns a
+/// portal session until its own D-Bus call returns — so the only honest answer
+/// is to wait.
+fn admit(kind: Kind, live: usize) -> Result<(), Unavailable> {
     if live > 0 {
-        return Err(Unavailable::Failed(
-            "a previous capture is still shutting down, try again in a moment".to_string(),
-        ));
+        return Err(Unavailable::Failed(format!(
+            "a previous {} is still shutting down, try again in a moment",
+            kind.what()
+        )));
     }
     Ok(())
 }
@@ -122,11 +153,11 @@ pub(crate) fn start(
             "there is no graphical session to capture".to_string(),
         ));
     }
-    admit(LIVE_THREADS.load(Ordering::SeqCst))?;
+    admit(Kind::Screen, LIVE_SCREEN.load(Ordering::SeqCst))?;
 
     let (reports, report) = mpsc::channel::<Report>();
     let (stop, stopped) = channel::channel::<()>();
-    let live = Live::claim();
+    let live = Live::claim(Kind::Screen);
     let thread = std::thread::Builder::new()
         .name("vorcall-capture".to_string())
         .spawn(move || {
@@ -221,7 +252,7 @@ fn capture(
     let capture = Capture {
         runtime: &runtime,
         request: &request,
-        ending: Rc::new(Ending::new(events)),
+        ending: Rc::new(Ending::new(Kind::Screen, events)),
         reports,
     };
     let mut revoked = runtime.block_on(cast.revoked());
@@ -325,13 +356,15 @@ impl Capture<'_> {
 /// Where a capture ends, whoever notices first. The consumer hears one
 /// [`CaptureEvent::Ended`] and nothing after it.
 struct Ending {
+    kind: Kind,
     events: UnboundedSender<CaptureEvent>,
     done: Cell<bool>,
 }
 
 impl Ending {
-    fn new(events: UnboundedSender<CaptureEvent>) -> Ending {
+    fn new(kind: Kind, events: UnboundedSender<CaptureEvent>) -> Ending {
         Ending {
+            kind,
             events,
             done: Cell::new(false),
         }
@@ -356,7 +389,7 @@ impl Ending {
         if self.done.get() {
             return;
         }
-        tracing::debug!(%reason, "the screen capture ended");
+        tracing::debug!(what = self.kind.what(), %reason, "the capture ended");
         let _ = self.events.unbounded_send(CaptureEvent::Ended(reason));
         self.done.set(true);
     }
@@ -411,16 +444,32 @@ mod tests {
 
     #[test]
     fn a_capture_starts_with_no_thread_of_its_own_left() {
-        assert!(admit(0).is_ok());
+        assert!(admit(Kind::Screen, 0).is_ok());
+        assert!(admit(Kind::Camera, 0).is_ok());
     }
 
     #[test]
     fn an_abandoned_capture_thread_refuses_the_next_start() {
-        let Err(refused) = admit(1) else {
-            panic!("a live capture thread must refuse a start");
-        };
-        assert!(matches!(refused, Unavailable::Failed(_)), "{refused:?}");
-        assert!(refused.to_string().contains("try again"), "{refused}");
+        for kind in [Kind::Screen, Kind::Camera] {
+            let Err(refused) = admit(kind, 1) else {
+                panic!("a live {} thread must refuse a start", kind.what());
+            };
+            assert!(matches!(refused, Unavailable::Failed(_)), "{refused:?}");
+            assert!(refused.to_string().contains("try again"), "{refused}");
+            assert!(refused.to_string().contains(kind.what()), "{refused}");
+        }
+    }
+
+    /// The whole point of counting the two apart: a camera and a share are two
+    /// portal sessions, and one running is no reason to refuse the other.
+    #[test]
+    fn a_camera_may_start_while_a_screen_capture_runs() {
+        let _screen = Live::claim(Kind::Screen);
+        assert!(admit(Kind::Camera, LIVE_CAMERA.load(Ordering::SeqCst)).is_ok());
+        assert!(admit(Kind::Screen, LIVE_SCREEN.load(Ordering::SeqCst)).is_err());
+
+        let _camera = Live::claim(Kind::Camera);
+        assert!(admit(Kind::Camera, LIVE_CAMERA.load(Ordering::SeqCst)).is_err());
     }
 
     #[test]

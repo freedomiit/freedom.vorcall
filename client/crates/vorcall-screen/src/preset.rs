@@ -10,7 +10,12 @@ use std::time::Duration;
 
 /// Bounds on a manually chosen bitrate, in kbit/s.
 pub const MIN_BITRATE_KBPS: u32 = 1_000;
-pub const MAX_BITRATE_KBPS: u32 = 30_000;
+pub const MAX_BITRATE_KBPS: u32 = 24_000;
+/// And the same for a camera, which is a small picture beside a share and is
+/// budgeted separately by the relay: this ceiling is the server's own default
+/// `Vorcall:CameraMaxKbps`.
+pub const MIN_CAMERA_BITRATE_KBPS: u32 = 300;
+pub const MAX_CAMERA_BITRATE_KBPS: u32 = 4_000;
 /// The largest picture the encoder will be asked for. OpenH264 refuses anything
 /// past 3840x2160 (or 2160x3840) outright, so [`Resolution::Source`] stops here.
 pub const MAX_SOURCE: (u32, u32) = (3840, 2160);
@@ -133,27 +138,7 @@ impl Preset {
     /// 2x2, because H.264 chroma is subsampled by two. A portrait source is
     /// bounded by the box's height just as a landscape one is by its width.
     pub fn output_size(&self, source: (u32, u32)) -> (u32, u32) {
-        let (source_width, source_height) = (source.0.max(1), source.1.max(1));
-        let (box_width, box_height) = self.resolution.box_size();
-
-        let fitted = if source_width <= box_width && source_height <= box_height {
-            (source_width, source_height)
-        } else {
-            let by_width = (
-                box_width,
-                scale(source_height, box_width, source_width).max(1),
-            );
-            if by_width.1 <= box_height {
-                by_width
-            } else {
-                (
-                    scale(source_width, box_height, source_height).max(1),
-                    box_height,
-                )
-            }
-        };
-
-        (even(fitted.0), even(fitted.1))
+        fit(source, self.resolution.box_size())
     }
 
     /// The bitrate this preset asks the encoder for, in kbit/s. A manual choice
@@ -186,6 +171,109 @@ impl Preset {
             (Resolution::P2160 | Resolution::Source, FrameRate::F60) => 24_000,
         }
     }
+}
+
+/// The box a camera's picture is fitted into. A webcam is a face beside the
+/// conversation rather than the conversation itself, so the table stops at
+/// 720p — past that the relay's camera budget is spent long before the picture
+/// gets better.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraResolution {
+    P360,
+    P720,
+}
+
+impl CameraResolution {
+    const fn box_size(self) -> (u32, u32) {
+        match self {
+            CameraResolution::P360 => (640, 360),
+            CameraResolution::P720 => (1280, 720),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            CameraResolution::P360 => "360p",
+            CameraResolution::P720 => "720p",
+        }
+    }
+}
+
+impl fmt::Display for CameraResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CameraResolution {
+    type Err = UnknownResolution;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let lowercase = raw.to_ascii_lowercase();
+        [CameraResolution::P360, CameraResolution::P720]
+            .into_iter()
+            .find(|candidate| candidate.as_str() == lowercase)
+            .ok_or_else(|| UnknownResolution(raw.to_string()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CameraPreset {
+    pub resolution: CameraResolution,
+    pub fps: FrameRate,
+    /// `None` is Auto: the table below decides.
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl CameraPreset {
+    /// Fits `source` — whatever size the device handed over — inside the
+    /// preset's box, on the same terms as [`Preset::output_size`].
+    pub fn output_size(&self, source: (u32, u32)) -> (u32, u32) {
+        fit(source, self.resolution.box_size())
+    }
+
+    /// The bitrate this preset asks the encoder for, in kbit/s. A manual choice
+    /// wins, clamped to [`MIN_CAMERA_BITRATE_KBPS`]..=[`MAX_CAMERA_BITRATE_KBPS`].
+    pub fn bitrate_kbps(&self) -> u32 {
+        if let Some(manual) = self.bitrate_kbps {
+            return manual.clamp(MIN_CAMERA_BITRATE_KBPS, MAX_CAMERA_BITRATE_KBPS);
+        }
+
+        match (self.resolution, self.fps) {
+            (CameraResolution::P360, FrameRate::F15) => 400,
+            (CameraResolution::P360, FrameRate::F30) => 600,
+            (CameraResolution::P360, FrameRate::F60) => 1_000,
+            (CameraResolution::P720, FrameRate::F15) => 1_000,
+            (CameraResolution::P720, FrameRate::F30) => 1_500,
+            (CameraResolution::P720, FrameRate::F60) => 2_500,
+        }
+    }
+}
+
+/// `source` inside `box_size` keeping the aspect ratio, never upscaling, both
+/// dimensions even and at least 2x2.
+fn fit(source: (u32, u32), box_size: (u32, u32)) -> (u32, u32) {
+    let (source_width, source_height) = (source.0.max(1), source.1.max(1));
+    let (box_width, box_height) = box_size;
+
+    let fitted = if source_width <= box_width && source_height <= box_height {
+        (source_width, source_height)
+    } else {
+        let by_width = (
+            box_width,
+            scale(source_height, box_width, source_width).max(1),
+        );
+        if by_width.1 <= box_height {
+            by_width
+        } else {
+            (
+                scale(source_width, box_height, source_height).max(1),
+                box_height,
+            )
+        }
+    };
+
+    (even(fitted.0), even(fitted.1))
 }
 
 /// `value * numerator / denominator` without overflowing at 4K.
@@ -328,6 +416,80 @@ mod tests {
         assert_eq!("1080P".parse(), Ok(Resolution::P1080));
         assert!("4k".parse::<Resolution>().is_err());
         assert!("".parse::<Resolution>().is_err());
+    }
+
+    fn camera(resolution: CameraResolution, fps: FrameRate) -> CameraPreset {
+        CameraPreset {
+            resolution,
+            fps,
+            bitrate_kbps: None,
+        }
+    }
+
+    #[test]
+    fn a_camera_frame_fits_its_box_keeping_aspect() {
+        let preset = camera(CameraResolution::P720, FrameRate::F30);
+        // The two sizes a webcam most often hands over.
+        assert_eq!(preset.output_size((1920, 1080)), (1280, 720));
+        assert_eq!(preset.output_size((640, 480)), (640, 480));
+        // 4:3 at 720p is bounded by the height, not the width.
+        assert_eq!(preset.output_size((1600, 1200)), (960, 720));
+
+        let small = camera(CameraResolution::P360, FrameRate::F30);
+        assert_eq!(small.output_size((1280, 720)), (640, 360));
+        assert_eq!(small.output_size((640, 480)), (480, 360));
+        // Never upscaled, and always even.
+        assert_eq!(small.output_size((321, 241)), (320, 240));
+        assert_eq!(small.output_size((1, 1)), (2, 2));
+    }
+
+    #[test]
+    fn the_camera_bitrate_table_matches_the_box_and_fps() {
+        let cases = [
+            (CameraResolution::P360, FrameRate::F15, 400),
+            (CameraResolution::P360, FrameRate::F30, 600),
+            (CameraResolution::P360, FrameRate::F60, 1_000),
+            (CameraResolution::P720, FrameRate::F15, 1_000),
+            (CameraResolution::P720, FrameRate::F30, 1_500),
+            (CameraResolution::P720, FrameRate::F60, 2_500),
+        ];
+        for (resolution, fps, expected) in cases {
+            assert_eq!(
+                camera(resolution, fps).bitrate_kbps(),
+                expected,
+                "{resolution} at {} fps",
+                fps.hz()
+            );
+            // Every row stays inside what the relay will carry.
+            assert!(camera(resolution, fps).bitrate_kbps() <= MAX_CAMERA_BITRATE_KBPS);
+        }
+    }
+
+    #[test]
+    fn a_manual_camera_bitrate_is_clamped_and_wins() {
+        let preset = |kbps| CameraPreset {
+            resolution: CameraResolution::P720,
+            fps: FrameRate::F30,
+            bitrate_kbps: Some(kbps),
+        };
+        assert_eq!(preset(2_000).bitrate_kbps(), 2_000);
+        assert_eq!(preset(10).bitrate_kbps(), MIN_CAMERA_BITRATE_KBPS);
+        assert_eq!(preset(999_999).bitrate_kbps(), MAX_CAMERA_BITRATE_KBPS);
+    }
+
+    #[test]
+    fn camera_resolution_strings_round_trip() {
+        for (resolution, name) in [
+            (CameraResolution::P360, "360p"),
+            (CameraResolution::P720, "720p"),
+        ] {
+            assert_eq!(resolution.to_string(), name);
+            assert_eq!(name.parse(), Ok(resolution));
+        }
+
+        assert_eq!("720P".parse(), Ok(CameraResolution::P720));
+        assert!("1080p".parse::<CameraResolution>().is_err());
+        assert!("".parse::<CameraResolution>().is_err());
     }
 
     #[test]

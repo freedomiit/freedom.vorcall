@@ -367,6 +367,12 @@ namespace Vorcall.Server.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("edited_at");
 
+                    b.Property<bool>("IsSticker")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false)
+                        .HasColumnName("sticker");
+
                     b.Property<bool>("MentionEveryone")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("boolean")
@@ -394,6 +400,10 @@ namespace Vorcall.Server.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("sent_at");
 
+                    b.Property<long?>("StickerId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("sticker_id");
+
                     b.Property<string>("Text")
                         .IsRequired()
                         .HasMaxLength(2000)
@@ -405,6 +415,8 @@ namespace Vorcall.Server.Migrations
                         .HasColumnName("user_id");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("StickerId");
 
                     b.HasIndex("UserId");
 
@@ -640,6 +652,52 @@ namespace Vorcall.Server.Migrations
                     b.HasIndex("UploaderId");
 
                     b.ToTable("sounds", (string)null);
+                });
+
+            modelBuilder.Entity("Vorcall.Server.Data.Sticker", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<bool>("Complete")
+                        .HasColumnType("boolean")
+                        .HasColumnName("complete");
+
+                    b.Property<string>("ContentType")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("content_type");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("name");
+
+                    b.Property<long>("Size")
+                        .HasColumnType("bigint")
+                        .HasColumnName("size");
+
+                    b.Property<long?>("UploaderId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("uploader_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CreatedAt");
+
+                    b.HasIndex("UploaderId");
+
+                    b.ToTable("stickers", (string)null);
                 });
 
             modelBuilder.Entity("Vorcall.Server.Data.StreamedFile", b =>
@@ -880,6 +938,11 @@ namespace Vorcall.Server.Migrations
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
+                    b.HasOne("Vorcall.Server.Data.Sticker", null)
+                        .WithMany()
+                        .HasForeignKey("StickerId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
                     b.HasOne("Vorcall.Server.Data.User", null)
                         .WithMany()
                         .HasForeignKey("UserId")
@@ -926,6 +989,14 @@ namespace Vorcall.Server.Migrations
                 });
 
             modelBuilder.Entity("Vorcall.Server.Data.Sound", b =>
+                {
+                    b.HasOne("Vorcall.Server.Data.User", null)
+                        .WithMany()
+                        .HasForeignKey("UploaderId")
+                        .OnDelete(DeleteBehavior.SetNull);
+                });
+
+            modelBuilder.Entity("Vorcall.Server.Data.Sticker", b =>
                 {
                     b.HasOne("Vorcall.Server.Data.User", null)
                         .WithMany()

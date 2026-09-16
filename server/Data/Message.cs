@@ -33,4 +33,10 @@ public class Message
     public bool MentionEveryone { get; set; }
 
     public bool MentionHere { get; set; }
+
+    // A sticker message keeps IsSticker after its sticker is deleted, which nulls StickerId, so it
+    // still reads as a sticker message rather than as an empty text one.
+    public long? StickerId { get; set; }
+
+    public bool IsSticker { get; set; }
 }

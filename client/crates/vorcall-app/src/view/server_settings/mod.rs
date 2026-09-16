@@ -14,6 +14,7 @@ pub mod members;
 pub mod overview;
 pub mod roles;
 pub mod sounds;
+pub mod stickers;
 
 use iced::alignment::Vertical;
 use iced::widget::{
@@ -64,6 +65,7 @@ pub fn view<'a>(app: &'a App, main: &'a MainState, tab: ServerTab) -> Element<'a
         ServerTab::Roles => roles::view(app, main),
         ServerTab::Members => members::view(app, main),
         ServerTab::Sounds => sounds::view(app, main),
+        ServerTab::Stickers => stickers::view(app, main),
         ServerTab::Invites => invites::view(app, main),
         ServerTab::Bans => bans::view(app, main),
     };
@@ -157,6 +159,7 @@ fn glyph(tab: ServerTab) -> Icon {
         ServerTab::Roles => Icon::Shield,
         ServerTab::Members => Icon::Users,
         ServerTab::Sounds => Icon::Speaker,
+        ServerTab::Stickers => Icon::Star,
         ServerTab::Invites => Icon::Link,
         ServerTab::Bans => Icon::Ban,
     }

@@ -27,7 +27,7 @@ use crate::app::state::settings::ServerTab;
 use crate::app::state::ui::{Dialog, Route, TransferState};
 // The two named rather than the module: `chat` is already the state module here.
 use crate::app::update::chat::{advance_dialog, finish_dialog};
-use crate::app::update::{admin, channels, check, settings, share, sound, voice};
+use crate::app::update::{admin, camera, channels, check, settings, share, sound, sticker, voice};
 use crate::app::{App, MainState, Status, decode_task};
 use crate::view;
 use crate::workers::images::{self, ImageKey};
@@ -191,6 +191,7 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
             // Taken before the rest of the snapshot is moved into the model: the
             // library is the soundpad's, not the server model's.
             sound::on_snapshot(app, std::mem::take(&mut snapshot.sounds));
+            sticker::on_snapshot(app, std::mem::take(&mut snapshot.stickers));
             let images = {
                 let Some(main) = app.main_mut() else {
                     return Task::none();
@@ -598,6 +599,13 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
         | Event::SoundDeleted { .. }
         | Event::SoundPlayed { .. }
         | Event::SoundStopped { .. } => sound::on_event(app, event),
+        Event::CameraStarted { .. }
+        | Event::CameraStopped { .. }
+        | Event::CameraWatchState { .. }
+        | Event::CameraWatchers { .. } => camera::on_event(app, event),
+        Event::StickerUpserted { .. } | Event::StickerDeleted { .. } => {
+            sticker::on_event(app, event)
+        }
     }
 }
 
@@ -671,6 +679,11 @@ fn land(
         .attachments
         .iter()
         .map(|attachment| ImageKey::Attachment(attachment.id))
+        // A sticker message carries one picture and no attachments at all.
+        .chain(
+            (message.sticker && message.sticker_id != 0)
+                .then_some(ImageKey::Sticker(message.sticker_id)),
+        )
         .collect();
 
     let channel = main.chat.entry(channel_id);
@@ -756,10 +769,11 @@ fn opens(main: &mut MainState, id: i64, dm: bool) -> Option<Opened> {
 fn on_server_error(app: &mut App, code: i32, detail: String, fatal: bool) -> Task<Message> {
     tracing::warn!(code, %detail, fatal, "the server refused something");
 
-    // A refused share or join must not leave the voice card waiting for an answer
-    // that is not coming; asserting either again on the next reconnect would only
-    // repeat the refusal.
+    // A refused share, camera or join must not leave the voice card waiting for
+    // an answer that is not coming; asserting any of them again on the next
+    // reconnect would only repeat the refusal.
     share::on_server_error(app, code);
+    camera::on_server_error(app, code);
     if refused_join(code)
         && let Some(main) = app.main_mut()
         && main.voice.joining

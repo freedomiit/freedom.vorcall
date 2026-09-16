@@ -78,7 +78,8 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 # NSMicrophoneUsageDescription is not optional: macOS kills a bundled app that
 # touches the microphone without one, and push-to-talk does.
 # NSScreenCaptureUsageDescription is what macOS shows on the Screen Recording
-# prompt when a share starts.
+# prompt when a share starts, and NSCameraUsageDescription the same for the
+# camera — without it macOS kills the app the moment AVFoundation opens one.
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -108,6 +109,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <string>public.app-category.social-networking</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Vorcall uses the camera when you turn it on in a call.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>

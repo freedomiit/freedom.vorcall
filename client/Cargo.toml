@@ -4,16 +4,16 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.7.2"
+version = "0.8.0"
 license = "MIT"
 
 # Oldest client version the current release still lets chat. Clients below it
 # show the "Update required" screen; release.yml asserts min_version <= version.
-# Raised to 0.7.0 with that release: a 0.6.0 client knows nothing of the soundpad,
-# and the owner chose to have the whole group update together rather than
-# leave some people silently missing sounds others hear.
+# Raised to 0.8.0 with that release: a 0.7.x client knows nothing of cameras or
+# stickers, and the owner chose to have the whole group update together rather
+# than leave some people silently missing what others see.
 [workspace.metadata.vorcall]
-min_version = "0.7.0"
+min_version = "0.8.0"
 
 [workspace.dependencies]
 # Pure-Rust port of WebRTC's AEC3, noise suppressor and AGC2. Young and its API
@@ -114,11 +114,14 @@ core-foundation = "0.9"
 x11rb = { version = "0.13", features = ["xinput"] }
 libc = "0.2"
 # `global_shortcuts` is what carries the portal this crate binds against; the
-# module does not exist without it.
+# module does not exist without it. `camera` is the same for the webcam portal;
+# ashpd's own `pipewire` feature stays off, since it would pull a second, older
+# pipewire crate in beside the one vorcall-screen already links.
 ashpd = { version = "0.13", default-features = false, features = [
     "tokio",
     "global_shortcuts",
     "screencast",
+    "camera",
 ] }
 
 # Screen share: capture backends per platform, the video codec and socket buffers.
@@ -128,12 +131,14 @@ openh264 = { version = "=0.9.8", default-features = false, features = ["source"]
 openh264-sys2 = { version = "=0.9.8", default-features = false }
 # Already in the lock as a tokio dependency; sizes the media socket's kernel buffers.
 socket2 = "0.6"
-# Already in the lock as a cpal dependency (cpal allows 0.59..=0.62); Desktop Duplication, Windows.Graphics.Capture and D3D11 readback.
+# Already in the lock as a cpal dependency (cpal allows 0.59..=0.62); Desktop Duplication, Windows.Graphics.Capture and D3D11 readback,
+# plus Media Foundation for the camera's source reader.
 windows = { version = "0.62", features = [
     "Foundation", "Foundation_Metadata",
     "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11",
     "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
     "Win32_System_Com", "Win32_System_Threading", "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_WindowsAndMessaging",
@@ -143,6 +148,21 @@ windows-future = "0.3"
 # Process-loopback audio capture (exclude this process) on Windows build 20348 and newer.
 wasapi = "=0.24.0"
 # ScreenCaptureKit and the Core Media / Core Video / Core Audio types it hands out; the objc2 family is already in the lock via winit.
+# AVFoundation is the camera's side of the same family, already in the lock at 0.3.2 through rfd: only the capture classes are turned on.
+objc2-av-foundation = { version = "=0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureSessionPreset",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+] }
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-screen-capture-kit = "=0.3.2"

@@ -10,6 +10,7 @@ use std::fmt;
 use vorcall_core::connection::RestKind;
 use vorcall_core::images::ImagePurpose;
 use vorcall_core::{Ban, ChannelKind, Config, Invite, Profile, Role, Server};
+use vorcall_screen::CameraSource;
 
 use crate::app::message::{OverrideTargetKind, RoleIconDraft};
 use crate::theme::ThemeTokens;
@@ -65,17 +66,19 @@ pub enum ServerTab {
     Roles,
     Members,
     Sounds,
+    Stickers,
     Invites,
     Bans,
 }
 
 impl ServerTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Overview,
         Self::Channels,
         Self::Roles,
         Self::Members,
         Self::Sounds,
+        Self::Stickers,
         Self::Invites,
         Self::Bans,
     ];
@@ -87,6 +90,7 @@ impl ServerTab {
             Self::Roles => "Roles",
             Self::Members => "Members",
             Self::Sounds => "Sounds",
+            Self::Stickers => "Stickers",
             Self::Invites => "Invites",
             Self::Bans => "Bans",
         }
@@ -104,6 +108,7 @@ impl ServerTab {
             // roles needs it as much as whoever manages members.
             Self::Members => perms::MANAGE_MEMBERS | perms::MANAGE_ROLES,
             Self::Sounds => perms::MANAGE_SOUNDS,
+            Self::Stickers => perms::MANAGE_STICKERS,
             Self::Invites => perms::MANAGE_INVITES,
             Self::Bans => perms::BAN_MEMBERS,
         }
@@ -127,6 +132,10 @@ impl fmt::Display for ServerTab {
 pub struct SettingsState {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    /// Every camera this machine can name, read when the Voice page opens. Empty
+    /// on a backend that does not enumerate them, which is a list with nothing
+    /// to pick from rather than a machine without a camera.
+    pub cameras: Vec<CameraSource>,
     pub profile: ProfileDraft,
     pub theme: ThemeDraft,
     /// Every theme the appearance page offers, read when the page opens: a card
@@ -311,6 +320,9 @@ pub struct AdminState {
     /// Clip names being typed on the sounds page, by clip id; an entry only
     /// exists while one is being edited.
     pub sound_names: BTreeMap<i64, String>,
+    /// Sticker names being typed on the stickers page, by sticker id; an entry
+    /// only exists while one is being edited.
+    pub sticker_names: BTreeMap<i64, String>,
     pub invite_days: u32,
     pub invites: RestList<Invite>,
     pub bans: RestList<Ban>,

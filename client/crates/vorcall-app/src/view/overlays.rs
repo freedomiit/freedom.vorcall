@@ -173,6 +173,12 @@ fn modal<'a>(app: &'a App, main: &'a MainState, dialog: &'a Dialog) -> Element<'
             "It goes from the soundpad for everybody, and anyone playing it is cut off.",
             "Delete clip",
         ),
+        Dialog::ConfirmDeleteSticker { sticker_id } => confirm(
+            app,
+            format!("Delete {}?", sticker_name(main, *sticker_id)),
+            "It goes from the library for everybody; messages sent with it say so.",
+            "Delete sticker",
+        ),
         Dialog::ConfirmDeleteMessage { .. } => confirm(
             app,
             "Delete this message?".to_owned(),
@@ -1331,6 +1337,13 @@ fn soundpad<'a>(app: &'a App, main: &'a MainState, at: iced::Point) -> Element<'
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn sticker_name(main: &MainState, id: i64) -> String {
+    main.sticker
+        .library
+        .get(&id)
+        .map_or_else(|| "this sticker".to_owned(), |sticker| sticker.name.clone())
 }
 
 fn role_name(main: &MainState, id: i64) -> String {

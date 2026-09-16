@@ -8,11 +8,19 @@
 //! is dropped or the backend gives up. Everything above it — what to encode,
 //! how often, at what size — comes out of [`preset`], and [`codec`] turns the
 //! frames into H.264 access units. Nothing here knows about the wire.
+//!
+//! [`camera`] is the same contract pointed at a webcam, and the two can run at
+//! the same time in one process.
 
+pub mod camera;
 pub mod codec;
 pub mod pattern;
 pub mod preset;
 pub mod scale;
+
+pub use camera::{
+    CameraCapabilities, CameraRequest, CameraSource, camera_capabilities, cameras, start_camera,
+};
 
 // Each backend module exposes exactly three entry points and nothing else:
 //
@@ -21,7 +29,8 @@ pub mod scale;
 //   pub(crate) fn start(request: CaptureRequest, events: UnboundedSender<CaptureEvent>)
 //       -> Result<Capturer, Unavailable>
 //
-// The dispatch below is the only place that names them.
+// and a `camera` submodule with the same three for a webcam. The dispatch below
+// and the one in [`camera`] are the only places that name them.
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

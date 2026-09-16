@@ -351,7 +351,7 @@ fn format_param(fps: FrameRate, size: Option<(u32, u32)>) -> Option<Vec<u8>> {
 /// The memory this process can actually read: a plain mapping, or a memfd the
 /// stream maps for us. Anything else — a DMA-BUF the GPU holds — would arrive
 /// as a buffer with no address.
-fn buffers_param() -> Option<Vec<u8>> {
+pub(super) fn buffers_param() -> Option<Vec<u8>> {
     let readable = (1 << libspa::sys::SPA_DATA_MemPtr) | (1 << libspa::sys::SPA_DATA_MemFd);
     super::serialise(Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),

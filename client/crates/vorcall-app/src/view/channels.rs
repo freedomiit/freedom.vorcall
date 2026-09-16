@@ -14,7 +14,7 @@ use iced::{Element, Length, Padding};
 use vorcall_core::permissions;
 use vorcall_core::{Category, Channel, ChannelKind, VoiceMember};
 
-use crate::app::message::{ChannelsMsg, MenuTarget, Message, ShareMsg, UiMsg, VoiceMsg};
+use crate::app::message::{CameraMsg, ChannelsMsg, MenuTarget, Message, ShareMsg, UiMsg, VoiceMsg};
 use crate::app::state::chat::Current;
 use crate::app::state::server::channel_kind;
 use crate::app::state::settings::ServerTab;
@@ -347,6 +347,7 @@ fn occupant<'a>(
     let roster = main.voice.rosters.get(&channel_id);
     let speaking = roster.is_some_and(|roster| roster.speaking.contains(&user_id));
     let sharing = roster.is_some_and(|roster| roster.sharing.contains_key(&user_id));
+    let on_camera = roster.is_some_and(|roster| roster.on_camera(user_id));
     // One's own switches are known here before the server has echoed them, so the
     // icon flips on the press rather than on the round trip.
     let self_muted = if me {
@@ -408,6 +409,9 @@ fn occupant<'a>(
     }
     if sharing {
         line = line.push(widgets::watch_badge(main, channel_id, user_id, tokens));
+    }
+    if on_camera {
+        line = line.push(widgets::camera_badge(main, channel_id, user_id, tokens));
     }
     // How loud somebody else is played here is this machine's own business, so the
     // row keeps it one press away rather than in a menu.
@@ -524,7 +528,7 @@ fn voice_card<'a>(
         None => String::new(),
     };
 
-    let mut switches = row![share_button(app, main)].spacing(6);
+    let mut switches = row![share_button(app, main), camera_button(app, main)].spacing(6);
     if voice.watch.state.is_some() {
         let popped = voice.watch.popped.is_some();
         switches = switches.push(widgets::icon_control(
@@ -580,6 +584,16 @@ fn voice_card<'a>(
         }
         lines = lines.push(share_line);
     }
+    if let Some(stats) = voice.camera.stats.as_ref().filter(|_| voice.camera.active) {
+        lines = lines.push(
+            text(format!(
+                "Camera {}×{} · {} kbit/s",
+                stats.output.0, stats.output.1, stats.kbps
+            ))
+            .size(metrics.text(TEXT_SECONDARY))
+            .color(tokens.text_secondary),
+        );
+    }
 
     let card = container(column![lines, switches].spacing(8))
         .width(Length::Fill)
@@ -630,6 +644,53 @@ fn share_button<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
             "Requires Share Screen"
         },
         allowed.then_some(Message::Share(ShareMsg::OpenPicker)),
+        false,
+        tokens,
+    )
+}
+
+/// The camera switch, beside the share's: turn one on when this account may, or
+/// turn off the one that is running.
+fn camera_button<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
+    let tokens = &app.tokens;
+    let camera = &main.voice.camera;
+
+    if camera.active {
+        let watchers = camera.watchers;
+        let tip = match watchers {
+            1 => "Turn your camera off · 1 watching".to_owned(),
+            _ => format!("Turn your camera off · {watchers} watching"),
+        };
+        return widgets::icon_control(
+            Icon::User,
+            &tip,
+            Some(Message::Camera(CameraMsg::Toggle)),
+            false,
+            tokens,
+        );
+    }
+    if camera.starting {
+        return widgets::icon_control(Icon::Image, "Starting the camera…", None, false, tokens);
+    }
+
+    // A machine with no camera path at all still draws the switch, so the
+    // tooltip can say why it does nothing.
+    let capabilities = vorcall_screen::camera_capabilities();
+    let allowed = main.voice.is_live()
+        && main
+            .server
+            .can(permissions::VIDEO, Some(main.voice.channel_id));
+    let tip = if !capabilities.available {
+        "This system cannot use a camera"
+    } else if allowed {
+        "Turn your camera on"
+    } else {
+        "Requires Video"
+    };
+    widgets::icon_control(
+        Icon::Image,
+        tip,
+        (allowed && capabilities.available).then_some(Message::Camera(CameraMsg::Toggle)),
         false,
         tokens,
     )

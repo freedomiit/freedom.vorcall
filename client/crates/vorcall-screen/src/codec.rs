@@ -47,6 +47,16 @@ pub enum CodecError {
     Threads { requested: u16, effective: u16 },
 }
 
+/// What the encoder is being pointed at. A desktop holds still and then changes
+/// in blocks; a face moves everywhere at once, and OpenH264 tunes its rate
+/// control for one or the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Usage {
+    #[default]
+    Screen,
+    Camera,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderSettings {
     pub width: u32,
@@ -56,6 +66,7 @@ pub struct EncoderSettings {
     /// Slice threads to ask OpenH264 for. Anything up to 1 is the single-slice
     /// encoder; see [`VideoEncoder::threads`] for what was actually granted.
     pub threads: u16,
+    pub usage: Usage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -202,7 +213,10 @@ impl VideoEncoder {
 
 fn config(settings: &EncoderSettings) -> EncoderConfig {
     EncoderConfig::new()
-        .usage_type(UsageType::ScreenContentRealTime)
+        .usage_type(match settings.usage {
+            Usage::Screen => UsageType::ScreenContentRealTime,
+            Usage::Camera => UsageType::CameraVideoRealTime,
+        })
         .rate_control_mode(RateControlMode::Bitrate)
         .bitrate(BitRate::from_bps(
             settings.bitrate_kbps.saturating_mul(1_000),
@@ -371,6 +385,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 4_000,
             threads,
+            usage: Usage::Screen,
         }
     }
 
@@ -440,6 +455,29 @@ mod tests {
             "openh264 did not grant two slice threads"
         );
         assert!(error < 8.0, "mean absolute luma error was {error}");
+    }
+
+    #[test]
+    fn a_camera_encoder_round_trips_too() {
+        let mut encoder = VideoEncoder::new(EncoderSettings {
+            usage: Usage::Camera,
+            ..settings(1)
+        })
+        .expect("the camera encoder builds");
+        let mut decoder = VideoDecoder::new().expect("the decoder builds");
+
+        let bgra = frame(0);
+        let mut unit = Vec::new();
+        let encoded = encoder
+            .encode(&bgra, WIDTH as usize * 4, false, &mut unit)
+            .expect("the frame encodes");
+        assert!(encoded.keyframe);
+
+        let picture = decoder
+            .decode(&unit)
+            .expect("the access unit decodes")
+            .expect("an access unit with an IDR completes a picture");
+        assert_eq!((picture.width, picture.height), (WIDTH, HEIGHT));
     }
 
     #[test]

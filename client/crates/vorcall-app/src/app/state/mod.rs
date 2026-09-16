@@ -10,6 +10,7 @@ pub mod rules;
 pub mod server;
 pub mod settings;
 pub mod sound;
+pub mod sticker;
 pub mod ui;
 pub mod update;
 pub mod voice;

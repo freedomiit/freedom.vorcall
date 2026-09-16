@@ -57,6 +57,17 @@ internal static class Frames
 
     public static ClientFrame UnwatchShare(long channelId) => new() { UnwatchShare = new UnwatchShare { ChannelId = channelId } };
 
+    public static ClientFrame StartCamera(long channelId) => new() { StartCamera = new StartCamera { ChannelId = channelId } };
+
+    public static ClientFrame StopCamera(long channelId) => new() { StopCamera = new StopCamera { ChannelId = channelId } };
+
+    public static ClientFrame WatchCamera(long channelId, long userId)
+        => new() { WatchCamera = new WatchCamera { ChannelId = channelId, UserId = userId } };
+
+    // user_id 0 unwatches every camera.
+    public static ClientFrame UnwatchCamera(long channelId, long userId = 0)
+        => new() { UnwatchCamera = new UnwatchCamera { ChannelId = channelId, UserId = userId } };
+
     public static ClientFrame CreateChannel(ChannelKind kind, string name, string topic = "", long categoryId = 0)
         => new() { CreateChannel = new CreateChannel { Kind = kind, Name = name, Topic = topic, CategoryId = categoryId } };
 
@@ -207,6 +218,19 @@ internal static class Frames
         => new() { UpdateSound = new UpdateSound { SoundId = soundId, Name = name } };
 
     public static ClientFrame DeleteSound(long soundId) => new() { DeleteSound = new DeleteSound { SoundId = soundId } };
+
+    public static ClientFrame UpdateSticker(long stickerId, string name)
+        => new() { UpdateSticker = new UpdateSticker { StickerId = stickerId, Name = name } };
+
+    public static ClientFrame DeleteSticker(long stickerId) => new() { DeleteSticker = new DeleteSticker { StickerId = stickerId } };
+
+    // A sticker message: text, attachments and streamed files all belong empty beside it.
+    public static ClientFrame SendSticker(long channelId, long stickerId, long replyToId = 0, string text = "", params long[] attachmentIds)
+    {
+        var send = new SendMessage { Text = text, ChannelId = channelId, ReplyToId = replyToId, StickerId = stickerId };
+        send.AttachmentIds.AddRange(attachmentIds);
+        return new ClientFrame { Send = send };
+    }
 
     public static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }

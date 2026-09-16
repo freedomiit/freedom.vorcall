@@ -8,7 +8,8 @@
 //! - [`jitter`] — one adaptive buffer per remote speaker, reordering and
 //!   absorbing network jitter, reporting losses to the codec so it can conceal.
 //! - [`playout`] — every remote speaker decoded and summed into one frame.
-//! - [`video`] — screen-share access units cut into datagrams and reassembled.
+//! - [`video`] — screen-share and camera access units cut into datagrams and
+//!   reassembled, one stream at a time.
 //! - [`engine`] — the UDP socket, the send path, keepalive pings and statistics.
 //! - [`cleanup`] — on the capture side instead: echo cancellation, noise
 //!   suppression and automatic gain, applied before anything else sees a frame.
