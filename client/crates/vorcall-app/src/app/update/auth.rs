@@ -359,11 +359,11 @@ fn on_change_password(app: &mut App, result: Result<(), ApiFailure>) -> Task<Mes
     };
 
     let detail = match &failure {
-        // The server cannot tell a wrong current password from a refused token,
-        // and only one of the two is worth saying here.
-        ApiFailure::AuthChallenge(_) | ApiFailure::Status(401, _) => {
-            "Current password is wrong".to_owned()
-        }
+        // A Bearer challenge is the access token, never the password: the
+        // endpoint answers a wrong current password with a plain 401 carrying
+        // its own `ApiError` and no `WWW-Authenticate` header.
+        ApiFailure::AuthChallenge(_) => "Your session expired, try again".to_owned(),
+        ApiFailure::Status(401, _) => "Current password is wrong".to_owned(),
         other => describe(other),
     };
     if let Some(Dialog::ChangePassword { error, busy, .. }) = app.dialog_mut() {

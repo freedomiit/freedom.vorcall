@@ -173,6 +173,16 @@ pub struct PendingStream {
     pub size: i64,
 }
 
+/// The mention list as it stands: what was typed after the `@` at the caret,
+/// and which of the rows it offers is highlighted. `None` whenever there is no
+/// list — no fragment at the caret, or a fragment nothing matches — so that a
+/// key binding can read it as "the popup is up".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mention {
+    pub query: String,
+    pub selected: usize,
+}
+
 /// What the message being written carries besides its text.
 #[derive(Default)]
 pub struct Composer {
@@ -186,8 +196,9 @@ pub struct Composer {
     /// Uploads and offers still in flight, which count against the per-message
     /// limit like the files that have already landed.
     pub uploading: Vec<PendingTransfer>,
-    /// What is being typed after an `@`, without the `@` itself.
-    pub mention_query: Option<String>,
+    /// The mention list, while the caret sits in an `@` fragment that has
+    /// something to offer.
+    pub mention: Option<Mention>,
 }
 
 impl Composer {
@@ -207,7 +218,7 @@ impl Composer {
     pub fn finish_edit(&mut self) {
         self.content = text_editor::Content::new();
         self.editing = None;
-        self.mention_query = None;
+        self.mention = None;
     }
 
     /// Empties it and forgets the reply, the edit and the files.
@@ -217,7 +228,7 @@ impl Composer {
         self.editing = None;
         self.attachments.clear();
         self.streams.clear();
-        self.mention_query = None;
+        self.mention = None;
     }
 
     /// What the channel leaving view takes with it: the reply, the files and the
@@ -231,7 +242,7 @@ impl Composer {
         self.editing = None;
         self.attachments.clear();
         self.streams.clear();
-        self.mention_query = None;
+        self.mention = None;
     }
 
     /// Whether there is anything to send. A file alone is a message: text is
@@ -825,13 +836,16 @@ mod tests {
         let mut chat = ChatState::new();
         chat.composer.editing = Some(4);
         chat.composer.set_text("the other channel's message");
-        chat.composer.mention_query = Some("an".to_owned());
+        chat.composer.mention = Some(Mention {
+            query: "an".to_owned(),
+            selected: 0,
+        });
 
         chat.leave_channel();
 
         assert_eq!(chat.composer.editing, None);
         assert!(chat.composer.text().trim().is_empty());
-        assert_eq!(chat.composer.mention_query, None);
+        assert_eq!(chat.composer.mention, None);
     }
 
     #[test]

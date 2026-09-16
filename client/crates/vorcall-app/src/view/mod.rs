@@ -1,6 +1,6 @@
 //! Drawing. Every function here is a pure read of the state in [`crate::app`].
 //!
-//! The root picks what one window shows: the splash's entrance, the popped-out
+//! The root picks what one window shows: the entrance, the popped-out
 //! stage, the sign-in screens, the update that takes the whole window, or the
 //! shell — the rail, a page, and whatever overlay is in front of it.
 
@@ -32,6 +32,7 @@ use crate::app::state::chat::MainView;
 use crate::app::state::ui::Route;
 use crate::app::{App, MainState, Screen};
 use crate::brand::mark::mark;
+use crate::brand::palette;
 use crate::theme::styles;
 use crate::update_ui::{self, UpdateView};
 
@@ -86,6 +87,23 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
             Some(entrance) => entrance.view(Message::Window(WindowMsg::SplashSkip)),
             None => Space::new().into(),
         };
+    }
+
+    // Without a splash window the entrance plays in the main window, over the
+    // brand ground, in the splash's own 320×320 footprint so the creature keeps
+    // its size.
+    if app.splash.is_none()
+        && app.main_window == Some(window)
+        && let Some(entrance) = &app.entrance
+    {
+        return container(
+            container(entrance.view(Message::Window(WindowMsg::SplashSkip)))
+                .width(320.0)
+                .height(320.0),
+        )
+        .center(Length::Fill)
+        .style(palette::ground)
+        .into();
     }
 
     // The popped-out stage is its own window, and nothing else is in it.

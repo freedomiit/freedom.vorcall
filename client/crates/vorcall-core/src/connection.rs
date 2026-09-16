@@ -61,6 +61,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(75);
 /// A bare 401 means a stale build, not a blip: retry at the backoff cap.
 const UNAUTHORIZED_RETRY: Duration = Duration::from_secs(30);
+/// A refresh that fails while the socket is up costs nothing but a wait: the
+/// token in hand is still good, so the renewal is simply tried again.
+const LIVE_REFRESH_RETRY: Duration = Duration::from_secs(30);
 /// `PROTOCOL.md`'s admin close codes: neither is worth reconnecting after.
 const KICKED_CLOSE_CODE: u16 = 4001;
 /// The owner locked the account out of signing in; not the in-app ban.
@@ -1334,6 +1337,17 @@ fn refresh_failure_outcome(failure: &ApiFailure) -> AfterAttempt {
             reason: DisconnectReason::Io(other.to_string()),
             after: Retry::Backoff,
         },
+    }
+}
+
+/// How long a live session waits before asking for its token again after a
+/// refresh that failed rather than was refused. A throttle names its own
+/// wait, which is honoured as at attempt time; anything else is the fixed
+/// retry.
+fn live_refresh_retry(failure: &ApiFailure) -> Duration {
+    match failure {
+        ApiFailure::Throttled(seconds) => Duration::from_secs((*seconds).max(1)),
+        _ => LIVE_REFRESH_RETRY,
     }
 }
 
@@ -2741,7 +2755,23 @@ where
     let silence = sleep(SILENCE_TIMEOUT);
     tokio::pin!(silence);
 
+    // A session outlives its 15-minute access token, and the app clones that
+    // token for the REST calls it makes itself, so it is renewed here as well
+    // as between attempts. The socket is unaffected either way.
+    let refresh_due = sleep_until(Instant::now() + session.refresh_due_in(session::now_unix()));
+    tokio::pin!(refresh_due);
+    // The expiry this timer was armed against: `recover_fetch` rotates the
+    // tokens from the other arms, and that is how this one notices.
+    let mut armed_for = session.expires_at_unix;
+
     let outcome = 'live: loop {
+        if session.expires_at_unix != armed_for {
+            armed_for = session.expires_at_unix;
+            refresh_due
+                .as_mut()
+                .reset(Instant::now() + session.refresh_due_in(session::now_unix()));
+        }
+
         tokio::select! {
             incoming = stream.next() => {
                 let frame = match incoming {
@@ -3468,6 +3498,31 @@ where
                 );
             }
 
+            () = &mut refresh_due => {
+                let refreshed = refresh_session(endpoints, session, events).await;
+                // A refusal ends the session, but a mere failure must not: the
+                // token in hand is still valid, and dropping a working socket
+                // over a blip the user cannot see would be worse than waiting.
+                if let Refreshed::Failed(failure) = &refreshed {
+                    let retry = live_refresh_retry(failure);
+                    tracing::warn!(
+                        retry_secs = retry.as_secs(),
+                        "keeping the socket; the access token refresh is retried"
+                    );
+                    refresh_due.as_mut().reset(Instant::now() + retry);
+                    continue;
+                }
+                match refresh_outcome(refreshed) {
+                    Ok(()) => {
+                        armed_for = session.expires_at_unix;
+                        refresh_due
+                            .as_mut()
+                            .reset(Instant::now() + session.refresh_due_in(session::now_unix()));
+                    }
+                    Err(outcome) => break 'live outcome,
+                }
+            }
+
             () = &mut silence => {
                 tracing::warn!("no frame for 75s; dropping the connection");
                 break AfterAttempt::Reconnect {
@@ -3952,6 +4007,33 @@ mod tests {
         );
     }
 
+    /// The loop must sit out its backoff and reconnect while the UI is still
+    /// holding the other end of the command channel.
+    #[tokio::test]
+    async fn wait_out_backoff_keeps_waiting_while_the_ui_holds_the_sender() {
+        let (_commands, mut receiver) = mpsc::channel::<Command>(1);
+        let (mut events, _received) = mpsc::channel(1);
+
+        assert!(
+            wait_out_backoff(Duration::from_millis(10), &mut receiver, &mut events).await,
+            "a held sender means the UI is still there"
+        );
+    }
+
+    /// A closed command channel is the only thing that ends the loop here: the
+    /// UI is gone, so there is nobody left to reconnect for.
+    #[tokio::test]
+    async fn wait_out_backoff_stops_once_the_sender_is_dropped() {
+        let (commands, mut receiver) = mpsc::channel::<Command>(1);
+        let (mut events, _received) = mpsc::channel(1);
+        drop(commands);
+
+        assert!(
+            !wait_out_backoff(Duration::from_secs(30), &mut receiver, &mut events).await,
+            "a dropped sender must stop the loop before the backoff elapses"
+        );
+    }
+
     /// Nothing the server can send before `Welcome` may reach the
     /// "known but unhandled" path: every payload of the schema is named here.
     #[test]
@@ -4150,6 +4232,34 @@ mod tests {
         match refresh_outcome(challenged) {
             Err(AfterAttempt::Stop(Some(DisconnectReason::AuthRequired(_)))) => {}
             _ => panic!("a 401 must ask for a new sign-in"),
+        }
+    }
+
+    #[test]
+    fn a_throttled_live_refresh_waits_what_the_server_said() {
+        assert_eq!(
+            live_refresh_retry(&ApiFailure::Throttled(7)),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn a_throttle_of_zero_still_waits_a_second() {
+        assert_eq!(
+            live_refresh_retry(&ApiFailure::Throttled(0)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn any_other_live_refresh_failure_waits_the_fixed_retry() {
+        for failure in [
+            ApiFailure::Transport("x".to_owned()),
+            ApiFailure::Malformed("x".to_owned()),
+            ApiFailure::Io("x".to_owned()),
+            ApiFailure::Status(500, "x".to_owned()),
+        ] {
+            assert_eq!(live_refresh_retry(&failure), LIVE_REFRESH_RETRY);
         }
     }
 }

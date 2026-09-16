@@ -161,7 +161,10 @@ fn apply(app: &mut App, event: Event) -> Task<Message> {
             };
             if let Some(main) = app.main_mut() {
                 main.status = status;
-                main.cmd = None;
+                // `main.cmd` deliberately outlives the socket: the loop answers
+                // commands through `drop_command` while it backs off, and a
+                // closed channel is how it learns the UI is gone for good.
+
                 // Nothing is in flight any more; the next `Connected` asks again.
                 for channel in main.chat.channels.values_mut() {
                     channel.loading = false;
@@ -1048,4 +1051,47 @@ fn snap_to_bottom() -> Task<Message> {
         Id::new(view::MESSAGES_ID),
         scrollable::RelativeOffset::START,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::channel::mpsc;
+    use vorcall_core::{Config, Endpoints, Session};
+
+    use super::*;
+
+    /// The connection loop answers commands through `drop_command` while it
+    /// backs off, and reads a closed channel as the UI going away for good. A
+    /// disconnect must therefore leave the sender where it is, or the loop
+    /// stops and nothing ever reconnects.
+    #[test]
+    fn a_disconnect_keeps_the_command_channel_open() {
+        let endpoints = Endpoints::parse("http://localhost", "dev").expect("a valid target");
+        let config = Config::default();
+        let session = Session {
+            access_token: "access".to_owned(),
+            refresh_token: "refresh".to_owned(),
+            expires_at_unix: 0,
+            user_id: 1,
+            username: "alice".to_owned(),
+        };
+        let mut app = App::new(endpoints, config, Some(session), Vec::new(), None);
+        let (sender, mut commands) = mpsc::channel(4);
+        let disconnected = Event::Disconnected {
+            reason: DisconnectReason::Io("test".to_owned()),
+            retry_in: Some(Duration::from_secs(1)),
+        };
+
+        let _ = update(&mut app, Event::Ready(sender));
+        let _ = update(&mut app, disconnected);
+
+        assert!(
+            matches!(commands.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the sender must outlive the socket"
+        );
+        let status = &app.main().expect("the shell stays up").status;
+        assert!(matches!(status, Status::Reconnecting { in_secs: 1 }));
+    }
 }

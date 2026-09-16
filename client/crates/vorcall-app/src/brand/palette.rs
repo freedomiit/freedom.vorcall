@@ -3,6 +3,7 @@
 use std::sync::LazyLock;
 
 use iced::theme::{Palette, Style};
+use iced::widget::container;
 use iced::{Color, Theme};
 
 /// "Deep", the brand red.
@@ -43,6 +44,15 @@ static SPLASH_THEME: LazyLock<Theme> = LazyLock::new(|| {
 
 pub fn splash_theme() -> Theme {
     SPLASH_THEME.clone()
+}
+
+/// The brand ground, for the entrance played inside a window that has no
+/// transparency of its own.
+pub fn ground(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(GROUND.into()),
+        ..container::Style::default()
+    }
 }
 
 /// The window's clear colour and default text colour, taken straight from the palette so a

@@ -151,7 +151,16 @@ pub enum ChatMsg {
     React(i64, &'static str),
     /// One emoji of the palette, into the composer at the caret.
     InsertEmoji(&'static str),
+    /// The word one row of the mention list writes after the `@`: a username,
+    /// or `everyone` or `here`.
     MentionPick(String),
+    /// One step through that list, wrapping at both ends.
+    MentionMove(i32),
+    /// Take whichever row is highlighted.
+    MentionAccept,
+    /// Put the list away. The next edit that leaves a fragment at the caret
+    /// opens it again, so nothing remembers the dismissal.
+    MentionDismiss,
     PickAttachment,
     /// Whatever the file dialog answered, or the files dropped on the window.
     FilesPicked(Vec<PathBuf>),
@@ -691,6 +700,9 @@ pub enum ToastKind {
 pub enum MenuTarget {
     /// The server header, which has no id of its own: there is one server.
     Server,
+    /// The chevron beside the paperclip: the routes the one-click paperclip
+    /// does not take.
+    FileRoutes,
     Message(i64),
     Member(i64),
     Channel(i64),

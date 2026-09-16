@@ -7,7 +7,7 @@
 use std::fmt;
 use std::io::{ErrorKind, Write as _};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,12 @@ const TEMP_FILE: &str = "session.toml.tmp";
 /// Refresh this many seconds before the access token expires, so a request
 /// never spends a round trip on a 401 it could have avoided.
 pub const REFRESH_MARGIN_SECS: i64 = 60;
+
+/// The margin the connection loop keeps to while a session is live. Wider than
+/// [`REFRESH_MARGIN_SECS`] because the app clones the access token when it
+/// starts a REST call of its own, so the copy in its hand must outlive that
+/// call: 60 s of request, on top of the 30 s of clock skew the server allows.
+pub const LIVE_REFRESH_MARGIN_SECS: i64 = 120;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -59,6 +65,17 @@ impl Session {
 
     pub fn seconds_left(&self, now_unix: i64) -> i64 {
         self.expires_at_unix.saturating_sub(now_unix)
+    }
+
+    /// How long a live session may wait before renewing the access token, zero
+    /// once the renewal is due.
+    pub fn refresh_due_in(&self, now_unix: i64) -> Duration {
+        let seconds = self
+            .expires_at_unix
+            .saturating_sub(LIVE_REFRESH_MARGIN_SECS)
+            .saturating_sub(now_unix);
+        // A negative remainder is one already due.
+        Duration::from_secs(u64::try_from(seconds).unwrap_or(0))
     }
 }
 
@@ -145,4 +162,39 @@ pub fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(expires_at_unix: i64) -> Session {
+        Session {
+            access_token: "access".to_owned(),
+            refresh_token: "refresh".to_owned(),
+            expires_at_unix,
+            user_id: 7,
+            username: "alice".to_owned(),
+        }
+    }
+
+    /// The server's access token lasts 15 minutes, and the margin is 120 s.
+    #[test]
+    fn a_fresh_token_is_renewed_at_the_remainder() {
+        assert_eq!(
+            session(1_000 + 900).refresh_due_in(1_000),
+            Duration::from_secs(780)
+        );
+    }
+
+    #[test]
+    fn a_token_inside_the_margin_is_due_at_once() {
+        assert_eq!(session(1_000 + 120).refresh_due_in(1_000), Duration::ZERO);
+        assert_eq!(session(1_000 + 119).refresh_due_in(1_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn an_expired_token_is_due_at_once() {
+        assert_eq!(session(990).refresh_due_in(1_000), Duration::ZERO);
+    }
 }

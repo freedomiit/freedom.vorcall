@@ -76,7 +76,11 @@ pub fn view<'a>(app: &'a App, main: &'a MainState, chat: &ChatMessage) -> Elemen
     if !grouped {
         body = body.push(head(app, main, chat, metrics));
     }
-    body = body.push(said(app, main, chat, metrics));
+    // An empty rich text still lays out a line, which is a gap above an
+    // attachment-only message; the tombstone is drawn inside `said`.
+    if chat.deleted || !chat.text.is_empty() {
+        body = body.push(said(app, main, chat, metrics));
+    }
     // A tombstone carries neither, and the server strips both; the guard says so
     // here rather than trusting the frame.
     if !chat.deleted {

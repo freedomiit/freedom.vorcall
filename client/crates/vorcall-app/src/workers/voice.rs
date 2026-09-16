@@ -32,7 +32,7 @@ use std::num::NonZero;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -46,6 +46,8 @@ use vorcall_voice::{
     CleanupSettings, FRAME_SAMPLES, FrameSender, GateDecision, InputCleanup, NoiseGate, Playout,
     SAMPLE_RATE, STEREO_FRAME_SAMPLES, Sfx,
 };
+
+use crate::workers::{Mailbox, lock};
 
 /// How often the thread wakes up to cut frames when no command arrives. Well
 /// under the 20 ms a frame lasts, so the capture ring never runs long.
@@ -197,12 +199,10 @@ pub enum AudioEvent {
     },
     Failed(String),
     Closed,
-    /// Every 100 ms while a microphone is open: the last frame's level in dBFS
-    /// and whether the gate is open.
-    InputLevel {
-        dbfs: f32,
-        gate_open: bool,
-    },
+    /// Every 100 ms while a microphone is open. The level in dBFS and whether the
+    /// gate is open wait in the handle's mailbox, so at most one of these is ever
+    /// queued however long the interface takes to read it.
+    InputLevel,
     /// On every change of the effective "audio is leaving this machine" state.
     Transmitting(bool),
 }
@@ -211,6 +211,8 @@ pub enum AudioEvent {
 pub struct AudioHandle {
     commands: Sender<AudioCommand>,
     share_far_end: Arc<Mutex<VecDeque<f32>>>,
+    /// The microphone level behind [`AudioEvent::InputLevel`].
+    pub level: Arc<Mailbox<(f32, bool)>>,
 }
 
 impl AudioHandle {
@@ -236,11 +238,13 @@ pub fn spawn_audio_thread() -> (AudioHandle, async_mpsc::UnboundedReceiver<Audio
     let (commands, requests) = std::sync::mpsc::channel();
     let (events, updates) = async_mpsc::unbounded();
     let share_far_end = Arc::new(Mutex::new(VecDeque::with_capacity(FAR_END_MAX_SAMPLES)));
+    let level = Arc::new(Mailbox::new());
 
     let played = share_far_end.clone();
+    let posted = level.clone();
     let spawned = std::thread::Builder::new()
         .name("vorcall-audio".to_string())
-        .spawn(move || run(requests, events, played));
+        .spawn(move || run(requests, events, played, posted));
     if let Err(error) = spawned {
         tracing::error!(%error, "cannot start the audio thread");
     }
@@ -249,6 +253,7 @@ pub fn spawn_audio_thread() -> (AudioHandle, async_mpsc::UnboundedReceiver<Audio
         AudioHandle {
             commands,
             share_far_end,
+            level,
         },
         updates,
     )
@@ -258,8 +263,9 @@ fn run(
     requests: Receiver<AudioCommand>,
     events: async_mpsc::UnboundedSender<AudioEvent>,
     share_far_end: Arc<Mutex<VecDeque<f32>>>,
+    level: Arc<Mailbox<(f32, bool)>>,
 ) {
-    let mut state = AudioThread::new(events, share_far_end);
+    let mut state = AudioThread::new(events, share_far_end, level);
     loop {
         match requests.recv_timeout(TICK) {
             Ok(command) => state.handle(command),
@@ -286,6 +292,8 @@ struct AudioThread {
     /// The last [`AudioEvent::Transmitting`] sent.
     transmitting: bool,
     frames_since_level: u8,
+    /// Where the level meter's reading is left for the interface.
+    level: Arc<Mailbox<(f32, bool)>>,
 
     ptt: bool,
     muted: bool,
@@ -458,6 +466,7 @@ impl AudioThread {
     fn new(
         events: async_mpsc::UnboundedSender<AudioEvent>,
         share_far_end: Arc<Mutex<VecDeque<f32>>>,
+        level: Arc<Mailbox<(f32, bool)>>,
     ) -> Self {
         let transmit = TransmitSettings::default();
         Self {
@@ -472,6 +481,7 @@ impl AudioThread {
             transmit,
             transmitting: false,
             frames_since_level: 0,
+            level,
             ptt: false,
             muted: false,
             deafened: Arc::new(AtomicBool::new(false)),
@@ -826,10 +836,13 @@ impl AudioThread {
             self.frames_since_level += 1;
             if self.frames_since_level >= LEVEL_EVERY_FRAMES {
                 self.frames_since_level = 0;
-                self.emit(AudioEvent::InputLevel {
-                    dbfs: NoiseGate::level(&frame),
-                    gate_open: self.gate.is_open(),
-                });
+                if self
+                    .level
+                    .post((NoiseGate::level(&frame), self.gate.is_open()))
+                    .marker
+                {
+                    self.emit(AudioEvent::InputLevel);
+                }
             }
 
             let wants = wants_to_send(self.transmit.mode, self.ptt, decision);
@@ -1232,14 +1245,6 @@ impl Throttle {
         }
         false
     }
-}
-
-/// A poisoned lock still holds a usable ring or playout, and losing the call over
-/// it would be worse than carrying on.
-pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn pick_device<I, F>(
@@ -1667,7 +1672,11 @@ mod tests {
     fn listening() -> Listening {
         let (events, updates) = async_mpsc::unbounded();
         let playout = Arc::new(Mutex::new(Playout::new()));
-        let mut audio = AudioThread::new(events, Arc::new(Mutex::new(VecDeque::new())));
+        let mut audio = AudioThread::new(
+            events,
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(Mailbox::new()),
+        );
         audio.playout = Some(playout.clone());
         Listening {
             audio,

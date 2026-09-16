@@ -44,7 +44,8 @@ use vorcall_voice::{
     AccessUnit, FrameSender, SAMPLE_RATE, STEREO_FRAME_SAMPLES, ShareCleanup, StereoEncoder,
 };
 
-use crate::workers::voice::{Throttle, lock};
+use crate::workers::voice::Throttle;
+use crate::workers::{Mailbox, lock};
 
 /// How often the share thread wakes when no command arrives. Well under one
 /// frame even at 60 fps, so the encode deadline is never missed by much.
@@ -1049,17 +1050,19 @@ impl Resample {
 
 #[derive(Clone)]
 pub enum StageEvent {
-    Picture {
-        picture: Arc<Picture>,
-        seq: u64,
-    },
+    /// A picture is waiting in the decode handle's mailbox. The picture itself
+    /// never travels, so at most one of these is ever queued however long the
+    /// interface takes to read it, and what it reads is always the newest frame.
+    Picture,
     /// Once a second while access units arrive.
     Stats {
         decode_fps: f32,
         pictures: u64,
         errors: u64,
-        /// Access units thrown away undecoded: a backlog too deep to catch up
-        /// with, or everything between a failure and the next keyframe.
+        /// Frames thrown away: access units left undecoded — a backlog too deep
+        /// to catch up with, or everything between a failure and the next
+        /// keyframe — plus pictures overwritten in the mailbox before the
+        /// interface could draw them.
         dropped: u64,
     },
     Failed(String),
@@ -1069,12 +1072,7 @@ impl fmt::Debug for StageEvent {
     /// Sizes only: a picture is somebody's screen.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StageEvent::Picture { picture, seq } => f
-                .debug_struct("Picture")
-                .field("width", &picture.width)
-                .field("height", &picture.height)
-                .field("seq", seq)
-                .finish(),
+            StageEvent::Picture => f.write_str("Picture"),
             StageEvent::Stats {
                 decode_fps,
                 pictures,
@@ -1095,6 +1093,8 @@ impl fmt::Debug for StageEvent {
 /// Dropping this stops the decode thread, within one [`DECODE_TICK`].
 pub struct DecodeHandle {
     stop: Arc<AtomicBool>,
+    /// The newest decoded picture behind [`StageEvent::Picture`].
+    pub picture: Arc<Mailbox<(Arc<Picture>, u64)>>,
 }
 
 impl Drop for DecodeHandle {
@@ -1120,22 +1120,25 @@ pub fn spawn_decode_thread(
 ) -> (DecodeHandle, async_mpsc::UnboundedReceiver<StageEvent>) {
     let stop = Arc::new(AtomicBool::new(false));
     let (events, updates) = async_mpsc::unbounded();
+    let picture = Arc::new(Mailbox::new());
 
     let thread_stop = stop.clone();
+    let decoded = picture.clone();
     let spawned = std::thread::Builder::new()
         .name("vorcall-decode".to_string())
-        .spawn(move || decode(units, thread_stop, events));
+        .spawn(move || decode(units, thread_stop, events, decoded));
     if let Err(error) = spawned {
         tracing::error!(%error, "cannot start the decode thread");
     }
 
-    (DecodeHandle { stop }, updates)
+    (DecodeHandle { stop, picture }, updates)
 }
 
 fn decode(
     mut units: UnboundedReceiver<AccessUnit>,
     stop: Arc<AtomicBool>,
     events: async_mpsc::UnboundedSender<StageEvent>,
+    mailbox: Arc<Mailbox<(Arc<Picture>, u64)>>,
 ) {
     let emit = |event: StageEvent| {
         if events.unbounded_send(event).is_err() {
@@ -1235,10 +1238,15 @@ fn decode(
                         Ok(Some(picture)) => {
                             seq += 1;
                             pictures += 1;
-                            emit(StageEvent::Picture {
-                                picture: Arc::new(picture),
-                                seq,
-                            });
+                            let posted = mailbox.post((Arc::new(picture), seq));
+                            // A picture the interface never took is one it never
+                            // drew, which is a dropped frame like any other.
+                            if posted.replaced {
+                                dropped += 1;
+                            }
+                            if posted.marker {
+                                emit(StageEvent::Picture);
+                            }
                         }
                         // Not every access unit completes a picture.
                         Ok(None) => {}

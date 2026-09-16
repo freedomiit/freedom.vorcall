@@ -24,9 +24,10 @@ use crate::app::state::rules::{
 use crate::app::state::sound::{Switch, Switches, press};
 use crate::app::state::voice::{EngineHandoff, HotkeyHandoff, HotkeyStatus, MediaSession, VoiceUi};
 use crate::app::update::share;
-use crate::app::{App, SPEAKING_WINDOW, STATS_EVERY, VOICE_TICK};
+use crate::app::{App, SPEAKING_WINDOW, STATS_EVERY, Status, VOICE_TICK};
+use crate::workers::lock;
 use crate::workers::share::ShareCommand;
-use crate::workers::voice::{AudioCommand, AudioEvent, AudioSettings, TransmitSettings, lock};
+use crate::workers::voice::{AudioCommand, AudioEvent, AudioSettings, TransmitSettings};
 
 /// The loudest either sound volume goes, which is the range the configuration
 /// stores and the same 200 % a peer's own volume allows.
@@ -243,12 +244,17 @@ pub fn on_connected(app: &mut App) -> Task<Message> {
     Task::none()
 }
 
-/// Asks for one channel's voice session. `joining` follows the frame: a client that
-/// could not send one is not waiting for an answer.
+/// Asks for one channel's voice session. `joining` follows the answer this client
+/// may actually expect: the command channel outlives a dropped socket, so a join
+/// sent while the loop backs off is taken and then dropped without a frame ever
+/// going out. Only a connected client waits for an answer.
 fn request_join(app: &mut App, channel_id: i64) -> bool {
     let Some(main) = app.main_mut() else {
         return false;
     };
+    if !matches!(main.status, Status::Connected) {
+        return false;
+    }
     main.voice.joining = true;
     // The switches ride the join, so the channel never draws this client unmuted
     // for the moment between the VoiceState and a VoiceSelfState of its own.
@@ -598,9 +604,18 @@ fn on_audio(app: &mut App, event: AudioEvent) -> Task<Message> {
         }
         AudioEvent::Failed(reason) => app.toast(ToastKind::Error, format!("Audio: {reason}")),
         AudioEvent::Closed => {}
-        AudioEvent::InputLevel { dbfs, gate_open } => {
-            if let Some(main) = app.main_mut() {
-                main.voice.input_level = Some((dbfs, gate_open));
+        AudioEvent::InputLevel => {
+            // A marker whose value has already been read carries nothing: the
+            // meter keeps whatever it last showed.
+            let level = app
+                .workers
+                .audio
+                .as_ref()
+                .and_then(|handle| handle.level.take());
+            if let Some(level) = level
+                && let Some(main) = app.main_mut()
+            {
+                main.voice.input_level = Some(level);
             }
         }
         AudioEvent::Transmitting(transmitting) => {
@@ -1194,7 +1209,72 @@ fn peer_audio_map(config: &Config) -> BTreeMap<i64, PeerAudio> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use vorcall_core::{DisconnectReason, Endpoints, Session};
+
     use super::*;
+    use crate::app::update::events;
+
+    /// An app whose connection loop has a live command channel and no socket.
+    fn reconnecting_app() -> (App, mpsc::Receiver<Command>) {
+        let endpoints = Endpoints::parse("http://localhost", "dev").expect("a valid target");
+        let session = Session {
+            access_token: "access".to_owned(),
+            refresh_token: "refresh".to_owned(),
+            expires_at_unix: 0,
+            user_id: 1,
+            username: "alice".to_owned(),
+        };
+        let mut app = App::new(
+            endpoints,
+            Config::default(),
+            Some(session),
+            Vec::new(),
+            None,
+        );
+        let (sender, commands) = mpsc::channel(4);
+        let _ = events::update(&mut app, Event::Ready(sender));
+        let _ = events::update(
+            &mut app,
+            Event::Disconnected {
+                reason: DisconnectReason::Io("test".to_owned()),
+                retry_in: Some(Duration::from_secs(1)),
+            },
+        );
+        (app, commands)
+    }
+
+    /// The command channel outlives the socket, so a join sent during the backoff
+    /// is swallowed by the loop. Nothing may be queued and no spinner may be left
+    /// waiting on the answer that swallowed frame will never get.
+    #[test]
+    fn a_join_while_reconnecting_sends_nothing_and_keeps_no_spinner() {
+        let (mut app, mut commands) = reconnecting_app();
+
+        assert!(!request_join(&mut app, 7));
+
+        assert!(!app.main().expect("the shell stays up").voice.joining);
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    /// The guard must not cost the normal path its join.
+    #[test]
+    fn a_join_while_connected_sends_the_frame_and_waits() {
+        let (mut app, mut commands) = reconnecting_app();
+        app.main_mut().expect("the shell stays up").status = Status::Connected;
+
+        assert!(request_join(&mut app, 7));
+
+        assert!(app.main().expect("the shell stays up").voice.joining);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::JoinVoice { channel_id: 7, .. })
+        ));
+    }
 
     /// A client that left General still has General as its `channel_id`, and the
     /// server still tells it who comes and goes there. None of that is a motif.

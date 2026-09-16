@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-version = "0.7.1"
+version = "0.7.2"
 license = "MIT"
 
 # Oldest client version the current release still lets chat. Clients below it

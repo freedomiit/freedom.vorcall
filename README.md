@@ -61,6 +61,10 @@ Download the latest build for your platform from
 | Windows (x86_64) | `vorcall-windows-x86_64-setup.exe` | Installs per user, no admin prompt. SmartScreen: "More info" → "Run anyway". |
 | macOS (Apple Silicon) | `vorcall-macos-aarch64.dmg` | Drag to Applications. Ad-hoc signed, so the first launch needs right-click → Open. macOS 13+. |
 
+On Linux emoji come from a bundled copy of Noto Color Emoji; the system one is not
+used, because most distributions now ship a COLRv1-only build the client cannot
+rasterise.
+
 The client updates itself from whichever server it is connected to, so this download is a
 one-time step for people on a server that publishes releases. See
 [Client updates](docs/self-hosting.md#client-updates) for what that means when you host

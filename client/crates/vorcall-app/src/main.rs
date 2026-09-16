@@ -6,6 +6,7 @@
 
 mod app;
 mod brand;
+mod fonts;
 mod icons;
 mod theme;
 mod update_ui;
@@ -95,6 +96,8 @@ fn main() -> iced::Result {
             None
         }
     };
+
+    fonts::install();
 
     iced::daemon(
         move || {

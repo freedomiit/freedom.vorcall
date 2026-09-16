@@ -68,9 +68,9 @@ pub mod button {
 
     use super::{DISABLED_ALPHA, RADIUS_CONTROL, ThemeTokens, faded};
 
-    /// How hard the rail's squares are rounded — more than a card, less than a
-    /// circle.
-    const RADIUS_RAIL: f32 = 14.0;
+    /// How hard the rail's squares are rounded: half the rail square
+    /// (`view::rail::SQUARE`), a circle rather than a squircle.
+    const RADIUS_RAIL: f32 = 20.0;
 
     /// The filled accent button: one per dialog, and the composer's send.
     pub fn primary(tokens: &ThemeTokens) -> impl Fn(&Theme, Status) -> Style {

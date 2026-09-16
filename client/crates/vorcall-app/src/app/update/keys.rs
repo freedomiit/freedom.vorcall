@@ -78,7 +78,17 @@ fn key_down(app: &mut App, key: &keyboard::Key, modifiers: keyboard::Modifiers) 
             None => Task::none(),
         };
     }
+    // The mention list takes Tab before the focus ring does, but only where it is
+    // on screen: the chat route with no context menu over it. It is handled only
+    // here: iced yields no binding of its own for Tab, so the composer never
+    // sees it.
     if named(key, Named::Tab) {
+        if app.ui.route.is_main()
+            && app.ui.context_menu.is_none()
+            && app.main().is_some_and(chat::mention_open)
+        {
+            return chat::update(app, ChatMsg::MentionAccept);
+        }
         return ui::update(
             app,
             if modifiers.shift() {

@@ -15,9 +15,9 @@ use crate::app::message::{Message, ShareMsg, ToastKind};
 use crate::app::state::rules::{self, WatchResume};
 use crate::app::state::ui::{Dialog, SourcesState};
 use crate::app::state::voice::{ShareIntent, watch_intent_after_stop};
-use crate::app::{App, STAGE_WINDOW};
+use crate::app::{App, STAGE_WINDOW, Status};
+use crate::workers::lock;
 use crate::workers::share::{ShareCommand, ShareEvent, StageEvent, spawn_decode_thread};
-use crate::workers::voice::lock;
 
 pub fn update(app: &mut App, message: ShareMsg) -> Task<Message> {
     match message {
@@ -268,6 +268,13 @@ fn confirm(app: &mut App) -> Task<Message> {
     let Some(main) = app.main_mut() else {
         return Task::none();
     };
+    // Before the session check: a backed-off loop takes the command and drops it
+    // without a frame, which would leave the share waiting on an answer that is
+    // never coming.
+    if !matches!(main.status, Status::Connected) {
+        main.notice = Some("Not connected".to_owned());
+        return Task::none();
+    }
     if !main.voice.is_live() {
         main.notice = Some("Join voice first".to_owned());
         return Task::none();
@@ -551,10 +558,20 @@ fn leave_stage(app: &mut App) -> Task<Message> {
 
 fn on_stage_event(app: &mut App, event: StageEvent) -> Task<Message> {
     match event {
-        StageEvent::Picture { picture, seq } => {
+        StageEvent::Picture => {
             if let Some(main) = app.main_mut() {
-                main.voice.watch.picture = Some(picture);
-                main.voice.watch.seq = seq;
+                let taken = main
+                    .voice
+                    .watch
+                    .decoder
+                    .as_ref()
+                    .and_then(|decoder| decoder.picture.take());
+                // A marker whose picture has already been read carries nothing:
+                // the stage keeps the frame it is showing.
+                if let Some((picture, seq)) = taken {
+                    main.voice.watch.picture = Some(picture);
+                    main.voice.watch.seq = seq;
+                }
             }
         }
         StageEvent::Stats {

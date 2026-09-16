@@ -4,18 +4,20 @@
 use iced::alignment::Vertical;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::widget::{
-    Id, Space, button, column, container, image, keyed, pick_list, progress_bar, row, text,
-    text_editor, tooltip,
+    Id, Space, button, column, container, image, keyed, progress_bar, row, text, text_editor,
+    tooltip,
 };
 use iced::{Element, Length, Padding, keyboard};
 use vorcall_core::mentions::{self, PALETTE};
 use vorcall_core::{Attachment, attachments, permissions};
 
-use crate::app::message::{ChatMsg, Message};
+use crate::app::message::{ChatMsg, MenuTarget, Message, UiMsg};
 use crate::app::state::chat::{
-    COMPOSER_PALETTE, MESSAGE_MAX_CHARS, PendingStream, PendingTransfer, TransferKind,
+    COMPOSER_PALETTE, MESSAGE_MAX_CHARS, Mention, PendingStream, PendingTransfer, TransferKind,
 };
-use crate::app::state::rules::{format_bytes, plain_text, progress_fraction};
+use crate::app::state::rules::{
+    MentionCandidate, format_bytes, mention_candidates, plain_text, progress_fraction,
+};
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
 use crate::theme::{ThemeTokens, styles};
@@ -30,8 +32,6 @@ const MIN_EDITOR_HEIGHT: f32 = 28.0;
 const MAX_LINES: f32 = 6.0;
 /// How tall one line of the editor is, as a share of its text size.
 const LINE_HEIGHT: f32 = 1.4;
-/// How many names the mention list offers before it stops being a shortcut.
-const SUGGESTIONS: usize = 8;
 /// How much of a quoted message the reply banner shows.
 const EXCERPT_MAX: usize = 60;
 /// The thumbnail a pending attachment is drawn as.
@@ -74,9 +74,12 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let can_everyone = allowed(permissions::MENTION_EVERYONE);
 
     let mentions = composer
-        .mention_query
-        .as_deref()
-        .and_then(|query| mention_list(app, main, query, metrics));
+        .mention
+        .as_ref()
+        .and_then(|mention| mention_list(app, main, mention, can_everyone, metrics));
+    // The popup is open only while it has rows to draw, which is what the
+    // composer's key bindings answer Enter and the arrows on.
+    let mention_open = mentions.is_some();
     let attachment_strip = (composer.slots_used() > 0).then(|| strip(app, main, metrics));
     let palette =
         (main.chat.reacting == Some(COMPOSER_PALETTE)).then(|| emoji_palette(app, metrics));
@@ -93,7 +96,10 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
         )
         .push_maybe(Slot::Strip, attachment_strip)
         .push_maybe(Slot::Palette, palette)
-        .push(Slot::Input, input(app, main, can_send, can_attach, metrics))
+        .push(
+            Slot::Input,
+            input(app, main, can_send, can_attach, mention_open, metrics),
+        )
         .push(Slot::Footer, footer(app, main, can_send, metrics));
 
     container(panel)
@@ -108,6 +114,7 @@ fn input<'a>(
     main: &'a MainState,
     can_send: bool,
     can_attach: bool,
+    mention_open: bool,
     metrics: Metrics,
 ) -> Element<'a, Message> {
     let tokens = &app.tokens;
@@ -138,7 +145,9 @@ fn input<'a>(
 
         editor = editor
             .on_action(|action| Message::Chat(ChatMsg::Editor(action)))
-            .key_binding(move |press| binding(press, editing, replying, empty, last_own));
+            .key_binding(move |press| {
+                binding(press, editing, replying, empty, last_own, mention_open)
+            });
     }
 
     let (attach, attach_tip): (Option<Message>, &str) = if !can_attach {
@@ -179,7 +188,7 @@ fn input<'a>(
     // The chevron is the choice between the two routes, so it is offered on
     // exactly the terms the paperclip is: whatever refuses one refuses both.
     if attach.is_some() {
-        box_row = box_row.push(routes(tokens, metrics));
+        box_row = box_row.push(routes(tokens));
     }
     let box_row = box_row
         .push(editor)
@@ -197,17 +206,17 @@ fn input<'a>(
 /// this disk for as long as the sender is online. A file above the stored
 /// ceiling takes the second route whichever of these is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileRoute {
+pub(crate) enum FileRoute {
     Attach,
     Stream,
 }
 
 impl FileRoute {
-    const ALL: [FileRoute; 2] = [FileRoute::Attach, FileRoute::Stream];
+    pub(crate) const ALL: [FileRoute; 2] = [FileRoute::Attach, FileRoute::Stream];
 
     /// Which dialog the entry opens. Both end in the same picker; only what the
     /// picked paths are routed to differs.
-    fn message(self) -> Message {
+    pub(crate) fn message(self) -> Message {
         match self {
             FileRoute::Attach => Message::Chat(ChatMsg::PickAttachment),
             FileRoute::Stream => Message::Chat(ChatMsg::PickStream),
@@ -225,19 +234,20 @@ impl std::fmt::Display for FileRoute {
 }
 
 /// The chevron beside the paperclip, which offers the route the one-click
-/// paperclip does not. It is a pick list rather than the anchored popover the
-/// rest of the window uses because that popover is keyed on a menu target held
-/// in the window's own state, which this module does not own; a pick list keeps
-/// its open state inside the widget, and its handle is the chevron.
-fn routes<'a>(tokens: &'a ThemeTokens, metrics: Metrics) -> Element<'a, Message> {
+/// paperclip does not. It opens the window's own anchored popover, keyed on
+/// [`MenuTarget::FileRoutes`], so the rows are as wide as the menu rather than
+/// as wide as the handle that opened them.
+fn routes<'a>(tokens: &'a ThemeTokens) -> Element<'a, Message> {
     widgets::tooltip_of(
-        pick_list(FileRoute::ALL, None::<FileRoute>, FileRoute::message)
-            .placeholder("")
-            .width(ROUTES_WIDTH)
-            .text_size(metrics.text(TEXT_SECONDARY))
-            .padding([2.0, 4.0])
-            .style(styles::pick_list(tokens))
-            .menu_style(styles::menu(tokens)),
+        button(icons::icon(
+            Icon::ChevronDown,
+            widgets::ICON_MARK,
+            tokens.text_secondary,
+        ))
+        .width(ROUTES_WIDTH)
+        .padding([6.0, 4.0])
+        .style(styles::button::icon(tokens))
+        .on_press(Message::Ui(UiMsg::ContextMenu(MenuTarget::FileRoutes))),
         "Other ways to send a file",
         tooltip::Position::Top,
         tokens,
@@ -280,7 +290,39 @@ fn emoji_palette<'a>(app: &'a App, metrics: Metrics) -> Element<'a, Message> {
 /// Enter sends; Shift+Enter breaks the line; Escape unwinds a reply or an edit;
 /// Up in an empty composer reaches for the last message of one's own; Ctrl+V is
 /// the app's own paste. Everything else is the editor's own.
+///
+/// An open mention list takes Enter, the arrows and Escape ahead of all of that.
+/// Tab is not here: iced yields no binding for it, so it is answered by the
+/// window's own key handler instead.
 fn binding(
+    press: KeyPress,
+    editing: Option<i64>,
+    replying: bool,
+    empty: bool,
+    last_own: Option<i64>,
+    mention_open: bool,
+) -> Option<Binding<Message>> {
+    use keyboard::key::Named;
+
+    if mention_open {
+        let taken = match &press.key {
+            keyboard::Key::Named(Named::Enter) if !press.modifiers.shift() => {
+                Some(ChatMsg::MentionAccept)
+            }
+            keyboard::Key::Named(Named::ArrowUp) => Some(ChatMsg::MentionMove(-1)),
+            keyboard::Key::Named(Named::ArrowDown) => Some(ChatMsg::MentionMove(1)),
+            keyboard::Key::Named(Named::Escape) => Some(ChatMsg::MentionDismiss),
+            _ => None,
+        };
+        if let Some(message) = taken {
+            return Some(Binding::Custom(Message::Chat(message)));
+        }
+    }
+    plain_binding(press, editing, replying, empty, last_own)
+}
+
+/// The composer's own bindings, with no mention list in front of them.
+fn plain_binding(
     press: KeyPress,
     editing: Option<i64>,
     replying: bool,
@@ -447,45 +489,54 @@ fn everyone_warning<'a>(
     )
 }
 
-/// The names the mention list offers for what has been typed after the `@`.
+/// What the mention list offers for what has been typed after the `@`, with the
+/// highlighted row lit. Enter and Tab take that row; a press takes the row it
+/// lands on.
 fn mention_list<'a>(
     app: &'a App,
     main: &'a MainState,
-    query: &str,
+    mention: &Mention,
+    can_everyone: bool,
     metrics: Metrics,
 ) -> Option<Element<'a, Message>> {
     let tokens = &app.tokens;
-    let names = suggestions(&main.user_pairs, query);
-    if names.is_empty() {
+    let candidates = mention_candidates(&main.user_pairs, &mention.query, can_everyone);
+    if candidates.is_empty() {
         return None;
     }
+    // A query that grew keeps its highlight, and the list it was taken from can
+    // have shrunk under it since.
+    let selected = mention.selected.min(candidates.len() - 1);
 
     let mut list = column![].spacing(2).width(Length::Fill);
-    for (user_id, username) in names {
-        let display = main.server.display_name(user_id);
-        let line = row![
-            widgets::member_avatar(main, user_id, widgets::AVATAR_OCCUPANT, tokens),
-            widgets::clipped_name_within(
-                text(display)
-                    .size(metrics.text(TEXT_SECONDARY))
-                    .color(tokens.text_primary),
-                display,
-                MENTION_NAME_MAX,
+    for (index, candidate) in candidates.iter().enumerate() {
+        let word = candidate.word().to_owned();
+        let line = match candidate {
+            MentionCandidate::Everyone => broadcast_row(
+                mentions::EVERYONE,
+                Icon::Users,
+                "Notify everyone in the channel",
                 tokens,
+                metrics,
             ),
-            text(format!("@{username}"))
-                .size(metrics.text(TEXT_BADGE))
-                .color(tokens.text_muted),
-        ]
-        .spacing(8)
-        .align_y(Vertical::Center);
+            MentionCandidate::Here => broadcast_row(
+                mentions::HERE,
+                Icon::Bell,
+                "Notify online members",
+                tokens,
+                metrics,
+            ),
+            MentionCandidate::Member { user_id, username } => {
+                member_row(main, *user_id, username, tokens, metrics)
+            }
+        };
 
         list = list.push(
             button(line)
                 .width(Length::Fill)
                 .padding([metrics.row_padding(), 6.0])
-                .style(styles::button::row(tokens))
-                .on_press(Message::Chat(ChatMsg::MentionPick(username.to_owned()))),
+                .style(styles::button::row_for(tokens, index == selected))
+                .on_press(Message::Chat(ChatMsg::MentionPick(word))),
         );
     }
 
@@ -498,17 +549,63 @@ fn mention_list<'a>(
     )
 }
 
-/// Everyone whose username starts with what has been typed, by name.
-fn suggestions<'a>(pairs: &'a [(i64, String)], query: &str) -> Vec<(i64, &'a str)> {
-    let query = query.to_lowercase();
-    let mut names: Vec<(i64, &str)> = pairs
-        .iter()
-        .filter(|(_, name)| name.to_lowercase().starts_with(&query))
-        .map(|(user_id, name)| (*user_id, name.as_str()))
-        .collect();
-    names.sort_by_cached_key(|(_, name)| name.to_lowercase());
-    names.truncate(SUGGESTIONS);
-    names
+/// One member of the mention list: their picture, the name they go by, and the
+/// handle a pick actually writes.
+fn member_row<'a>(
+    main: &'a MainState,
+    user_id: i64,
+    username: &str,
+    tokens: &'a ThemeTokens,
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let display = main.server.display_name(user_id);
+    row![
+        widgets::member_avatar(main, user_id, widgets::AVATAR_OCCUPANT, tokens),
+        widgets::clipped_name_within(
+            text(display)
+                .size(metrics.text(TEXT_SECONDARY))
+                .color(tokens.text_primary),
+            display,
+            MENTION_NAME_MAX,
+            tokens,
+        ),
+        text(format!("@{username}"))
+            .size(metrics.text(TEXT_BADGE))
+            .color(tokens.text_muted),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+/// `@everyone` or `@here`: a chip of the word itself, since neither has a face,
+/// and one line on who it would reach.
+fn broadcast_row<'a>(
+    word: &'a str,
+    glyph: Icon,
+    hint: &'a str,
+    tokens: &'a ThemeTokens,
+    metrics: Metrics,
+) -> Element<'a, Message> {
+    let mark = icons::icon(glyph, widgets::ICON_MARK, tokens.text_secondary);
+    let chip = text(word)
+        .size(metrics.text(TEXT_SECONDARY))
+        .color(tokens.text_primary);
+
+    row![
+        // The same footprint an avatar takes, so the rows line up whichever kind
+        // they are.
+        container(mark).center(widgets::AVATAR_OCCUPANT),
+        container(chip)
+            .padding([1.0, 6.0])
+            .style(styles::container::chip(tokens)),
+        text(hint)
+            .size(metrics.text(TEXT_BADGE))
+            .color(tokens.text_muted),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
 }
 
 /// What is already held for the next message, and what is still going up: the
@@ -745,26 +842,6 @@ mod tests {
     #[test]
     fn an_excerpt_names_the_user_a_token_stands_for() {
         assert_eq!(excerpt("hi <@2> there", &users()), "hi @ana there");
-    }
-
-    #[test]
-    fn a_prefix_matches_whatever_its_case_and_is_offered_by_name() {
-        let users = users();
-        let names: Vec<&str> = suggestions(&users, "AN")
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect();
-
-        assert_eq!(names, ["ana", "Ana Maria", "anders"]);
-        assert!(suggestions(&users, "zz").is_empty());
-        assert_eq!(suggestions(&users, "").len(), 4);
-    }
-
-    #[test]
-    fn the_mention_list_stops_at_eight() {
-        let many: Vec<(i64, String)> = (0..12).map(|id| (id, format!("a{id:02}"))).collect();
-
-        assert_eq!(suggestions(&many, "a").len(), SUGGESTIONS);
     }
 
     #[test]

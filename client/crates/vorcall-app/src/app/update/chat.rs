@@ -15,16 +15,18 @@ use iced::Task;
 use iced::widget::{Id, operation, scrollable, text_editor};
 use vorcall_clipboard::Pasted;
 use vorcall_core::connection::Blob;
-use vorcall_core::{ChannelKind, Command, Endpoints, attachments, mentions};
+use vorcall_core::{ChannelKind, Command, Endpoints, attachments, mentions, permissions};
 
 use crate::app::message::{ChatMsg, Message, ToastKind, UiMsg};
-use crate::app::state::chat::{ImageState, MESSAGE_MAX_CHARS, PendingTransfer, TransferKind};
+use crate::app::state::chat::{
+    ImageState, MESSAGE_MAX_CHARS, Mention, PendingTransfer, TransferKind,
+};
 use crate::app::state::rules::{
-    CLIPBOARD_UNAVAILABLE, FILE_TOO_LARGE, NOTHING_TO_PASTE, describe, mention_query,
-    mention_replace, plain_text,
+    CLIPBOARD_UNAVAILABLE, FILE_TOO_LARGE, MentionCandidate, NOTHING_TO_PASTE, describe,
+    mention_candidates, mention_completion, mention_fragment, plain_text,
 };
 use crate::app::state::server::channel_kind;
-use crate::app::state::ui::{Dialog, TransferSource, TransferState};
+use crate::app::state::ui::{Dialog, TransferSource, TransferState, wrap_index};
 use crate::app::{App, MainState, PendingUpload, Status};
 use crate::view;
 use crate::workers::images::{self, ImageKey};
@@ -36,8 +38,7 @@ pub fn update(app: &mut App, message: ChatMsg) -> Task<Message> {
         ChatMsg::Editor(action) => {
             if let Some(main) = app.main_mut() {
                 main.chat.composer.content.perform(action);
-                let text = main.chat.composer.content.text();
-                main.chat.composer.mention_query = mention_query(text.trim_end());
+                refresh_mention(main);
             }
             Task::none()
         }
@@ -143,15 +144,24 @@ pub fn update(app: &mut App, message: ChatMsg) -> Task<Message> {
             }
             focus_composer()
         }
-        ChatMsg::MentionPick(username) => {
+        ChatMsg::MentionPick(word) => pick_mention(app, &word),
+        ChatMsg::MentionAccept => accept_mention(app),
+        ChatMsg::MentionMove(delta) => {
             if let Some(main) = app.main_mut() {
-                let text = main.chat.composer.text();
-                main.chat
-                    .composer
-                    .set_text(&mention_replace(text.trim_end(), &username));
-                main.chat.composer.mention_query = None;
+                let count = mention_rows(main).len();
+                if count == 0 {
+                    main.chat.composer.mention = None;
+                } else if let Some(mention) = &mut main.chat.composer.mention {
+                    mention.selected = wrap_index(mention.selected, delta, count);
+                }
             }
-            focus_composer()
+            Task::none()
+        }
+        ChatMsg::MentionDismiss => {
+            if let Some(main) = app.main_mut() {
+                main.chat.composer.mention = None;
+            }
+            Task::none()
         }
         ChatMsg::PickAttachment => Task::perform(pick_files(), |paths| {
             Message::Chat(ChatMsg::FilesPicked(paths))
@@ -437,9 +447,14 @@ fn start_edit(app: &mut App, id: i64) -> Task<Message> {
     };
 
     main.chat.composer.set_text(&text);
+    // A rebuilt buffer starts at (0, 0), and the text is here to be finished.
+    main.chat
+        .composer
+        .content
+        .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
     main.chat.composer.editing = Some(id);
     main.chat.composer.reply_to = None;
-    main.chat.composer.mention_query = None;
+    main.chat.composer.mention = None;
     focus_composer()
 }
 
@@ -452,8 +467,161 @@ fn insert(main: &mut MainState, text: String) {
         .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
             Arc::new(text),
         )));
+    refresh_mention(main);
+}
+
+/// Where the caret sits in [`text_editor::Content::text`], counted in bytes.
+/// `None` while anything is selected: a fragment is only ever read off a plain
+/// caret.
+///
+/// iced passes cosmic-text's own cursor straight through, so `Position::column`
+/// is a byte index into its line rather than a character one; `Content::text`
+/// joins the lines with each line's own ending — a line carrying none is joined
+/// with `\n` — and puts nothing after the last one.
+fn caret_offset(content: &text_editor::Content) -> Option<usize> {
+    let cursor = content.cursor();
+    if cursor.selection.is_some() {
+        return None;
+    }
+
+    let mut offset = 0;
+    for index in 0..cursor.position.line {
+        let line = content.line(index)?;
+        let ending = match line.ending {
+            text_editor::LineEnding::None => text_editor::LineEnding::default(),
+            ending => ending,
+        };
+        offset += line.text.len() + ending.as_str().len();
+    }
+    Some(offset + cursor.position.column)
+}
+
+/// Whether `@everyone` and `@here` would reach anybody from the channel in view.
+/// The composer's own view resolves the permission the same way: the rows the
+/// popup draws have to be the rows a keyboard pick takes from.
+fn can_mention_everyone(main: &MainState) -> bool {
+    main.chat
+        .current
+        .channel_id()
+        .is_some_and(|id| main.server.can(permissions::MENTION_EVERYONE, Some(id)))
+}
+
+/// The rows the popup is drawing, which is what a step through the list and a
+/// keyboard pick both read.
+fn mention_rows(main: &MainState) -> Vec<MentionCandidate> {
+    let Some(mention) = &main.chat.composer.mention else {
+        return Vec::new();
+    };
+    let can_everyone = can_mention_everyone(main);
+    mention_candidates(&main.user_pairs, &mention.query, can_everyone)
+}
+
+/// Whether the popup is open, which it is only while it has rows to draw: a list
+/// that emptied under it — the members changed, the permission changed — must not
+/// go on holding Enter and Tab.
+pub fn mention_open(main: &MainState) -> bool {
+    main.chat.composer.mention.is_some() && !mention_rows(main).is_empty()
+}
+
+/// Recomputes the mention list after the buffer moved. It is up only while an
+/// `@` fragment ends at the caret and has something to offer, so the composer's
+/// key bindings can read `mention` as "the popup is open". The highlighted row
+/// survives a query that only grew, since that list can only have shrunk.
+fn refresh_mention(main: &mut MainState) {
     let text = main.chat.composer.content.text();
-    main.chat.composer.mention_query = mention_query(text.trim_end());
+    let caret = caret_offset(&main.chat.composer.content);
+    let fragment = caret.and_then(|at| mention_fragment(&text, at));
+    let mention = match fragment {
+        Some(range) => mention_for(main, &text[range.start + 1..range.end]),
+        None => None,
+    };
+
+    main.chat.composer.mention = mention;
+}
+
+/// The list one query leaves, or `None` when nothing matches it. The highlight
+/// of the list being replaced is kept while that list can only have shrunk —
+/// the query grew on the same fragment — and starts over otherwise.
+fn mention_for(main: &MainState, query: &str) -> Option<Mention> {
+    let can_everyone = can_mention_everyone(main);
+    if mention_candidates(&main.user_pairs, query, can_everyone).is_empty() {
+        return None;
+    }
+
+    let selected = match &main.chat.composer.mention {
+        Some(open) if query.starts_with(&open.query) => open.selected,
+        _ => 0,
+    };
+    Some(Mention {
+        query: query.to_owned(),
+        selected,
+    })
+}
+
+/// Takes the highlighted row, off the same rows the popup drew.
+fn accept_mention(app: &mut App) -> Task<Message> {
+    let Some(main) = app.main_mut() else {
+        return Task::none();
+    };
+    let Some(mention) = &main.chat.composer.mention else {
+        return Task::none();
+    };
+    let highlighted = mention.selected;
+    let candidates = mention_rows(main);
+    // The rows are what the popup is: a list that emptied under it leaves nothing
+    // to take, so the popup goes away instead.
+    if candidates.is_empty() {
+        main.chat.composer.mention = None;
+        return Task::none();
+    }
+    // The list can have shrunk under a highlight a shorter query left behind.
+    let selected = highlighted.min(candidates.len() - 1);
+    let word = candidates[selected].word().to_owned();
+
+    pick_mention(app, &word)
+}
+
+/// Takes one row of the mention list, whether it was pressed or accepted from
+/// the keyboard, and puts the popup away.
+fn pick_mention(app: &mut App, word: &str) -> Task<Message> {
+    let Some(main) = app.main_mut() else {
+        return Task::none();
+    };
+    complete_mention(&mut main.chat.composer.content, word);
+    main.chat.composer.mention = None;
+    focus_composer()
+}
+
+/// Writes `@word ` where the fragment at the caret was, leaving the caret right
+/// after the space and whatever follows it untouched. Nothing happens when no
+/// fragment ends at the caret.
+///
+/// The buffer is edited rather than rebuilt: a fresh `Content` starts at (0, 0),
+/// which is what used to send the caret back to the top of the message.
+fn complete_mention(content: &mut text_editor::Content, word: &str) {
+    let before = content.text();
+    let caret = caret_offset(content);
+    let Some(fragment) = caret.and_then(|at| mention_fragment(&before, at)) else {
+        return;
+    };
+
+    // A backspace in cosmic-text deletes exactly one `char`, so one per character
+    // of the fragment — the `@` included — is the whole fragment and no more. The
+    // caret is what actually stops the loop if the editor ever disagrees: a caret
+    // that cannot be read is a caret that has gone somewhere else.
+    let mut left = before[fragment.start..fragment.end].chars().count();
+    while left > 0 && caret_offset(content).unwrap_or(0) > fragment.start {
+        content.perform(text_editor::Action::Edit(text_editor::Edit::Backspace));
+        left -= 1;
+    }
+    content.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+        Arc::new(format!("@{word} ")),
+    )));
+
+    debug_assert_eq!(
+        content.text(),
+        mention_completion(&before, fragment, word).0
+    );
 }
 
 /// Whether a file of this size is one the server keeps. Above the ceiling it is
@@ -1133,7 +1301,82 @@ fn opener() -> std::process::Command {
 
 #[cfg(test)]
 mod tests {
+    use vorcall_core::{Config, Session};
+
     use super::*;
+
+    /// A signed-in shell with nothing in view: no channel, so `@everyone` and
+    /// `@here` never resolve and the list is exactly `user_pairs`.
+    fn shell() -> App {
+        let endpoints = Endpoints::parse("http://localhost", "dev").expect("a valid target");
+        let session = Session {
+            access_token: "access".to_owned(),
+            refresh_token: "refresh".to_owned(),
+            expires_at_unix: 0,
+            user_id: 1,
+            username: "alice".to_owned(),
+        };
+        App::new(
+            endpoints,
+            Config::default(),
+            Some(session),
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn open_mention(main: &mut MainState, query: &str) {
+        main.chat.composer.mention = Some(Mention {
+            query: query.to_owned(),
+            selected: 0,
+        });
+    }
+
+    /// The popup is open only while it has rows: the member list can empty
+    /// between two keystrokes, and the keys must go back to the composer.
+    #[test]
+    fn a_popup_with_no_rows_is_not_open() {
+        let mut app = shell();
+        let main = app.main_mut().expect("the shell is up");
+        main.user_pairs = vec![(2, "bob".to_owned())];
+        open_mention(main, "bo");
+
+        assert!(mention_open(main));
+
+        main.user_pairs.clear();
+        assert!(!mention_open(main));
+    }
+
+    #[test]
+    fn an_accept_over_an_empty_list_puts_the_popup_away() {
+        let mut app = shell();
+        let main = app.main_mut().expect("the shell is up");
+        open_mention(main, "bo");
+
+        let _ = update(&mut app, ChatMsg::MentionAccept);
+
+        let main = app.main().expect("the shell is up");
+        assert!(main.chat.composer.mention.is_none());
+        assert_eq!(main.chat.composer.content.text(), "");
+    }
+
+    #[test]
+    fn a_step_over_an_empty_list_puts_the_popup_away() {
+        let mut app = shell();
+        let main = app.main_mut().expect("the shell is up");
+        open_mention(main, "bo");
+
+        let _ = update(&mut app, ChatMsg::MentionMove(1));
+
+        assert!(
+            app.main()
+                .expect("the shell is up")
+                .chat
+                .composer
+                .mention
+                .is_none()
+        );
+    }
 
     /// `PROTOCOL.md` § Limits: the server stores up to 2 GiB, and a file above
     /// that is offered from the sender's own disk instead.
@@ -1177,5 +1420,51 @@ mod tests {
         ] {
             assert!(!is_web_link(refused), "{refused} must not be opened");
         }
+    }
+
+    /// Where the caret is put before a pick, as a plain caret on line 0.
+    fn caret_at(content: &mut text_editor::Content, column: usize) {
+        content.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 0, column },
+            selection: None,
+        });
+    }
+
+    #[test]
+    fn a_pick_edits_the_buffer_in_place_and_keeps_the_caret() {
+        let mut content = text_editor::Content::with_text("hi @an there");
+        caret_at(&mut content, 6);
+
+        complete_mention(&mut content, "ana");
+
+        // The text past the caret is untouched, and the caret sits right after
+        // the space the pick wrote — not back at the top, which is what a
+        // rebuilt buffer would give.
+        assert_eq!(content.text(), "hi @ana  there");
+        assert_eq!(caret_offset(&content), Some(8));
+    }
+
+    /// A pick writes the two broadcast words literally: the wire carries them as
+    /// text, not as a token.
+    #[test]
+    fn a_pick_writes_a_broadcast_word_as_it_stands() {
+        let mut content = text_editor::Content::with_text("@ev");
+        caret_at(&mut content, 3);
+
+        complete_mention(&mut content, "everyone");
+
+        assert_eq!(content.text(), "@everyone ");
+        assert_eq!(caret_offset(&content), Some(10));
+    }
+
+    /// Nothing ends at the caret, so nothing is written.
+    #[test]
+    fn a_pick_with_no_fragment_at_the_caret_leaves_the_buffer_alone() {
+        let mut content = text_editor::Content::with_text("hi @an there");
+        caret_at(&mut content, 12);
+
+        complete_mention(&mut content, "ana");
+
+        assert_eq!(content.text(), "hi @an there");
     }
 }

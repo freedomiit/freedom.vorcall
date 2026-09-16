@@ -6,6 +6,7 @@
 //! `app::update` call them; nothing here touches `App`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use iced::{keyboard, mouse};
 use vorcall_core::config::{self, Config, TransmitMode};
@@ -24,6 +25,10 @@ use crate::app::state::voice::{HotkeyStatus, VoiceUi};
 pub const PUSH_TO_TALK: ActionId = 0;
 pub const TOGGLE_MUTE: ActionId = 1;
 pub const TOGGLE_DEAFEN: ActionId = 2;
+
+/// How many rows the mention list offers before it stops being a shortcut. The
+/// two broadcast words count against it like any other row.
+pub const SUGGESTIONS: usize = 8;
 
 /// The generation the window's own fallback edges carry. No listener can have it:
 /// the first one started is generation 1.
@@ -348,27 +353,94 @@ pub fn auto_bitrate_kbps(config: &Config) -> u32 {
     preset.bitrate_kbps(capture_box(preset.resolution).unwrap_or(preset::MAX_SOURCE))
 }
 
-/// Where the `@…` being typed starts, which is the end of the last whitespace
-/// before it.
-pub fn fragment_start(input: &str) -> usize {
-    input
+/// The `@…` being typed, as byte offsets into `text`: the run of non-whitespace
+/// characters ending exactly at the caret, when it opens with an `@` and carries
+/// at least one character after it. What follows the caret is not part of it, so
+/// a name completed in the middle of a sentence still finds its fragment.
+pub fn mention_fragment(text: &str, caret: usize) -> Option<Range<usize>> {
+    if caret == 0 || !text.is_char_boundary(caret) {
+        return None;
+    }
+    let start = text[..caret]
         .char_indices()
         .rev()
         .find(|(_, character)| character.is_whitespace())
-        .map_or(0, |(at, character)| at + character.len_utf8())
+        .map_or(0, |(at, character)| at + character.len_utf8());
+    let name = text[start..caret].strip_prefix('@')?;
+    (!name.is_empty()).then_some(start..caret)
 }
 
-/// The name being typed after an `@`, without the `@`. `None` as soon as the
-/// fragment is finished or is not a mention at all.
-pub fn mention_query(input: &str) -> Option<String> {
-    let fragment = &input[fragment_start(input)..];
-    let name = fragment.strip_prefix('@')?;
-    (!name.is_empty()).then(|| name.to_owned())
+/// One row the mention list offers. The two words that name a whole channel are
+/// not members, and carry no id of their own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MentionCandidate {
+    Everyone,
+    Here,
+    Member { user_id: i64, username: String },
 }
 
-/// Puts the picked name where the fragment was, ready for the next word.
-pub fn mention_replace(input: &str, username: &str) -> String {
-    format!("{}@{username} ", &input[..fragment_start(input)])
+impl MentionCandidate {
+    /// What a pick writes after the `@`. The two broadcast words are spelled
+    /// once, in `vorcall_core::mentions`, and carry the `@` there.
+    pub fn word(&self) -> &str {
+        match self {
+            Self::Everyone => mentions::EVERYONE.trim_start_matches('@'),
+            Self::Here => mentions::HERE.trim_start_matches('@'),
+            Self::Member { username, .. } => username,
+        }
+    }
+}
+
+/// What the mention list offers for what has been typed after the `@`: the two
+/// broadcast words first when this member may use them, then everyone whose
+/// username starts with the query, by name.
+pub fn mention_candidates(
+    pairs: &[(i64, String)],
+    query: &str,
+    can_everyone: bool,
+) -> Vec<MentionCandidate> {
+    let query = query.to_lowercase();
+    let mut candidates: Vec<MentionCandidate> = Vec::new();
+    if can_everyone {
+        candidates.extend(
+            [MentionCandidate::Everyone, MentionCandidate::Here]
+                .into_iter()
+                .filter(|candidate| candidate.word().starts_with(&query)),
+        );
+    }
+
+    let mut names: Vec<(i64, &str)> = pairs
+        .iter()
+        .filter(|(_, name)| name.to_lowercase().starts_with(&query))
+        .map(|(user_id, name)| (*user_id, name.as_str()))
+        .collect();
+    names.sort_by_cached_key(|(_, name)| name.to_lowercase());
+    candidates.extend(
+        names
+            .into_iter()
+            .map(|(user_id, username)| MentionCandidate::Member {
+                user_id,
+                username: username.to_owned(),
+            }),
+    );
+
+    candidates.truncate(SUGGESTIONS);
+    candidates
+}
+
+/// What a pick leaves behind and where the caret lands in it: the fragment
+/// replaced by `@word `, everything past it untouched. The editor itself is
+/// edited in place rather than rebuilt, so this is the mirror the pick is
+/// checked against and the shape the tests read.
+pub fn mention_completion(text: &str, fragment: Range<usize>, word: &str) -> (String, usize) {
+    let inserted = format!("@{word} ");
+    let caret = fragment.start + inserted.len();
+    let mut completed =
+        String::with_capacity(text.len() - (fragment.end - fragment.start) + inserted.len());
+    completed.push_str(&text[..fragment.start]);
+    completed.push_str(&inserted);
+    completed.push_str(&text[fragment.end..]);
+    (completed, caret)
 }
 
 /// The three modifiers a binding can ask for.
@@ -1025,31 +1097,113 @@ mod tests {
         assert_eq!(next_unread(&order, Some(10), &unread, false), Some(10));
     }
 
+    fn mention_users() -> Vec<(i64, String)> {
+        [(1, "Bruno"), (2, "ana"), (3, "Ana Maria"), (4, "anders")]
+            .into_iter()
+            .map(|(id, name)| (id, name.to_owned()))
+            .collect()
+    }
+
+    fn words(candidates: &[MentionCandidate]) -> Vec<&str> {
+        candidates.iter().map(MentionCandidate::word).collect()
+    }
+
     #[test]
     fn a_mention_query_is_the_unfinished_fragment() {
-        assert_eq!(mention_query("hi @an").as_deref(), Some("an"));
-        assert_eq!(mention_query("@a").as_deref(), Some("a"));
+        assert_eq!(mention_fragment("@a", 2), Some(0..2));
+        assert_eq!(mention_fragment("hi @an", 6), Some(3..6));
+        // The caret ends the fragment; a name completed mid-sentence still
+        // finds it.
+        assert_eq!(mention_fragment("hi @an there", 6), Some(3..6));
     }
 
     #[test]
     fn a_finished_or_empty_fragment_queries_nothing() {
-        assert_eq!(mention_query("hi @an there"), None);
-        assert_eq!(mention_query("@"), None);
-        assert_eq!(mention_query("hi"), None);
-        assert_eq!(mention_query(""), None);
+        // Whitespace right before the caret leaves no fragment at all.
+        assert_eq!(mention_fragment("hi @an ", 7), None);
+        assert_eq!(mention_fragment("@", 1), None);
+        assert_eq!(mention_fragment("hi", 2), None);
+        assert_eq!(mention_fragment("hi @an there", 12), None);
+        // An address is not a mention: the run does not open with the `@`.
+        assert_eq!(mention_fragment("mail@x", 6), None);
+        assert_eq!(mention_fragment("", 0), None);
+        assert_eq!(mention_fragment("@ana", 0), None);
+        // Half of a multi-byte character is nowhere.
+        assert_eq!(mention_fragment("@joão", 4), None);
+    }
+
+    #[test]
+    fn a_prefix_matches_whatever_its_case_and_is_offered_by_name() {
+        let users = mention_users();
+
+        assert_eq!(
+            words(&mention_candidates(&users, "AN", false)),
+            ["ana", "Ana Maria", "anders"]
+        );
+        assert!(mention_candidates(&users, "zz", false).is_empty());
+        assert_eq!(mention_candidates(&users, "", false).len(), 4);
+    }
+
+    #[test]
+    fn the_two_broadcast_words_lead_the_list_for_a_member_who_may_use_them() {
+        let users = mention_users();
+
+        assert_eq!(words(&mention_candidates(&users, "e", true)), ["everyone"]);
+        assert_eq!(words(&mention_candidates(&users, "h", true)), ["here"]);
+        assert_eq!(words(&mention_candidates(&users, "ev", true)), ["everyone"]);
+        assert_eq!(
+            words(&mention_candidates(&users, "", true)),
+            ["everyone", "here", "ana", "Ana Maria", "anders", "Bruno"]
+        );
+    }
+
+    #[test]
+    fn the_two_broadcast_words_are_absent_without_the_permission() {
+        let users = mention_users();
+
+        assert!(mention_candidates(&users, "e", false).is_empty());
+        assert_eq!(
+            words(&mention_candidates(&users, "", false)),
+            ["ana", "Ana Maria", "anders", "Bruno"]
+        );
+    }
+
+    #[test]
+    fn the_mention_list_stops_at_eight() {
+        let many: Vec<(i64, String)> = (0..12).map(|id| (id, format!("a{id:02}"))).collect();
+
+        assert_eq!(mention_candidates(&many, "a", false).len(), SUGGESTIONS);
+        // The two broadcast words take rows of the eight, not rows beyond them.
+        let capped = mention_candidates(&many, "", true);
+        assert_eq!(capped.len(), SUGGESTIONS);
+        assert_eq!(words(&capped)[..2], ["everyone", "here"]);
     }
 
     #[test]
     fn picking_a_name_replaces_the_fragment() {
-        assert_eq!(mention_replace("hi @an", "ana"), "hi @ana ");
-        assert_eq!(mention_replace("@a", "ana"), "@ana ");
-        assert_eq!(mention_replace("", "ana"), "@ana ");
+        assert_eq!(
+            mention_completion("hi @an", 3..6, "ana"),
+            ("hi @ana ".to_owned(), 8)
+        );
+        assert_eq!(
+            mention_completion("@a", 0..2, "ana"),
+            ("@ana ".to_owned(), 5)
+        );
+        // What was written past the caret keeps its own spacing, the inserted
+        // space included.
+        assert_eq!(
+            mention_completion("hi @an there", 3..6, "ana"),
+            ("hi @ana  there".to_owned(), 8)
+        );
     }
 
     /// The fragment starts after the whitespace, whatever its length in bytes.
     #[test]
     fn picking_a_name_keeps_what_was_written_before_it() {
-        assert_eq!(mention_replace("olá @jo", "joão"), "olá @joão ");
+        assert_eq!(
+            mention_completion("olá @jo", 5..8, "joão"),
+            ("olá @joão ".to_owned(), 12)
+        );
     }
 
     #[test]

@@ -156,9 +156,9 @@ pub fn on_snapshot(app: &mut App, sounds: Vec<Sound>) {
 }
 
 /// Asks the server to play one clip. Nothing is heard here: the `SoundPlayed`
-/// this earns is what plays it, on every client at once.
+/// this earns is what plays it, on every client at once. The popover stays up —
+/// the stop control is in it, and a second clip is usually the next press.
 fn play(app: &mut App, sound_id: i64) -> Task<Message> {
-    close_popover(app);
     let Some(main) = app.main_mut() else {
         return Task::none();
     };

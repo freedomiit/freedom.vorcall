@@ -24,6 +24,11 @@ const SQUARE: f32 = 40.0;
 const PILL_WIDTH: f32 = 3.0;
 const PILL_HEIGHT: f32 = 16.0;
 const PILL_GAP: f32 = 5.0;
+/// The rail's horizontal padding: what leaves the pill, the gap and the square
+/// room inside `RAIL_WIDTH`, since iced clamps a fixed width to the limits it is
+/// given and would otherwise narrow the square.
+const RAIL_PADDING_X: f32 = 4.0;
+const _: () = assert!(RAIL_WIDTH - 2.0 * RAIL_PADDING_X >= PILL_WIDTH + PILL_GAP + SQUARE);
 
 pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     let tokens = &app.tokens;
@@ -71,7 +76,7 @@ pub fn view<'a>(app: &'a App, main: &'a MainState) -> Element<'a, Message> {
     container(
         column![server, dms]
             .spacing(8)
-            .padding([10.0, 8.0])
+            .padding([10.0, RAIL_PADDING_X])
             .align_x(Horizontal::Center),
     )
     .width(RAIL_WIDTH)

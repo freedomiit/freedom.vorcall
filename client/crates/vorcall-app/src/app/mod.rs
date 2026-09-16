@@ -9,6 +9,7 @@ pub mod message;
 pub mod state;
 pub mod update;
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
@@ -77,6 +78,20 @@ pub const PROGRESS_STEP: u64 = 1024 * 1024;
 /// The pop-out stage: a 16:9 picture with its toolbar over it.
 pub const STAGE_WINDOW: (f32, f32) = (960.0, 560.0);
 
+/// A rebuild of the whole window slower than this is what a freeze is made of:
+/// the message list is not virtualised, so a long channel is drawn row by row.
+const SLOW_VIEW: Duration = Duration::from_millis(100);
+/// Messages in one second above which the pipeline into the interface thread is
+/// worth a line in the log: iced holds 100 in flight, and a backed-up queue is
+/// what the owner's freeze looked like from the outside.
+const BUSY_MESSAGES: u32 = 500;
+
+/// Whether the entrance gets a borderless window of its own. Such a window needs
+/// a surface that composites alpha, and wgpu's DX12 window surface offers only
+/// `CompositeAlphaMode::Opaque` — the alpha-0 clear lands as a black box, and
+/// macOS shows the same. Elsewhere the entrance plays inside the main window.
+const SPLASH_WINDOW: bool = cfg!(target_os = "linux");
+
 /// The main window's `wl_display`, or null when this session is not Wayland.
 ///
 /// Only the client holding keyboard focus may read a Wayland selection, so the
@@ -123,8 +138,9 @@ pub struct App {
     /// manifest of its own, so both read this instead.
     pub force_required: bool,
     pub pending_restart: Option<Ready>,
-    /// The splash window while its entrance plays. It is closed before the main
-    /// window opens, so the two never exist at once.
+    /// The splash window while its entrance plays, on the platforms that get one
+    /// ([`SPLASH_WINDOW`]). Exactly one window exists while the entrance plays:
+    /// the splash there, the main window everywhere else.
     pub splash: Option<window::Id>,
     pub main_window: Option<window::Id>,
     pub entrance: Option<brand::entrance::Entrance>,
@@ -144,6 +160,15 @@ pub struct App {
     pub clipboard_unavailable: bool,
     pub last_toast: Option<Instant>,
     pub workers: Workers,
+    /// When the last slow-rebuild warning went out. `view` only has `&self`, and
+    /// rate limiting needs to remember something across calls; `App` never leaves
+    /// the interface thread, so a `Cell` is all it takes.
+    slow_view_warned: Cell<Option<Instant>>,
+    /// Messages taken this wall-clock second, and when that second began. A
+    /// freeze is a backed-up message pipeline, and this is what names it in the
+    /// log afterwards.
+    messages_this_second: u32,
+    second_started: Instant,
 }
 
 /// The sign-in screen's "Server" section: which server this client talks to.
@@ -316,8 +341,14 @@ impl MainState {
         }
     }
 
-    /// Sends one command, or says in the notice line why it could not.
+    /// Sends one command, or says in the notice line why it could not. The
+    /// channel outlives a dropped socket, so being able to send says nothing
+    /// about being connected: the status is what does.
     pub fn send_or_notice(&mut self, command: Command) {
+        if !matches!(self.status, Status::Connected) {
+            self.notice = Some("Not connected".to_owned());
+            return;
+        }
         if !self.send_command(command) {
             self.notice = Some("Not connected".to_owned());
         }
@@ -386,6 +417,9 @@ impl App {
             clipboard_unavailable: false,
             last_toast: None,
             workers: Workers::default(),
+            slow_view_warned: Cell::new(None),
+            messages_this_second: 0,
+            second_started: Instant::now(),
         };
         // A stored session lands straight in the shell, which is where the offer
         // belongs.
@@ -393,8 +427,8 @@ impl App {
         app
     }
 
-    /// Builds the state and asks for the first window: the splash, or the main
-    /// window when the entrance is switched off.
+    /// Builds the state and asks for the first window: the splash where the
+    /// entrance gets one, the main window otherwise.
     pub fn boot(
         endpoints: Endpoints,
         config: Config,
@@ -415,9 +449,13 @@ impl App {
         let task = match brand::entrance::choose(app.config.entrance) {
             Some(variant) => {
                 app.entrance = Some(brand::entrance::Entrance::new(variant));
-                let (id, task) = window::open(app.splash_settings());
-                app.splash = Some(id);
-                task.discard()
+                if SPLASH_WINDOW {
+                    let (id, task) = window::open(app.splash_settings());
+                    app.splash = Some(id);
+                    task.discard()
+                } else {
+                    app.open_main()
+                }
             }
             None => app.open_main(),
         };
@@ -428,11 +466,53 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.messages_this_second += 1;
+        let now = Instant::now();
+        if now.duration_since(self.second_started) >= Duration::from_secs(1) {
+            let count = self.messages_this_second;
+            self.messages_this_second = 0;
+            self.second_started = now;
+            if count > BUSY_MESSAGES {
+                tracing::warn!(count, "many messages in one second");
+            }
+        }
         update::update(self, message)
     }
 
     pub fn view(&self, window: window::Id) -> Element<'_, Message> {
-        view::view(self, window)
+        if self.main_window != Some(window) {
+            return view::view(self, window);
+        }
+        let started = Instant::now();
+        let element = view::view(self, window);
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_VIEW
+            && self
+                .slow_view_warned
+                .get()
+                .is_none_or(|last| started.duration_since(last) >= Duration::from_secs(1))
+        {
+            self.slow_view_warned.set(Some(started));
+            tracing::warn!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                messages = self.rows_in_view(),
+                "a view rebuild took long"
+            );
+        }
+        element
+    }
+
+    /// How many message rows the channel in view is drawing, which is what a slow
+    /// rebuild is usually proportional to.
+    fn rows_in_view(&self) -> usize {
+        let Some(main) = self.main() else {
+            return 0;
+        };
+        main.chat
+            .current
+            .channel_id()
+            .and_then(|id| main.chat.channels.get(&id))
+            .map_or(0, |channel| channel.messages.len())
     }
 
     pub fn title(&self, window: window::Id) -> String {
@@ -473,8 +553,9 @@ impl App {
             iced::event::listen_with(ui_event),
             window::close_events().map(|id| Message::Window(WindowMsg::Closed(id))),
         ];
-        // The splash is the only window while the entrance plays, so every frame
-        // that arrives is one of its own.
+        // Exactly one window exists while the entrance plays — the splash where
+        // there is one, the main window otherwise — so every frame that arrives
+        // is the entrance's own.
         if self.entrance.is_some() {
             subscriptions
                 .push(window::frames().map(|at| Message::Window(WindowMsg::SplashTick(at))));
@@ -908,15 +989,21 @@ impl App {
         task.discard()
     }
 
-    /// Idempotent: a skip and the natural end in the same frame close once. The
-    /// main window is opened first and the splash closed once it exists, because
-    /// iced tears the compositor down while no window is left. `splash` itself is
-    /// cleared only by [`WindowMsg::Closed`].
+    /// Ends the entrance. Idempotent: a skip and the natural end in the same
+    /// frame close once. With a splash window the main window is opened first and
+    /// the splash closed once it exists, because iced tears the compositor down
+    /// while no window is left; without one the main window already carries the
+    /// entrance and only its state goes. `splash` itself is cleared only by
+    /// [`WindowMsg::Closed`].
     fn close_splash(&mut self) -> Task<Message> {
         if self.entrance.take().is_none() {
             return Task::none();
         }
-        let open = self.open_main();
+        let open = if self.main_window.is_none() {
+            self.open_main()
+        } else {
+            Task::none()
+        };
         match self.splash {
             Some(id) => open.chain(window::close(id)),
             None => open,

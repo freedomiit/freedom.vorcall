@@ -19,6 +19,7 @@ use vorcall_core::{ChannelKind, ChatMessage, VoiceMember};
 use crate::app::message::{
     ChannelsMsg, ChatMsg, MenuTarget, Message, SettingsMsg, ShareMsg, UiMsg, VoiceMsg,
 };
+use crate::app::state::rules::SENDER_OFFLINE;
 use crate::app::state::server::{ServerModel, channel_kind};
 use crate::app::state::settings::ServerTab;
 use crate::app::state::ui::{Dialog, TransferSource};
@@ -27,6 +28,7 @@ use crate::icons::{self, Icon};
 use crate::theme::ThemeTokens;
 use crate::theme::styles;
 use crate::view::TEXT_ROW;
+use crate::view::composer::FileRoute;
 use crate::view::overlays::{copies, opens, perform};
 use crate::view::widgets;
 
@@ -228,6 +230,7 @@ fn row_of<'a>(entry: Entry, tokens: &'a ThemeTokens) -> Element<'a, Message> {
 fn entries(app: &App, main: &MainState, target: MenuTarget) -> Vec<Entry> {
     match target {
         MenuTarget::Server => server_items(main),
+        MenuTarget::FileRoutes => file_route_items(),
         MenuTarget::Message(id) => message_items(main, id),
         MenuTarget::Member(user_id) => member_items(main, user_id),
         MenuTarget::Channel(id) => channel_items(app, main, id),
@@ -258,6 +261,22 @@ fn server_items(main: &MainState) -> Vec<Entry> {
         )));
     }
     entries
+}
+
+/// The chevron beside the paperclip: one row per route a picked file can take.
+/// The paperclip itself is the first of them, so the menu is the whole choice
+/// rather than only what the paperclip leaves out.
+fn file_route_items() -> Vec<Entry> {
+    FileRoute::ALL
+        .into_iter()
+        .map(|route| {
+            let icon = match route {
+                FileRoute::Attach => Icon::Paperclip,
+                FileRoute::Stream => Icon::Link,
+            };
+            Entry::item(Item::new(route.to_string(), icon, perform(route.message())))
+        })
+        .collect()
 }
 
 fn message_items(main: &MainState, id: i64) -> Vec<Entry> {
@@ -337,7 +356,8 @@ fn message_items(main: &MainState, id: i64) -> Vec<Entry> {
                 },
             )
             .needs(alive, DELETED)
-            .needs(file.is_some(), NO_FILE),
+            .needs(file.is_some(), NO_FILE)
+            .needs(file_reachable(main, message), SENDER_OFFLINE),
         ),
         Entry::item(
             Item::new(
@@ -395,6 +415,20 @@ fn first_file(message: &ChatMessage) -> Option<TransferSource> {
         .streamed_files
         .first()
         .map(|file| TransferSource::Stream(file.id))
+}
+
+/// Whether the file the menu would save can be read at all: a streamed file
+/// lives only on its sender's machine, so the server answers a save attempted
+/// while they are offline with a 409 rather than the bytes.
+fn file_reachable(main: &MainState, message: &ChatMessage) -> bool {
+    match first_file(message) {
+        Some(TransferSource::Stream(id)) => message
+            .streamed_files
+            .iter()
+            .find(|file| file.id == id)
+            .is_some_and(|file| main.server.is_online(file.owner_id)),
+        _ => true,
+    }
 }
 
 fn member_items(main: &MainState, user_id: i64) -> Vec<Entry> {
