@@ -5733,7 +5733,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-app"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5762,7 +5762,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-clipboard"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -5777,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5804,7 +5804,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-hotkey"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ashpd",
  "core-foundation 0.9.4",
@@ -5820,7 +5820,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-probe"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "futures",
  "rustls",
@@ -5835,7 +5835,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-proto"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -5844,7 +5844,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-release"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5856,7 +5856,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-screen"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ashpd",
  "block2 0.6.2",
@@ -5887,7 +5887,7 @@ dependencies = [
 
 [[package]]
 name = "vorcall-voice"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aec3",
  "chacha20poly1305",
