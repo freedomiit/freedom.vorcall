@@ -42,14 +42,14 @@ use crate::workers::voice::{AudioCommand, AudioHandle};
 use crate::workers::{audio, camera, images, notify, share, sounds, voice};
 
 pub use message::Message;
-use message::{ChatMsg, TickMsg, UiMsg, WindowMsg};
+use message::{ChatMsg, ShareMsg, TickMsg, UiMsg, WindowMsg};
 use state::chat::{ChatState, ImageState};
 use state::rules;
 use state::server::ServerModel;
 use state::settings::{AdminState, SettingsState};
 use state::sound::SoundState;
 use state::sticker::StickerState;
-use state::ui::UiState;
+use state::ui::{Dialog, UiState};
 use state::update::UpdateState;
 use state::voice::VoiceUi;
 
@@ -69,6 +69,9 @@ pub const SPEAKING_WINDOW: Duration = Duration::from_millis(200);
 pub const STATS_EVERY: u32 = 10;
 /// How often the toast stack is swept.
 pub const TOAST_TICK: Duration = Duration::from_millis(500);
+/// How often the share dialog asks again which applications play sound, so one
+/// that was silent when it opened shows up once it plays.
+pub const AUDIO_APPS_REFRESH: Duration = Duration::from_secs(2);
 /// How often a connected client asks whether there is a new release.
 pub const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// What the voice channel gets between the LeaveVoice and the swap: the frame has
@@ -608,6 +611,16 @@ impl App {
                         .map(|_| Message::Update(message::UpdateMsg::Tick)),
                 );
             }
+        }
+        if matches!(
+            self.ui.dialog,
+            Some(Dialog::SharePicker { audio: true, .. })
+        ) && vorcall_screen::capabilities().app_audio
+        {
+            subscriptions.push(
+                iced::time::every(AUDIO_APPS_REFRESH)
+                    .map(|_| Message::Share(ShareMsg::RefreshAudioApps)),
+            );
         }
         // Only while there is something to sweep.
         if !self.ui.toasts.is_empty() {

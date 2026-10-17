@@ -13,7 +13,7 @@ use vorcall_screen::CaptureRequest;
 
 use crate::app::message::{Message, ShareMsg, ToastKind};
 use crate::app::state::rules::{self, WatchResume};
-use crate::app::state::ui::{Dialog, SourcesState};
+use crate::app::state::ui::{AudioChoice, Dialog, SourcesState, answers};
 use crate::app::state::voice::{ShareIntent, watch_intent_after_stop};
 use crate::app::{App, STAGE_WINDOW, Status};
 use crate::workers::lock;
@@ -40,6 +40,32 @@ pub fn update(app: &mut App, message: ShareMsg) -> Task<Message> {
         ShareMsg::SetPickerAudio(value) => {
             if let Some(Dialog::SharePicker { audio, .. }) = &mut app.ui.dialog {
                 *audio = value;
+            }
+            Task::none()
+        }
+        ShareMsg::RefreshAudioApps => refresh_audio_apps(app),
+        ShareMsg::AudioAppsListed(ticket, result) => {
+            if let Some(Dialog::SharePicker {
+                apps, listing_apps, ..
+            }) = &mut app.ui.dialog
+                && answers(*listing_apps, ticket)
+            {
+                *listing_apps = None;
+                match result {
+                    Ok(listed) => *apps = listed,
+                    Err(error) => {
+                        tracing::debug!(%error, "cannot list the applications playing sound");
+                    }
+                }
+            }
+            Task::none()
+        }
+        ShareMsg::PickAudioApp(choice) => {
+            if let Some(Dialog::SharePicker { audio_app, .. }) = &mut app.ui.dialog {
+                *audio_app = match choice {
+                    AudioChoice::Everything => None,
+                    AudioChoice::App(chosen) => Some(chosen),
+                };
             }
             Task::none()
         }
@@ -215,6 +241,7 @@ fn open_picker(app: &mut App) -> Task<Message> {
         return Task::none();
     }
 
+    let ticket = capabilities.app_audio.then(|| next_listing(app));
     app.ui.dialog = Some(Dialog::SharePicker {
         sources: if capabilities.portal_picker {
             SourcesState::Ready(Vec::new())
@@ -223,14 +250,18 @@ fn open_picker(app: &mut App) -> Task<Message> {
         },
         selected: None,
         audio,
+        apps: Vec::new(),
+        audio_app: None,
+        listing_apps: ticket,
     });
 
     // The pipeline thread is started here rather than on the confirmation: a
     // portal picker is raised by the capture itself, which must not wait for a
     // thread as well.
     let thread = app.ensure_share();
+    let apps = ticket.map_or_else(Task::none, list_audio_apps);
     if capabilities.portal_picker {
-        return thread;
+        return Task::batch([thread, apps]);
     }
 
     // Listing the screens talks to the window server and blocks; on macOS it is
@@ -245,13 +276,56 @@ fn open_picker(app: &mut App) -> Task<Message> {
             Message::Share(ShareMsg::SourcesListed(listed))
         },
     );
-    Task::batch([thread, listing])
+    Task::batch([thread, listing, apps])
+}
+
+/// Asks again which applications play sound, unless a listing is already on its
+/// way or nobody would see the answer.
+fn refresh_audio_apps(app: &mut App) -> Task<Message> {
+    let idle = matches!(
+        app.ui.dialog,
+        Some(Dialog::SharePicker {
+            audio: true,
+            listing_apps: None,
+            ..
+        })
+    );
+    if !idle || !vorcall_screen::capabilities().app_audio {
+        return Task::none();
+    }
+    let ticket = next_listing(app);
+    if let Some(Dialog::SharePicker { listing_apps, .. }) = &mut app.ui.dialog {
+        *listing_apps = Some(ticket);
+    }
+    list_audio_apps(ticket)
+}
+
+fn next_listing(app: &mut App) -> u64 {
+    app.ui.listings = app.ui.listings.wrapping_add(1);
+    app.ui.listings
+}
+
+/// Listing the applications asks the sound server and blocks.
+fn list_audio_apps(ticket: u64) -> Task<Message> {
+    Task::perform(
+        tokio::task::spawn_blocking(vorcall_screen::audio_apps),
+        move |joined| {
+            let listed = match joined {
+                Ok(listed) => listed.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            Message::Share(ShareMsg::AudioAppsListed(ticket, listed))
+        },
+    )
 }
 
 fn confirm(app: &mut App) -> Task<Message> {
     let preset = rules::share_preset(&app.config);
     let Some(Dialog::SharePicker {
-        selected, audio, ..
+        selected,
+        audio,
+        audio_app,
+        ..
     }) = app.ui.dialog.take()
     else {
         return Task::none();
@@ -262,6 +336,11 @@ fn confirm(app: &mut App) -> Task<Message> {
         fps: preset.fps,
         cursor: true,
         audio,
+        audio_app: if audio && vorcall_screen::capabilities().app_audio {
+            audio_app
+        } else {
+            None
+        },
         max_size: rules::capture_box(preset.resolution),
     };
 

@@ -13,8 +13,8 @@ use futures::channel::mpsc;
 use futures::channel::mpsc::TryRecvError;
 use vorcall_screen::preset::FrameRate;
 use vorcall_screen::{
-    AudioMode, CameraRequest, CameraSource, CaptureEvent, CaptureRequest, Capturer, SourceId,
-    SourceKind, Unavailable,
+    AudioApp, AudioMode, CameraRequest, CameraSource, CaptureEvent, CaptureRequest, Capturer,
+    SourceId, SourceKind, Unavailable,
 };
 
 use crate::report::quote;
@@ -41,6 +41,7 @@ enum Mode {
     Screen {
         seconds: u64,
         audio: bool,
+        audio_app: Option<String>,
         fps: FrameRate,
     },
     Camera {
@@ -50,6 +51,7 @@ enum Mode {
         fps: FrameRate,
     },
     ListCameras,
+    ListAudioApps,
 }
 
 /// `Ok(None)` means `--help` was asked for.
@@ -62,12 +64,18 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
     let mut camera_size = (640u32, 360u32);
     let mut camera_fps = FrameRate::F30;
     let mut list_cameras = false;
+    let mut audio_app = None;
+    let mut list_audio_apps = false;
 
     let mut args = args.peekable();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--help" | "-h" => return Ok(None),
             "--capture-audio" => audio = true,
+            "--capture-audio-app" => {
+                audio_app = Some(crate::value(&flag, &mut args)?);
+                audio = true;
+            }
             "--capture-seconds" => seconds = Some(crate::number(&flag, &mut args)?),
             "--capture-fps" => fps = frame_rate(&flag, &mut args)?,
             "--capture-camera-seconds" => camera_seconds = Some(crate::number(&flag, &mut args)?),
@@ -77,6 +85,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
             }
             "--camera-fps" => camera_fps = frame_rate(&flag, &mut args)?,
             "--list-cameras" => list_cameras = true,
+            "--list-audio-apps" => list_audio_apps = true,
             "--share-seconds" | "--watch" | "--camera-seconds" | "--watch-camera" => {
                 return Err(format!("{flag} needs a server, so it cannot be used here"));
             }
@@ -84,6 +93,20 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
         }
     }
 
+    if audio_app.as_deref().is_some_and(str::is_empty) {
+        return Err("--capture-audio-app cannot be empty".to_owned());
+    }
+    if list_audio_apps {
+        if seconds.is_some() || camera_seconds.is_some() {
+            return Err("--list-audio-apps takes no capture of its own".to_owned());
+        }
+        if list_cameras {
+            return Err("--list-audio-apps and --list-cameras each stand alone".to_owned());
+        }
+        return Ok(Some(Args {
+            mode: Mode::ListAudioApps,
+        }));
+    }
     if list_cameras {
         if seconds.is_some() || camera_seconds.is_some() {
             return Err("--list-cameras takes no capture of its own".to_owned());
@@ -95,6 +118,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
     if let Some(seconds) = camera_seconds {
         if device.as_deref().is_some_and(str::is_empty) {
             return Err("--camera-device cannot be empty".to_owned());
+        }
+        if audio_app.is_some() {
+            return Err("--capture-audio-app is not something a camera can answer".to_owned());
         }
         if audio {
             return Err("--capture-audio is not something a camera can answer".to_owned());
@@ -114,6 +140,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Args>, String>
         mode: Mode::Screen {
             seconds,
             audio,
+            audio_app,
             fps,
         },
     }))
@@ -147,8 +174,9 @@ pub fn run(argv: Vec<String>) -> i32 {
             Mode::Screen {
                 seconds,
                 audio,
+                audio_app,
                 fps,
-            } => capture(seconds, audio, fps),
+            } => capture(seconds, audio, audio_app, fps),
             Mode::Camera {
                 seconds,
                 device,
@@ -156,6 +184,7 @@ pub fn run(argv: Vec<String>) -> i32 {
                 fps,
             } => camera(seconds, device, size, fps),
             Mode::ListCameras => list_cameras(),
+            Mode::ListAudioApps => list_audio_apps(),
         })
         .expect("spawning the capture thread")
         .join()
@@ -173,6 +202,7 @@ struct Tally {
     audio_mode: Option<AudioMode>,
     audio_chunks: u64,
     audio_samples: u64,
+    audio_peak: f32,
     sample_rate: u32,
     channels: u16,
     ended: Option<String>,
@@ -260,7 +290,7 @@ fn drive(
     }
 }
 
-fn capture(seconds: u64, audio: bool, fps: FrameRate) -> i32 {
+fn capture(seconds: u64, audio: bool, audio_app: Option<String>, fps: FrameRate) -> i32 {
     let capabilities = vorcall_screen::capabilities();
     eprintln!(
         "vorcall-probe: capture backend {} (portal picker {}, windows {}, audio {})",
@@ -281,6 +311,30 @@ fn capture(seconds: u64, audio: bool, fps: FrameRate) -> i32 {
         }
     };
 
+    let audio_app = match audio_app {
+        None => None,
+        Some(wanted) => {
+            let apps = match vorcall_screen::audio_apps() {
+                Ok(apps) => apps,
+                Err(error) => {
+                    eprintln!("vorcall-probe: {error}");
+                    return 2;
+                }
+            };
+            match pick_audio_app(apps, &wanted) {
+                Some(app) => Some(app),
+                None => {
+                    eprintln!(
+                        "vorcall-probe: no application called {wanted} is playing sound (see \
+--list-audio-apps)"
+                    );
+                    return 2;
+                }
+            }
+        }
+    };
+    let app_label = audio_app.as_ref().map(|app| quote(app.label()));
+
     let (events, mut incoming) = mpsc::unbounded();
     let capturer = match Capturer::start(
         CaptureRequest {
@@ -288,6 +342,7 @@ fn capture(seconds: u64, audio: bool, fps: FrameRate) -> i32 {
             fps,
             cursor: true,
             audio,
+            audio_app,
             max_size: None,
         },
         events,
@@ -313,7 +368,8 @@ fn capture(seconds: u64, audio: bool, fps: FrameRate) -> i32 {
 
     println!(
         "{{\"capture\":{{\"backend\":{},\"width\":{},\"height\":{},\"frames\":{},\"fps\":{:.2},\
-\"audio_mode\":{},\"audio_chunks\":{},\"audio_samples\":{},\"ended\":{},\"stop_ms\":{:.2}}}}}",
+\"audio_mode\":{},\"audio_chunks\":{},\"audio_samples\":{},\"audio_app\":{},\"audio_peak\":{:.4},\
+\"ended\":{},\"stop_ms\":{:.2}}}}}",
         quote(backend),
         tally.width,
         tally.height,
@@ -322,6 +378,8 @@ fn capture(seconds: u64, audio: bool, fps: FrameRate) -> i32 {
         tally.audio_mode.map_or("null".to_owned(), audio_mode),
         tally.audio_chunks,
         tally.audio_samples,
+        app_label.unwrap_or_else(|| "null".to_owned()),
+        tally.audio_peak,
         tally.ended.as_deref().map_or("null".to_owned(), quote),
         run.stop_ms,
     );
@@ -401,6 +459,41 @@ fn camera(seconds: u64, device: Option<String>, size: (u32, u32), fps: FrameRate
     0
 }
 
+fn list_audio_apps() -> i32 {
+    let apps = match vorcall_screen::audio_apps() {
+        Ok(apps) => apps,
+        Err(error) => {
+            eprintln!("vorcall-probe: {error}");
+            return 2;
+        }
+    };
+    let optional = |value: Option<&str>| value.map_or("null".to_owned(), quote);
+    let list: Vec<String> = apps
+        .iter()
+        .map(|app| {
+            format!(
+                "{{\"name\":{},\"binary\":{}}}",
+                optional(app.name.as_deref()),
+                optional(app.binary.as_deref())
+            )
+        })
+        .collect();
+    println!(
+        "{{\"audio_apps\":[{}],\"app_audio\":{}}}",
+        list.join(","),
+        vorcall_screen::capabilities().app_audio,
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    0
+}
+
+/// The first application `--capture-audio-app` names, by its name or binary
+/// exactly as [`vorcall_screen::audio_apps`] reports them.
+fn pick_audio_app(apps: Vec<AudioApp>, wanted: &str) -> Option<AudioApp> {
+    apps.into_iter()
+        .find(|app| app.name.as_deref() == Some(wanted) || app.binary.as_deref() == Some(wanted))
+}
+
 fn list_cameras() -> i32 {
     let capabilities = vorcall_screen::camera_capabilities();
     let cameras = vorcall_screen::cameras();
@@ -461,6 +554,12 @@ fn note(tally: &mut Tally, since: Instant, event: CaptureEvent) -> bool {
         CaptureEvent::Audio(chunk) => {
             tally.audio_chunks += 1;
             tally.audio_samples += chunk.interleaved.len() as u64;
+            tally.audio_peak = chunk
+                .interleaved
+                .iter()
+                .map(|sample| sample.abs())
+                .filter(|level| !level.is_nan())
+                .fold(tally.audio_peak, f32::max);
             tally.sample_rate = chunk.sample_rate;
             tally.channels = chunk.channels;
         }
@@ -510,12 +609,18 @@ mod tests {
     }
 
     fn screen(argv: &[&str]) -> (u64, bool, FrameRate) {
+        let (seconds, audio, _, fps) = screen_with_app(argv);
+        (seconds, audio, fps)
+    }
+
+    fn screen_with_app(argv: &[&str]) -> (u64, bool, Option<String>, FrameRate) {
         match parse_argv(argv).expect("valid").expect("not help").mode {
             Mode::Screen {
                 seconds,
                 audio,
+                audio_app,
                 fps,
-            } => (seconds, audio, fps),
+            } => (seconds, audio, audio_app, fps),
             _ => panic!("not a screen capture"),
         }
     }
@@ -604,6 +709,68 @@ mod tests {
         ));
         assert!(parse_argv(&["--list-cameras", "--capture-seconds", "5"]).is_err());
         assert!(parse_argv(&["--list-cameras", "--capture-camera-seconds", "5"]).is_err());
+    }
+
+    #[test]
+    fn list_audio_apps_stands_alone() {
+        assert!(matches!(
+            parse_argv(&["--list-audio-apps"])
+                .expect("valid")
+                .expect("not help")
+                .mode,
+            Mode::ListAudioApps
+        ));
+        assert!(parse_argv(&["--list-audio-apps", "--capture-seconds", "5"]).is_err());
+        assert!(parse_argv(&["--list-audio-apps", "--capture-camera-seconds", "5"]).is_err());
+        assert!(parse_argv(&["--list-audio-apps", "--list-cameras"]).is_err());
+    }
+
+    #[test]
+    fn capture_audio_app_narrows_and_implies_capture_audio() {
+        let (seconds, audio, audio_app, _) =
+            screen_with_app(&["--capture-audio-app", "Firefox", "--capture-seconds", "5"]);
+        assert_eq!(seconds, 5);
+        assert!(audio);
+        assert_eq!(audio_app.as_deref(), Some("Firefox"));
+
+        let (_, audio, audio_app, _) = screen_with_app(&["--capture-seconds", "5"]);
+        assert!(!audio);
+        assert_eq!(audio_app, None);
+
+        assert!(parse_argv(&["--capture-seconds", "5", "--capture-audio-app", ""]).is_err());
+        assert!(parse_argv(&["--capture-seconds", "5", "--capture-audio-app"]).is_err());
+        assert!(
+            parse_argv(&[
+                "--capture-camera-seconds",
+                "5",
+                "--capture-audio-app",
+                "Firefox"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pick_audio_app_matches_a_name_or_a_binary_exactly() {
+        let apps = || {
+            vec![
+                AudioApp {
+                    name: Some("Firefox".to_owned()),
+                    binary: Some("firefox".to_owned()),
+                },
+                AudioApp {
+                    name: None,
+                    binary: Some("mpv".to_owned()),
+                },
+            ]
+        };
+        let by_name = pick_audio_app(apps(), "Firefox").expect("named");
+        assert_eq!(by_name.binary.as_deref(), Some("firefox"));
+        let by_binary = pick_audio_app(apps(), "mpv").expect("by binary");
+        assert_eq!(by_binary.name, None);
+        assert_eq!(by_binary.binary.as_deref(), Some("mpv"));
+        assert!(pick_audio_app(apps(), "Spotify").is_none());
+        assert!(pick_audio_app(apps(), "fire").is_none());
     }
 
     #[test]

@@ -15,24 +15,25 @@ use std::sync::Arc;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::canvas::{self, Canvas, Frame, Program};
 use iced::widget::{
-    Id, Space, TextInput, button, column, container, image, mouse_area, opaque, progress_bar, row,
-    scrollable, slider, stack, text, text_input, toggler,
+    Id, Space, TextInput, button, column, container, image, mouse_area, opaque, pick_list,
+    progress_bar, row, scrollable, slider, stack, text, text_input, toggler,
 };
 use iced::{Color, ContentFit, Element, Length, Rectangle, Renderer, Size, Theme, mouse};
 use vorcall_core::ChannelKind;
 use vorcall_core::images::ImagePurpose;
 use vorcall_core::permissions;
-use vorcall_screen::{Source, SourceId, SourceKind};
+use vorcall_screen::{AudioApp, Source, SourceId, SourceKind};
 
 use crate::app::message::{
     AdminMsg, AuthMsg, ChatMsg, CropMsg, Message, SettingsMsg, ShareMsg, SoundMsg, UiMsg,
 };
 use crate::app::state::chat::ImageState;
 use crate::app::state::crop::{self, CropState, FRAME_WIDTH, ZOOM_MAX, ZOOM_MIN};
-use crate::app::state::rules::{format_bytes, progress_fraction};
+use crate::app::state::rules::{self, format_bytes, progress_fraction};
 use crate::app::state::sound::{TRIM_WIDTH, TrimEdge, TrimState, can_stop, clock, span_ms};
 use crate::app::state::ui::{
-    Dialog, DialogAction, SourcesState, TransferSource, TransferState, validate_long, validate_name,
+    AudioChoice, Dialog, DialogAction, SourcesState, TransferSource, TransferState, validate_long,
+    validate_name,
 };
 use crate::app::{App, MainState};
 use crate::icons::{self, Icon};
@@ -215,7 +216,17 @@ fn modal<'a>(app: &'a App, main: &'a MainState, dialog: &'a Dialog) -> Element<'
             sources,
             selected,
             audio,
-        } => share_picker(app, sources, selected.as_ref(), *audio),
+            apps,
+            audio_app,
+            ..
+        } => share_picker(
+            app,
+            sources,
+            selected.as_ref(),
+            *audio,
+            apps,
+            audio_app.as_ref(),
+        ),
         Dialog::Transfer {
             source,
             request_id,
@@ -793,6 +804,8 @@ fn share_picker<'a>(
     sources: &'a SourcesState,
     selected: Option<&'a SourceId>,
     audio: bool,
+    apps: &'a [AudioApp],
+    audio_app: Option<&'a AudioApp>,
 ) -> Element<'a, Message> {
     let tokens = &app.tokens;
     let capabilities = vorcall_screen::capabilities();
@@ -814,6 +827,36 @@ fn share_picker<'a>(
             .style(styles::toggler(tokens))
             .into(),
     );
+    if capabilities.app_audio && audio {
+        let current = audio_app
+            .cloned()
+            .map_or(AudioChoice::Everything, AudioChoice::App);
+        let from = pick_list(
+            rules::audio_choices(apps, audio_app),
+            Some(current),
+            |choice| Message::Share(ShareMsg::PickAudioApp(choice)),
+        )
+        .width(Length::Fill)
+        .text_size(TEXT_ROW)
+        .padding([6.0, 10.0])
+        .style(styles::pick_list(tokens))
+        .menu_style(styles::menu(tokens));
+        rows.push(
+            row![
+                text("Audio from")
+                    .size(TEXT_ROW)
+                    .color(tokens.text_secondary),
+                from,
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center)
+            .into(),
+        );
+        rows.push(note(
+            tokens,
+            "Applications appear here while they play sound.".to_owned(),
+        ));
+    }
 
     // The system's own picker answers for the source, so there is nothing left to
     // choose here first.

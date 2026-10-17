@@ -12,6 +12,7 @@
 //! channel whose receiver is an fd in the loop, since `quit` from another thread
 //! is not allowed.
 
+mod apps;
 mod audio;
 pub(crate) mod camera;
 mod convert;
@@ -37,7 +38,7 @@ use pipewire::main_loop::MainLoopRc;
 use tokio::runtime::Runtime;
 
 use crate::{
-    AudioMode, Capabilities, CaptureEvent, CaptureRequest, Capturer, Source, Stop, Unavailable,
+    AudioApp, Capabilities, CaptureEvent, CaptureRequest, Capturer, Source, Stop, Unavailable,
 };
 
 const BACKEND: &str = "pipewire";
@@ -141,7 +142,12 @@ pub(crate) fn capabilities() -> Capabilities {
         portal_picker: true,
         windows: true,
         audio: true,
+        app_audio: true,
     }
+}
+
+pub(crate) fn audio_apps() -> Result<Vec<AudioApp>, Unavailable> {
+    apps::list()
 }
 
 pub(crate) fn start(
@@ -298,18 +304,21 @@ impl Capture<'_> {
 
         // Share audio never comes down the portal's remote: that connection
         // carries the cast's node and nothing else. The sink monitor lives on
-        // the session's own socket, which is a second connection.
+        // the session's own socket, which is a second connection, and so does a
+        // chosen application's tap, which links its streams into our own
+        // capture node there.
+        let audio_app = self.request.audio_app.clone();
         let audio = self
             .request
             .audio
-            .then(|| audio::connect(&context, self.ending.clone()))
+            .then(|| audio::connect(&context, audio_app, self.ending.clone()))
             .flatten();
         let cast_core = context.connect_fd_rc(remote, None).map_err(broken)?;
         let _screen = video::connect(
             &cast_core,
             cast,
             self.request,
-            audio.is_some().then_some(AudioMode::IncludesOwnPlayout),
+            audio.as_ref().map(audio::Tap::mode),
             self.ending.clone(),
             self.reports.clone(),
         )?;

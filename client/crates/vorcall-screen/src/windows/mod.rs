@@ -45,6 +45,7 @@ pub(crate) fn capabilities() -> Capabilities {
         portal_picker: false,
         windows: true,
         audio: true,
+        app_audio: false,
     }
 }
 

@@ -99,6 +99,12 @@ Options:
                          what the backend produced; needs no server and no
                          --username, and excludes --share-seconds and --watch
   --capture-audio        ask the capture for this machine's audio as well
+  --capture-audio-app <name>
+                         capture only that application's sound (Linux);
+                         implies --capture-audio; the name or binary as
+                         --list-audio-apps prints it
+  --list-audio-apps      print the applications playing sound that share
+                         audio can be narrowed to, then exit; needs no server
   --capture-fps <n>      capture frame rate: 15, 30 or 60 (default: 30)
   --capture-camera-seconds <n>
                          open this machine's camera for n seconds and print
@@ -147,6 +153,7 @@ screen to hand over, so someone has to answer the dialog — every run, by
 design, because nothing about the choice is remembered:
 
   vorcall-probe --capture-seconds 5 --capture-audio
+  vorcall-probe --capture-seconds 8 --capture-audio-app Firefox
 
 Camera-capture oracle, also no server and no account. On Windows and macOS
 the first run raises the operating system's camera permission prompt:
@@ -261,7 +268,10 @@ async fn main() {
     if argv.iter().any(|arg| {
         matches!(
             arg.as_str(),
-            "--capture-seconds" | "--capture-camera-seconds" | "--list-cameras"
+            "--capture-seconds"
+                | "--capture-camera-seconds"
+                | "--list-cameras"
+                | "--list-audio-apps"
         )
     }) {
         std::process::exit(capture::run(argv));

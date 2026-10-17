@@ -14,10 +14,11 @@ use vorcall_core::mentions::{self, Segment};
 use vorcall_core::{ApiFailure, Channel, ChannelKind, ChatMessage};
 use vorcall_hotkey::{ActionId, Backend, Binding, Key, MouseButton, Trigger};
 use vorcall_screen::preset::{self, CameraPreset, CameraResolution, FrameRate, Preset, Resolution};
-use vorcall_screen::{CameraCapabilities, CameraRequest, CameraSource, Capabilities};
+use vorcall_screen::{AudioApp, CameraCapabilities, CameraRequest, CameraSource, Capabilities};
 
 use crate::app::state::chat::MESSAGE_LIMIT;
 use crate::app::state::server::{ServerModel, channel_kind};
+use crate::app::state::ui::AudioChoice;
 use crate::app::state::voice::{CameraPrefs, CameraTileId, HotkeyStatus, VoiceRoster, VoiceUi};
 
 /// Push to talk keeps action 0: `vorcall-hotkey` describes that one to a Wayland
@@ -314,11 +315,26 @@ pub fn share_sentence(capabilities: &Capabilities, running: Option<&'static str>
     if capabilities.portal_picker {
         parts.push("the system dialog picks the screen or window".to_owned());
     }
+    if capabilities.app_audio {
+        parts.push("the share dialog can narrow the audio to one application".to_owned());
+    }
     #[cfg(target_os = "macos")]
     parts.push(
         "Screen Recording permission is required, and re-granted after every update".to_owned(),
     );
     parts.join(" · ")
+}
+
+/// The share dialog's "Audio from" entries: everything first, then the listed
+/// applications in order. A chosen application that stopped playing stays on
+/// offer, since the capture picks its streams up again whenever they return.
+pub fn audio_choices(apps: &[AudioApp], selected: Option<&AudioApp>) -> Vec<AudioChoice> {
+    let mut choices = vec![AudioChoice::Everything];
+    choices.extend(apps.iter().cloned().map(AudioChoice::App));
+    if let Some(selected) = selected.filter(|selected| !apps.contains(selected)) {
+        choices.push(AudioChoice::App(selected.clone()));
+    }
+    choices
 }
 
 /// The preset a share starts with. Anything the configuration cannot name is the
@@ -2005,5 +2021,71 @@ mod tests {
 
         assert_eq!(messages.len(), MESSAGE_LIMIT);
         assert_eq!(messages.keys().next().copied(), Some(3));
+    }
+
+    fn audio_app(name: &str) -> AudioApp {
+        AudioApp {
+            name: Some(name.to_owned()),
+            binary: None,
+        }
+    }
+
+    #[test]
+    fn audio_choices_start_with_everything_and_keep_the_listing_order() {
+        let apps = [audio_app("Spotify"), audio_app("Firefox")];
+
+        assert_eq!(
+            audio_choices(&apps, None),
+            vec![
+                AudioChoice::Everything,
+                AudioChoice::App(audio_app("Spotify")),
+                AudioChoice::App(audio_app("Firefox")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chosen_app_that_stopped_playing_is_still_offered_once() {
+        let apps = [audio_app("Firefox")];
+        let gone = audio_app("Spotify");
+
+        assert_eq!(
+            audio_choices(&apps, Some(&gone)),
+            vec![
+                AudioChoice::Everything,
+                AudioChoice::App(audio_app("Firefox")),
+                AudioChoice::App(audio_app("Spotify")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chosen_app_still_playing_is_not_offered_twice() {
+        let apps = [audio_app("Spotify"), audio_app("Firefox")];
+        let chosen = audio_app("Firefox");
+
+        assert_eq!(
+            audio_choices(&apps, Some(&chosen)),
+            vec![
+                AudioChoice::Everything,
+                AudioChoice::App(audio_app("Spotify")),
+                AudioChoice::App(audio_app("Firefox")),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_share_sentence_mentions_narrowing_only_with_app_audio() {
+        let capabilities = |app_audio: bool| Capabilities {
+            backend: "pipewire",
+            portal_picker: true,
+            windows: true,
+            audio: true,
+            app_audio,
+        };
+        let narrowing = "the share dialog can narrow the audio to one application";
+
+        assert!(share_sentence(&capabilities(true), None).contains(narrowing));
+        assert!(!share_sentence(&capabilities(false), None).contains(narrowing));
     }
 }

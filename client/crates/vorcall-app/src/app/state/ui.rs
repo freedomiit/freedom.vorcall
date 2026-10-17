@@ -15,7 +15,7 @@ use vorcall_core::connection::Blob;
 use vorcall_core::images::ImagePurpose;
 use vorcall_core::permissions;
 use vorcall_core::{ChannelKind, Config};
-use vorcall_screen::{Source, SourceId};
+use vorcall_screen::{AudioApp, Source, SourceId};
 
 use crate::app::MainState;
 use crate::app::message::{DragItem, DragSlot, MenuTarget, Message, ToastKind};
@@ -75,6 +75,8 @@ pub struct UiState {
     pub collapsed: BTreeSet<i64>,
     /// Mirrors `Config::show_members`.
     pub show_members: bool,
+    /// Numbers every application listing this run asks for.
+    pub listings: u64,
 }
 
 impl UiState {
@@ -95,6 +97,7 @@ impl UiState {
             drag: None,
             collapsed: config.collapsed_categories.clone(),
             show_members: config.show_members,
+            listings: 0,
         }
     }
 
@@ -248,6 +251,13 @@ pub enum Dialog {
         sources: SourcesState,
         selected: Option<SourceId>,
         audio: bool,
+        /// The applications playing sound at the latest listing.
+        apps: Vec<AudioApp>,
+        /// The application whose audio the share carries; `None` is everything.
+        audio_app: Option<AudioApp>,
+        /// The number of the listing this dialog waits for; `None` when none is
+        /// in flight.
+        listing_apps: Option<u64>,
     },
     ThemeSaveAs {
         name: String,
@@ -372,11 +382,15 @@ impl fmt::Debug for Dialog {
                 .field("trim", trim)
                 .finish_non_exhaustive(),
             Self::SharePicker {
-                selected, audio, ..
+                selected,
+                audio,
+                audio_app,
+                ..
             } => f
                 .debug_struct("SharePicker")
                 .field("selected", selected)
                 .field("audio", audio)
+                .field("audio_app", &audio_app.as_ref().map(AudioApp::label))
                 .finish_non_exhaustive(),
             Self::ThemeSaveAs { name } => {
                 f.debug_struct("ThemeSaveAs").field("name", name).finish()
@@ -438,6 +452,22 @@ pub enum SourcesState {
     Loading,
     Ready(Vec<Source>),
     Failed(String),
+}
+
+/// One entry of the share dialog's "Audio from" list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioChoice {
+    Everything,
+    App(AudioApp),
+}
+
+impl fmt::Display for AudioChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Everything => f.write_str("Everything this machine plays"),
+            Self::App(app) => f.write_str(app.label()),
+        }
+    }
 }
 
 /// A right-click menu, anchored where the pointer was.
@@ -685,6 +715,12 @@ pub fn validate_long(raw: &str) -> Result<String, String> {
     Ok(text.to_owned())
 }
 
+/// Whether the answer to listing `ticket` is the one a dialog awaiting
+/// `listing` takes; a closed dialog's or a superseded listing's is not.
+pub fn answers(listing: Option<u64>, ticket: u64) -> bool {
+    listing == Some(ticket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +752,15 @@ mod tests {
         assert_eq!(texts, ["note 2", "note 3", "note 4"]);
         // Every toast has its own handle, so a dismissal names one of them.
         assert_eq!(ui.toasts.front().map(|toast| toast.id), Some(3));
+    }
+
+    #[test]
+    fn only_the_awaited_listing_answers() {
+        assert!(answers(Some(2), 2));
+        assert!(!answers(Some(2), 1));
+        assert!(!answers(Some(2), 3));
+        assert!(!answers(None, 0));
+        assert!(!answers(None, 2));
     }
 
     #[test]

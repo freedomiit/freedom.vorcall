@@ -208,7 +208,11 @@ ScreenCaptureKit on macOS. Exit 0 means capture ran and the stop path completed:
 
 ```bash
 ./target/debug/vorcall-probe --capture-seconds 5 --capture-audio
+./target/debug/vorcall-probe --list-audio-apps
+./target/debug/vorcall-probe --capture-seconds 8 --capture-audio-app Firefox
 ```
+
+`--list-audio-apps` and `--capture-audio-app <name>` are Linux only. The first needs no server and prints the applications currently playing sound as JSON. The second implies `--capture-audio`, matches the name or the binary, and exits 2 if nothing by that name plays. Expect `"audio_mode":"excluded"` and `audio_peak > 0` while that application plays, and `audio_peak` 0 while only others do.
 
 **The updater** — drives `check-update` and `apply-update` end to end against a local
 server, using an account that already exists:

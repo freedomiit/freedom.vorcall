@@ -29,7 +29,9 @@ pub use camera::{
 //   pub(crate) fn start(request: CaptureRequest, events: UnboundedSender<CaptureEvent>)
 //       -> Result<Capturer, Unavailable>
 //
-// and a `camera` submodule with the same three for a webcam. The dispatch below
+// and a `camera` submodule with the same three for a webcam. Linux alone has a
+// fourth, `audio_apps() -> Result<Vec<AudioApp>, Unavailable>`, since only its
+// backend can narrow a share's audio to one application. The dispatch below
 // and the one in [`camera`] are the only places that name them.
 #[cfg(target_os = "linux")]
 mod linux;
@@ -87,6 +89,31 @@ pub enum AudioMode {
     IncludesOwnPlayout,
 }
 
+/// One application playing sound on this machine, which a share's audio can be
+/// narrowed to.
+///
+/// An identity rather than a stream: an application opens and closes streams as
+/// it plays, and a capture follows every stream that carries the same identity,
+/// the ones it opens after the share started included.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AudioApp {
+    /// `application.name`, as the application calls itself.
+    pub name: Option<String>,
+    /// `application.process.binary`.
+    pub binary: Option<String>,
+}
+
+impl AudioApp {
+    /// What to show the user: the name, else the binary.
+    pub fn label(&self) -> &str {
+        match (self.name.as_deref(), self.binary.as_deref()) {
+            (Some(name), _) => name,
+            (None, Some(binary)) => binary,
+            (None, None) => "Unknown application",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Capabilities {
     pub backend: &'static str,
@@ -96,6 +123,9 @@ pub struct Capabilities {
     /// Single windows can be captured, not just whole displays.
     pub windows: bool,
     pub audio: bool,
+    /// The share's audio can be narrowed to one application, one of those
+    /// [`audio_apps`] lists.
+    pub app_audio: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +135,10 @@ pub struct CaptureRequest {
     pub fps: preset::FrameRate,
     pub cursor: bool,
     pub audio: bool,
+    /// With `audio` on and [`Capabilities::app_audio`], only this application's
+    /// playout, streams it opens later included; `None` is everything the
+    /// machine plays. A backend that cannot narrow ignores it.
+    pub audio_app: Option<AudioApp>,
     /// The frame the backend should aim for, when it can scale for us.
     pub max_size: Option<(u32, u32)>,
 }
@@ -183,6 +217,7 @@ impl Capturer {
         tracing::debug!(
             fps = request.fps.hz(),
             audio = request.audio,
+            audio_app = request.audio_app.is_some(),
             "starting a screen capture"
         );
 
@@ -282,7 +317,25 @@ pub fn capabilities() -> Capabilities {
             portal_picker: false,
             windows: false,
             audio: false,
+            app_audio: false,
         }
+    }
+}
+
+/// The applications playing sound right now, which a share's audio can be
+/// narrowed to: Vorcall's own process left out, one entry per application,
+/// sorted by label. Empty wherever [`Capabilities::app_audio`] is off.
+///
+/// Blocking, a PipeWire round trip on Linux: call it off the UI thread.
+pub fn audio_apps() -> Result<Vec<AudioApp>, Unavailable> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::audio_apps()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(Vec::new())
     }
 }
 
@@ -333,5 +386,17 @@ mod tests {
 
         assert!(printed.contains("bytes: 16"), "{printed}");
         assert!(!printed.contains("171"), "{printed}");
+    }
+
+    #[test]
+    fn an_application_is_labelled_by_its_name_then_its_binary() {
+        let app = |name: Option<&str>, binary: Option<&str>| AudioApp {
+            name: name.map(str::to_string),
+            binary: binary.map(str::to_string),
+        };
+
+        assert_eq!(app(Some("Firefox"), Some("firefox")).label(), "Firefox");
+        assert_eq!(app(None, Some("mpv")).label(), "mpv");
+        assert_eq!(app(None, None).label(), "Unknown application");
     }
 }

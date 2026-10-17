@@ -1112,6 +1112,7 @@ mod tests {
                 fps: preset.fps,
                 cursor: true,
                 audio: false,
+                audio_app: None,
                 max_size: None,
             },
             preset,

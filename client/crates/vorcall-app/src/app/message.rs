@@ -24,11 +24,11 @@ use vorcall_core::update;
 use vorcall_core::{ApiFailure, ChannelKind, Session, Sound, Sticker};
 use vorcall_hotkey::Edge;
 use vorcall_screen::preset::CameraResolution;
-use vorcall_screen::{CameraSource, Source, SourceId};
+use vorcall_screen::{AudioApp, CameraSource, Source, SourceId};
 
 use crate::app::state::settings::{ServerTab, SettingsTab};
 use crate::app::state::sound::TrimEdge;
-use crate::app::state::ui::{Dialog, TransferSource};
+use crate::app::state::ui::{AudioChoice, Dialog, TransferSource};
 use crate::app::state::voice::{CameraTileId, EngineHandoff, HotkeyHandoff};
 // `vorcall_screen::Source` is a screen to capture; this one is a decoded audio
 // file waiting to be trimmed.
@@ -330,6 +330,12 @@ pub enum ShareMsg {
     SourcesListed(Result<Vec<Source>, String>),
     PickSource(SourceId),
     SetPickerAudio(bool),
+    /// The applications playing sound, as the listing of that number found them.
+    AudioAppsListed(u64, Result<Vec<AudioApp>, String>),
+    /// The share dialog's "Audio from" choice.
+    PickAudioApp(AudioChoice),
+    /// The share dialog's tick: time to ask again which applications play sound.
+    RefreshAudioApps,
     Confirm,
     Stop,
     Event(ShareEvent),

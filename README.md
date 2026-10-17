@@ -32,8 +32,8 @@ app. What there is:
 - **Voice** in every voice channel and DM: push-to-talk or voice activation, echo
   cancellation, noise suppression, per-person volume, priority speaker, and sound effects
   for joining, leaving, muting and deafening.
-- **Screen sharing** — a monitor or a single window, with its audio, watched by everyone
-  else in the channel.
+- **Screen sharing** — a monitor or a single window, with its audio (on Linux, narrowed to
+  one application if you like), watched by everyone else in the channel.
 - **Camera** — a second video stream beside (or instead of) a screen share, watched
   independently, up to four cameras at once per viewer.
 - **A shared soundpad** — short clips anyone may upload once and anyone may fire into a
